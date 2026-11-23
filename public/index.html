@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>B 站一起看</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main>
+    <header><a href="/">B 站一起看</a><span>私密观影</span></header>
+
+    <p id="startup" role="status">正在连接服务…</p>
+    <section id="signin" class="panel form-panel" hidden>
+      <h1>房主登录</h1>
+      <form id="login-form">
+        <label for="password">房主密码</label>
+        <input id="password" type="password" autocomplete="current-password" required>
+        <p id="login-error" class="error" role="alert"></p>
+        <button type="submit">登录</button>
+      </form>
+    </section>
+
+    <section id="create" class="panel form-panel" hidden>
+      <h1>创建观影房间</h1>
+      <form id="source-form">
+        <label for="source">B 站视频链接</label>
+        <input id="source" type="url" inputmode="url" autocapitalize="off" spellcheck="false"
+          required maxlength="2048" placeholder="https://www.bilibili.com/video/BV…"
+          aria-describedby="source-help">
+        <p id="source-help" class="hint">支持可公开播放的 BV 投稿，链接中的分 P 会一起导入。</p>
+        <p id="source-error" class="error" role="alert"></p>
+        <button type="submit">创建房间并导入</button>
+      </form>
+    </section>
+
+    <section id="room" class="panel room-panel" hidden>
+      <div class="room-heading">
+        <p id="status" role="status" data-status="queued"></p>
+        <h1 id="title">观影房间</h1>
+        <p id="source-detail" class="hint" hidden></p>
+      </div>
+      <p id="room-error" class="error" role="alert"></p>
+      <div class="player" id="player" hidden>
+        <video id="video" playsinline controls preload="metadata" aria-label="房间视频"></video>
+        <button id="play" type="button">播放</button>
+      </div>
+      <button id="retry" type="button" hidden>重试导入</button>
+      <a class="back" href="/">提交其他视频</a>
+    </section>
+  </main>
+</body>
+</html>

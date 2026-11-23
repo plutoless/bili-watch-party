@@ -1,0 +1,76 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft Yahei", sans-serif;
+  background: #111820;
+  color: #f1f5f9;
+  -webkit-font-smoothing: antialiased;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { margin: 0; }
+main { width: min(100% - 2rem, 52rem); margin-inline: auto; }
+header {
+  min-height: 4.75rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  color: #a8b7c4;
+  font-size: .875rem;
+}
+header a { color: #f1f5f9; font-weight: 750; font-size: 1.125rem; text-decoration: none; }
+a { color: #8bdcca; }
+a, button, input { min-height: 2.75rem; }
+a { display: inline-flex; align-items: center; text-underline-offset: .22em; }
+
+.panel {
+  background: #1b2632;
+  border-radius: 1.25rem;
+  padding: clamp(1rem, 4vw, 2rem);
+  margin: 1rem auto 2rem;
+  box-shadow: 0 2px 6px #0003, 0 18px 55px #0003;
+}
+.form-panel { max-width: 34rem; }
+h1 {
+  margin: 0 0 1.5rem;
+  font-size: clamp(1.4rem, 4vw, 2rem);
+  line-height: 1.25;
+  text-wrap: balance;
+  overflow-wrap: anywhere;
+}
+label { display: block; margin-bottom: .5rem; font-size: .9375rem; font-weight: 650; }
+input, button { font: inherit; border-radius: .65rem; }
+input {
+  width: 100%;
+  color: inherit;
+  background: #111820;
+  border: 1px solid #516071;
+  padding: .7rem .85rem;
+}
+input::placeholder { color: #a8b7c4; }
+button {
+  padding: .65rem 1rem;
+  border: 1px solid transparent;
+  background: #8bdcca;
+  color: #122522;
+  font-weight: 750;
+  cursor: pointer;
+}
+form button { width: 100%; margin-top: 1rem; }
+button:disabled { opacity: .62; cursor: wait; }
+:focus-visible { outline: 2px solid #9bd9ff; outline-offset: 3px; }
+p { line-height: 1.55; text-wrap: pretty; }
+.hint { color: #b3c3d2; font-size: .875rem; overflow-wrap: anywhere; }
+.error { color: #ffc3ad; margin-block: .75rem; }
+.error:empty { margin: 0; }
+.room-heading h1 { margin-bottom: .5rem; }
+#source-detail { margin-block: 0 1rem; font-variant-numeric: tabular-nums; }
+#status { color: #abdeff; margin: 0 0 .5rem; font-size: .875rem; font-weight: 700; }
+#status[data-status="ready"] { color: #8bdcca; }
+#status[data-status="failed"] { color: #ffc3ad; }
+.player { background: #000; border-radius: .75rem; overflow: hidden; position: relative; }
+video { width: 100%; display: block; aspect-ratio: 16 / 9; }
+#play { position: absolute; inset: 50% auto auto 50%; transform: translate(-50%, -50%); }
+.back { margin-top: .75rem; }
+#retry { display: block; margin-top: 1rem; }
