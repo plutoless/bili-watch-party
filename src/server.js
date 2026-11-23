@@ -7,17 +7,20 @@ import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 import { createImporter, ImportError, parseSource } from './importer.js';
+import { createPlayback } from './playback.js';
 import { openRooms } from './rooms.js';
 
 const lifetime = 12 * 60 * 60;
 const cookieName = 'watch_party_host';
-const roomId = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
-const roomRoute = new RegExp('^/api/rooms/(' + roomId + ')(?:/(retry|invitation|approve|join|end))?$');
-const pageRoute = new RegExp('^/(?:rooms|invite)/' + roomId + '$');
-const mediaRoute = new RegExp('^/media/(' + roomId + ')\\.mp4$');
+const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
+const playerIdPattern = new RegExp('^' + uuid + '$');
+const roomRoute = new RegExp('^/api/rooms/(' + uuid + ')(?:/(retry|invitation|approve|join|end|playback))?$');
+const pageRoute = new RegExp('^/(?:rooms|invite)/' + uuid + '$');
+const mediaRoute = new RegExp('^/media/(' + uuid + ')\\.mp4$');
 const assets = {
   '/index.html': 'text/html; charset=utf-8',
   '/app.js': 'text/javascript; charset=utf-8',
+  '/player.js': 'text/javascript; charset=utf-8',
   '/style.css': 'text/css; charset=utf-8',
 };
 
@@ -166,6 +169,8 @@ export async function startServer({
   const rooms = openRooms(dataDir, importVideo, { now, retentionMs });
   const { admission } = rooms;
   const mediaResponses = new Map();
+  const playback = new Map();
+  const playbackNow = now === Date.now ? () => performance.now() : now;
   let origin = publicOrigin;
 
   function requireHost(req) {
@@ -174,6 +179,30 @@ export async function startServer({
 
   const visitorCookieName = id => 'watch_party_visitor_' + id;
   const visitorToken = (req, id) => getCookie(req, visitorCookieName(id));
+
+  async function roomPlayback(req, res, id) {
+    const body = await readJson(req);
+    const { role, action, playerId, position } = body ?? {};
+    if (role === 'host') requireHost(req);
+    else if (role !== 'visitor' || !admission.isApproved(id, visitorToken(req, id))) {
+      throw new HttpError(401, '仅房主和已批准的访客可读取播放状态。');
+    }
+    const hostCommand = ['play', 'pause', 'seek'].includes(action);
+    if ((!hostCommand && !['observe', 'ready', 'blocked'].includes(action)) ||
+        typeof playerId !== 'string' || !playerIdPattern.test(playerId) ||
+        (['ready', 'seek'].includes(action) && !Number.isFinite(position))) {
+      throw new HttpError(400, '播放操作无效。');
+    }
+    if (role !== 'host' && hostCommand) {
+      throw new HttpError(403, '只有房主可以控制共享播放。');
+    }
+    if (rooms.isEnded(id)) throw new HttpError(410, '房间已结束。');
+    const room = rooms.get(id);
+    if (room?.status !== 'ready') throw new HttpError(404, '视频还不可用。');
+    if (!playback.has(id)) playback.set(id, createPlayback(room.duration));
+    const { conflict, state } = playback.get(id).update(body, playbackNow());
+    return send(res, conflict ? 409 : 200, state);
+  }
 
   async function joinRoom(req, res, id) {
     const body = req.method === 'POST' ? await readJson(req) : null;
@@ -219,6 +248,7 @@ export async function startServer({
         break;
       case 'end':
         rooms.end(id);
+        playback.delete(id);
         for (const response of mediaResponses.get(id) ?? []) response.destroy();
         return send(res, 200, { status: 'ended' });
     }
@@ -262,6 +292,7 @@ export async function startServer({
     if (match) {
       const [, id, action] = match;
       if (action === 'join' && ['GET', 'POST'].includes(method)) return joinRoom(req, res, id);
+      if (action === 'playback' && method === 'POST') return roomPlayback(req, res, id);
       if (method === (action ? 'POST' : 'GET')) return hostRoom(req, res, id, action);
     }
     const media = mediaRoute.exec(path);

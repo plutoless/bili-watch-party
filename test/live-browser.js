@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import { chromium, devices, webkit } from 'playwright';
 import { createImporter } from '../src/importer.js';
 import { startServer } from '../src/server.js';
+import { checkSharedPlayback } from './playback-browser.js';
 
 const run = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH ?? 'ffmpeg';
@@ -17,24 +18,10 @@ const password = deployedOrigin ? process.env.HOST_PASSWORD : 'synthetic-browser
 const dataDir = deployedOrigin ? null : await mkdtemp(join(tmpdir(), 'watch-party-live-'));
 const mediaDir = dataDir ?? process.env.BROWSER_DATA_DIR;
 const simulateFirstFailure = process.env.SIMULATE_FIRST_FAILURE === '1';
+const synthetic = process.env.SYNTHETIC_VIDEO === '1';
 const ignoreHTTPSErrors = process.env.BROWSER_LOCAL_TLS === '1';
 let app;
 let failNextRequest = simulateFirstFailure;
-
-async function playAndSeek(page) {
-  await page.getByRole('button', { name: '播放', exact: true }).tap();
-  await page.waitForFunction(() => {
-    const video = document.querySelector('video');
-    return !video.paused && video.currentTime > 0.25 && video.videoWidth > 0 && !video.muted;
-  });
-  // Both engines exercise HTMLMediaElement seeking through the real player.
-  await page.locator('video').evaluate(video => { video.currentTime = 600; });
-  await page.waitForFunction(() => {
-    const video = document.querySelector('video');
-    return !video.paused && !video.seeking && video.readyState >= 2 &&
-      video.currentTime > 600.2 && video.currentTime < 615;
-  });
-}
 
 async function checkMediaFile(media) {
   const output = join(mediaDir, 'media', media.split('/').at(-1));
@@ -46,10 +33,10 @@ async function checkMediaFile(media) {
   const video = file.streams.find(stream => stream.codec_type === 'video');
   assert.equal(video?.codec_name, 'h264');
   assert.equal(file.streams.find(stream => stream.codec_type === 'audio')?.codec_name, 'aac');
-  assert.ok(Number(file.format.duration) > 810);
+  assert.ok(Number(file.format.duration) > (synthetic ? 59 : 810));
   await run(ffmpeg, ['-v', 'error', '-xerror', '-i', output, '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'],
     { timeout: 180_000 });
-  console.log('Public sample: H.264 ' + video.height + 'p + AAC, ' + Number(file.format.duration).toFixed(2) +
+  console.log((synthetic ? 'Synthetic' : 'Public') + ' sample: H.264 ' + video.height + 'p + AAC, ' + Number(file.format.duration).toFixed(2) +
     ' s, complete audio/video decode passed.');
 }
 
@@ -162,7 +149,7 @@ async function checkSessions(browser, profile, origin, checkFile) {
   assert.ok(new URL(duplicateTab.url()).pathname === hostPath, 'Duplicate submission must reuse the active room');
   await duplicateTab.close();
 
-  await Promise.all([playAndSeek(hostPage), playAndSeek(visitorPage)]);
+  await checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, hostPath });
   if (checkFile && mediaDir) await checkMediaFile(media);
 
   hostPage.once('dialog', dialog => dialog.accept());
@@ -174,11 +161,12 @@ async function checkSessions(browser, profile, origin, checkFile) {
   assert.equal((await visitor.request.get(origin + media, { headers: range })).status(), 401);
   await strangerPage.goto(invitation);
   await watchStatus(strangerPage, 'ended').waitFor();
-  console.log(profile + ': independent approval, mobile playback/600 s seek, denied third session, and room end passed. ' +
+  console.log(profile + ': independent approval, shared mobile playback and seek, denied third session, and room end passed. ' +
     'Observed approved visitor waiting for import: ' + waitedForVideo + '.');
 }
 
 try {
+  assert.ok(!synthetic || (!deployedOrigin && !simulateFirstFailure), 'Synthetic video requires the standalone test server');
   if (deployedOrigin) {
     assert.equal(new URL(deployedOrigin).protocol, 'https:', 'Deployed browser run requires HTTPS');
     assert.ok(password, 'Set HOST_PASSWORD for the deployed browser run');
@@ -188,9 +176,18 @@ try {
         'Test trust bypass is for isolated loopback HTTPS only');
     }
   } else {
-    app = await startServer({
-      dataDir, password, port: 0,
-      importVideo: createImporter({
+    const importVideo = synthetic
+      ? async ({ output, update, signal }) => {
+          update({ title: '合成验收视频' });
+          update({ status: 'preparing' });
+          await run(ffmpeg, [
+            '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24',
+            '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '60',
+            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', output,
+          ], { signal });
+          return 60;
+        }
+      : createImporter({
         ffmpeg, ffprobe,
         async fetch(...args) {
           if (failNextRequest) {
@@ -199,8 +196,8 @@ try {
           }
           return fetch(...args);
         },
-      }),
-    });
+      });
+    app = await startServer({ dataDir, password, port: 0, importVideo });
   }
   const origin = deployedOrigin ?? app.origin;
   for (const [engine, profile] of [[chromium, 'Pixel 7'], [webkit, 'iPhone 13']]) {

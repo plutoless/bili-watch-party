@@ -447,3 +447,90 @@ test('ending a room interrupts a media transfer already in progress', { timeout:
     }
   }, TypeError);
 });
+
+
+test('only the host directs playback and both players must acknowledge the current target', async t => {
+  let now = 1_000_000;
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 120;
+  }, { now: () => now });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  await app.status(host, room.id, 'ready');
+  const path = '/api/rooms/' + room.id + '/';
+  const post = (route, body, cookie = host) =>
+    app.request(path + route, { method: 'POST', body, cookie });
+  const { invitation } = await post('invitation', { action: 'generate' }).then(r => r.json());
+  const joined = await post('join', { token: invitation.token }, '');
+  const { requestId } = await joined.json();
+  const visitor = joined.headers.get('set-cookie').split(';')[0];
+
+  const playerIds = {
+    host: '00000000-0000-4000-8000-000000000001',
+    visitor: '00000000-0000-4000-8000-000000000002',
+  };
+  const send = (role, action, fields, cookie = role === 'host' ? host : visitor) =>
+    post('playback', { role, playerId: playerIds[role], action, ...fields }, cookie);
+
+  assert.equal((await send('visitor', 'observe')).status, 401);
+  assert.equal((await post('approve', { requestId })).status, 200);
+  const initial = await send('host', 'observe').then(r => r.json());
+  const version = { epoch: initial.epoch, version: initial.version };
+  assert.deepEqual(initial.ready, { host: false, visitor: false });
+  assert.equal((await send('host', 'play', version)).status, 409);
+  assert.equal((await send('host', 'seek', { ...version, position: 12 }, visitor)).status, 401);
+  assert.equal((await send('visitor', 'seek', { ...version, position: 12 })).status, 403);
+
+  assert.equal((await send('host', 'ready', { ...version, position: 0, claim: true })).status, 200);
+  assert.equal((await send('visitor', 'ready', { ...version, position: 0, claim: true })).status, 200);
+  const start = await send('host', 'play', version).then(r => r.json());
+  assert.ok(start.startsAt > now);
+  const following = await send('visitor', 'observe').then(r => r.json());
+  assert.equal(following.startsAt, start.startsAt);
+  assert.equal(following.version, start.version);
+
+  now = start.startsAt + 500;
+  const seeking = await send('host', 'seek', { ...version, version: start.version, position: 25 }).then(r => r.json());
+  assert.equal(seeking.position, 25);
+  assert.equal(seeking.startsAt, null);
+  assert.deepEqual(seeking.ready, { host: false, visitor: false });
+  const seekVersion = { ...version, version: seeking.version };
+  assert.equal((await send('visitor', 'ready', { ...version, position: 0 })).status, 409);
+  assert.equal((await send('visitor', 'ready', { ...seekVersion, position: 24 })).status, 409);
+  const waiting = await send('host', 'ready', { ...seekVersion, position: 25 }).then(r => r.json());
+  assert.equal(waiting.startsAt, null);
+  const resumed = await send('visitor', 'ready', { ...seekVersion, position: 25 }).then(r => r.json());
+  assert.ok(resumed.startsAt > now);
+
+  now = resumed.startsAt + 750;
+  const paused = await send('host', 'pause', { ...seekVersion, version: resumed.version }).then(r => r.json());
+  assert.equal(paused.position, 25.75);
+  assert.equal(paused.startsAt, null);
+  assert.equal((await send('host', 'seek', { ...seekVersion, position: 95 })).status, 409);
+  const stillPaused = await send('visitor', 'observe').then(r => r.json());
+  assert.equal(stillPaused.position, 25.75);
+  assert.equal(stillPaused.version, paused.version);
+
+  const pausedVersion = { ...version, version: paused.version };
+  await send('host', 'ready', { ...pausedVersion, position: 25.75 });
+  await send('visitor', 'ready', { ...pausedVersion, position: 25.75 });
+  const retryStart = await send('host', 'play', pausedVersion).then(r => r.json());
+  const blocked = await send('visitor', 'blocked', { ...version, version: retryStart.version }).then(r => r.json());
+  assert.equal(blocked.startsAt, null);
+  assert.deepEqual(blocked.blocked, ['visitor']);
+  assert.deepEqual(blocked.ready, { host: false, visitor: false });
+  assert.equal((await send('visitor', 'ready', { ...version, version: retryStart.version, position: 25.75 })).status, 409);
+  const blockedVersion = { ...version, version: blocked.version };
+  await send('host', 'ready', { ...blockedVersion, position: 25.75 });
+  const rearmed = await send('visitor', 'ready', { ...blockedVersion, position: 25.75 }).then(r => r.json());
+  assert.ok(rearmed.startsAt > now);
+  assert.deepEqual(rearmed.blocked, []);
+
+  now += 4_000;
+  const expired = await send('host', 'observe').then(r => r.json());
+  assert.equal(expired.startsAt, null);
+  assert.equal(expired.wantsPlay, false);
+  assert.equal(expired.ownsSeat, false);
+  assert.deepEqual(expired.ready, { host: false, visitor: false });
+});

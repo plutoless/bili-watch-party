@@ -5,7 +5,7 @@
     "test": "node --test test/host.test.js",
     "start": "node src/server.js",
     "test:browser": "node test/live-browser.js",
-    "check": "node --check src/server.js && node --check src/importer.js && node --check src/rooms.js && node --check src/admission.js && node --check public/app.js"
+    "check": "node --check src/server.js && node --check src/importer.js && node --check src/rooms.js && node --check src/admission.js && node --check src/playback.js && node --check public/app.js && node --check public/player.js"
   },
   "type": "module",
   "engines": {
