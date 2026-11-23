@@ -21,6 +21,8 @@ second=2222222222222222222222222222222222222222
 third=3333333333333333333333333333333333333333
 for directory in "$fixture/first" "$fixture/upgrade"; do
   cp -R Dockerfile .dockerignore compose.yaml compose.release.yaml package.json src public "$directory"
+  # HTTPS on the fixture port is sufficient. Leave the runner's HTTP port available.
+  sed -i '/WATCH_BIND_IP.*:80:80/d' "$directory/compose.yaml"
   printf '%s\n' '{' 'admin off' 'skip_install_trust' 'auto_https disable_redirects' '}' \
     '{$PUBLIC_ORIGIN} {' 'tls internal' 'reverse_proxy 127.0.0.1:3000' '}' >"$directory/Caddyfile"
 done
@@ -37,8 +39,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+export FIXTURE_DOCKER_ERROR="$fixture/docker-error"
+docker() {
+  command docker "$@" 2>"$FIXTURE_DOCKER_ERROR"
+}
+export -f docker
+
 deploy() {
-  HOME="$fixture/home" bash scripts/deploy-backend.sh "$2" "$1" "$api" "$web"
+  if ! HOME="$fixture/home" bash scripts/deploy-backend.sh "$2" "$1" "$api" "$web"; then
+    grep -Eio 'address already in use|container .* exited|container .* is unhealthy|not found|permission denied|network .* does not exist|port is already allocated|bind source path does not exist' \
+      "$FIXTURE_DOCKER_ERROR" || true
+    compose "$1" "$2" ps --all --format json | jq -c '{Service, State, Health, ExitCode}' || true
+    exit 1
+  fi
 }
 
 check_https() {
