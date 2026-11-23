@@ -48,7 +48,7 @@ PR 合入 `main` 后，Actions 测试并构建确切的合并 SHA。生产作业
 ## 隔离验收与首次生产记录
 
 - `npm run check`、`npm test`、`npm run test:release` 验证代码与隔离发布流程。发布夹具使用本地 Git 仓库并替代 SSH、Compose 和 Vercel 的外部命令，覆盖默认与自定义 SSH 端口、缺失配置、主机身份异常、连接失败、构建和健康检查错误、Vercel 切换及回退、同 SHA 重试和旧 SHA 跳过。
-- `npm run test:release:compose` 在独立 Linux Docker Engine 上验证首次启用和两次升级。需要回环 TCP 80 与 18443 端口、Compose v2、curl 和 jq。夹具创建专用项目和卷，使用 Caddy 本地 CA 检查 HTTPS，并验证应用数据与 CA 卷得以复用。
+- `npm run test:release:compose` 在独立 Linux Docker Engine 上验证首次启用和两次升级。需要回环 TCP 18443 端口、Compose v2、curl 和 jq。夹具创建专用项目和卷，使用 Caddy 本地 CA 检查 HTTPS，并验证应用数据与 CA 卷得以复用。
 - 安装 Chromium、WebKit、FFmpeg 和 FFprobe 后，用 `BROWSER_SYNTHETIC_SPLIT=1 SYNTHETIC_VIDEO=1 npm run test:browser` 在回环 HTTPS 上验收旧网页对新后台的兼容性。用 `BROWSER_WEB_SOURCE` 指向上一份网页源码的私有检出，省略时使用当前网页源码。夹具生成并清理合成视频，检查移动浏览器会话、房间与邀请深链接、访客审批、授权 `206`、陌生 Origin 拒绝、播放和跳转。
 
 实际生产首发由维护者另行启用。核对域名、凭据和既有卷后，运行当前 `main` 的 **Release production**。通过两个正式 HTTPS 域检查网页和后台的 SHA，再用公开片源在独立验收房间测试登录、审批、播放和跳转。记录 Actions 运行链接、日期、两端 SHA、HTTPS 和浏览器验收结果及是否复用原卷。配置、Cookie、邀请、媒体地址、影片及原始日志留在私有位置。

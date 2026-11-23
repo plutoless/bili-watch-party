@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-# Runs against a local Linux Docker Engine with loopback ports 80 and 18443 free.
+# Runs against a local Linux Docker Engine with loopback port 18443 free.
 [[ $(uname -s) == Linux ]] || { echo 'Compose fixture requires Linux.'; exit 1; }
 fixture=$(mktemp -d)
 project=watch-release-${fixture##*.}
@@ -47,9 +47,12 @@ export -f docker
 
 deploy() {
   if ! HOME="$fixture/home" bash scripts/deploy-backend.sh "$2" "$1" "$api" "$web"; then
-    grep -Eio 'address already in use|container .* exited|container .* is unhealthy|not found|permission denied|network .* does not exist|port is already allocated|bind source path does not exist' \
+    grep -Eio 'address already in use|container .* exited|container .* is unhealthy|not found|permission denied|network .* does not exist|port is already allocated|bind source path does not exist|cannot join.*' \
       "$FIXTURE_DOCKER_ERROR" || true
     compose "$1" "$2" ps --all --format json | jq -c '{Service, State, Health, ExitCode}' || true
+    compose "$1" "$2" logs --tail 30 app caddy | grep -Eio \
+      'E[A-Z]{3,}|ERR_[A-Z_]+|unable to open database file|database is locked|MODULE_NOT_FOUND|Cannot find module|TypeError|SyntaxError|ReferenceError|必须是 HTTPS 源地址|设置至少 16 字符|房间保留期限必须是正数|拆分部署需要不同' |
+      sort -u || true
     exit 1
   fi
 }
