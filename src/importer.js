@@ -11,6 +11,7 @@ const bilibiliApi = 'https://api.bilibili.com';
 const sourceHosts = new Set(['www.bilibili.com', 'm.bilibili.com', 'bilibili.com']);
 const cdnDomain = /(?:^|\.)(?:bilivideo\.com|bilivideo\.cn)$/;
 const trackLimit = 512 * 1024 * 1024;
+const accessStatuses = new Set([401, 403, 404, 410, 451]);
 
 const failures = {
   invalid: ['请输入 B 站投稿视频链接，例如 https://www.bilibili.com/video/BV1TDyazeEuY。', false],
@@ -87,7 +88,7 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
     const response = await upstream(url, { headers: { Referer: referer } }, signal, 20_000);
     if (!response.ok) {
       await response.body?.cancel();
-      if ([401, 403, 404, 451].includes(response.status)) throw new ImportError('access');
+      if (accessStatuses.has(response.status)) throw new ImportError('access');
       throw new ImportError('network');
     }
     let result;
@@ -105,8 +106,11 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
 
   async function download(track, destination, referer, signal) {
     const urls = new Set([track.baseUrl ?? track.base_url, ...(track.backupUrl ?? track.backup_url ?? [])]);
+    const failedCandidates = new Set();
     for (const candidate of urls) {
       let url = cdnUrl(candidate);
+      if (!url) continue;
+      let failure = 'network';
       for (let redirects = 0; url && redirects <= 2; redirects++) {
         if (signal.aborted) throw new ImportError('network');
         let response;
@@ -123,6 +127,7 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
         }
         if (response.status !== 200 || !response.body) {
           await response.body?.cancel();
+          if (accessStatuses.has(response.status)) failure = 'access';
           break;
         }
         if (Number(response.headers.get('content-length')) > trackLimit) {
@@ -147,8 +152,10 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
         await rm(destination, { force: true });
         break;
       }
+      failedCandidates.add(failure);
     }
-    throw new ImportError('network');
+    const allDenied = failedCandidates.size === 1 && failedCandidates.has('access');
+    throw new ImportError(allDenied ? 'access' : 'network');
   }
 
   return async function importVideo({ source, workDir, output, update, signal }) {

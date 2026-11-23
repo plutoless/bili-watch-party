@@ -214,3 +214,37 @@ test('public access, missing part, and unsupported format have distinct actionab
     });
   }
 });
+
+test('media download tries backup URLs and distinguishes a refusal from a transient error', async t => {
+  for (const [backupStatus, expected] of [[404, 'access'], [503, 'network']]) {
+    await t.test(expected, async t => {
+      const attempted = [];
+      const importer = createImporter({ fetch: async url => {
+        if (url.pathname.endsWith('/view')) {
+          return Response.json({ code: 0, data: {
+            title: '验收影片', pages: [{ page: 1, cid: 123, duration: 818 }],
+          } });
+        }
+        if (url.pathname.endsWith('/playurl')) {
+          return Response.json({ code: 0, data: { dash: {
+            video: [{
+              id: 32, codecs: 'avc1.64001f',
+              baseUrl: 'https://cdn.bilivideo.com/primary',
+              backupUrl: ['https://cdn.bilivideo.com/backup'],
+            }],
+            audio: [{ codecs: 'mp4a.40.2' }],
+          } } });
+        }
+        attempted.push(url.pathname);
+        return new Response(null, { status: url.pathname === '/primary' ? 403 : backupStatus });
+      } });
+      const app = await setup(t, importer);
+      const cookie = await app.login();
+      const [, room] = await app.submit(cookie);
+      const failed = await app.status(cookie, room.id, 'failed');
+      assert.deepEqual(attempted, ['/primary', '/backup']);
+      assert.equal(failed.error.code, expected);
+      assert.equal(failed.mediaUrl, null);
+    });
+  }
+});
