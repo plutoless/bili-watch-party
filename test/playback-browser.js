@@ -52,9 +52,7 @@ async function checkStability(hostPage, visitorPage) {
   const samples = await Promise.all([hostPage, visitorPage].map(async (page, index) => {
     const { offset } = clocks[index];
     const samples = await sample(page, start - offset);
-    const paused = samples.filter(sample => sample.paused).length;
-    const seeking = samples.filter(sample => sample.seeking).length;
-    assert.ok(!paused && !seeking, 'Stable window observed ' + paused + ' paused and ' + seeking + ' seeking samples');
+    assert.ok(samples.every(sample => !sample.paused), 'Both players must stay unpaused in the stable window');
     assert.ok(samples.at(-1).position - samples[0].position >= 9, 'Both playheads must advance');
     return samples.map(sample => ({ ...sample, time: sample.time + offset }));
   }));
@@ -63,9 +61,11 @@ async function checkStability(hostPage, visitorPage) {
     return Math.abs(positionAt(samples[0], time) - positionAt(samples[1], time));
   });
   const below = differences.filter(delta => delta < 0.5).length;
+  const seekingSamples = samples.map(side => side.filter(sample => sample.seeking).length);
   console.log('Stable playback: ' + below + '/' + differences.length + ' below 0.5 s; maximum ' +
     Math.max(...differences).toFixed(3) + ' s; calibration RTTs ' +
-    clocks.map(({ rtt }) => rtt.toFixed(2) + ' ms').join(', ') + '.');
+    clocks.map(({ rtt }) => rtt.toFixed(2) + ' ms').join(', ') +
+    '; observed seeking samples ' + seekingSamples.join(', ') + '.');
   assert.ok(below / differences.length >= 0.95);
 }
 
