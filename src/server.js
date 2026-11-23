@@ -160,6 +160,7 @@ export async function startServer({
   retentionMs = 24 * 60 * 60_000,
   publicOrigin,
   webOrigin,
+  releaseSha,
   importVideo = createImporter(),
 } = {}) {
   if (typeof password !== 'string' || password.length < 16) {
@@ -306,6 +307,9 @@ export async function startServer({
     if (method === 'POST' && requestOrigin !== (webOrigin || origin)) {
       throw new HttpError(403, '请从本应用网页提交。');
     }
+    if (path === '/api/release' && method === 'GET' && releaseSha) {
+      return send(res, 200, { sha: releaseSha });
+    }
     if (path === '/api/session' && method === 'POST') {
       const body = await readJson(req);
       // The application binds exclusively to loopback. Its HTTPS proxy must overwrite this header.
@@ -393,6 +397,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     port: Number(process.env.PORT ?? 3000),
     publicOrigin: process.env.PUBLIC_ORIGIN,
     webOrigin: process.env.WEB_ORIGIN,
+    releaseSha: process.env.RELEASE_SHA,
     importVideo: createImporter({ ffmpeg: process.env.FFMPEG_PATH, ffprobe: process.env.FFPROBE_PATH }),
   });
   console.log('房主入口已启动。');

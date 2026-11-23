@@ -8,6 +8,7 @@ import { chromium, devices, webkit } from 'playwright';
 import { createImporter } from '../src/importer.js';
 import { startServer } from '../src/server.js';
 import { checkSharedPlayback } from './playback-browser.js';
+import { startSplitFixture } from './split-browser-fixture.js';
 
 const run = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH ?? 'ffmpeg';
@@ -20,8 +21,10 @@ const dataDir = deployedOrigin ? null : await mkdtemp(join(tmpdir(), 'watch-part
 const mediaDir = dataDir ?? process.env.BROWSER_DATA_DIR;
 const simulateFirstFailure = process.env.SIMULATE_FIRST_FAILURE === '1';
 const synthetic = process.env.SYNTHETIC_VIDEO === '1';
-const ignoreHTTPSErrors = process.env.BROWSER_LOCAL_TLS === '1';
+const splitFixture = process.env.BROWSER_SYNTHETIC_SPLIT === '1';
+const ignoreHTTPSErrors = splitFixture || process.env.BROWSER_LOCAL_TLS === '1';
 let app;
+let fixture;
 let failNextRequest = simulateFirstFailure;
 
 async function checkMediaFile(media) {
@@ -119,7 +122,7 @@ async function checkSessions(browser, profile, origin, apiOrigin, checkFile) {
       'Mobile page must fit the viewport');
   }
 
-  if (deployedOrigin) {
+  if (deployedOrigin || splitFixture) {
     for (const [context, cookiePrefix] of [[host, 'watch_party_host'], [visitor, 'watch_party_visitor_']]) {
       const cookie = (await context.cookies(apiOrigin)).find(cookie => cookie.name.startsWith(cookiePrefix));
       assert.ok(cookie?.secure && cookie.httpOnly && cookie.sameSite === 'Strict');
@@ -197,6 +200,7 @@ async function checkSessions(browser, profile, origin, apiOrigin, checkFile) {
 
 try {
   assert.ok(!synthetic || (!deployedOrigin && !simulateFirstFailure), 'Synthetic video requires the standalone test server');
+  assert.ok(!splitFixture || synthetic, 'The isolated split fixture requires SYNTHETIC_VIDEO=1');
   assert.ok(!deployedApiOrigin || deployedOrigin, 'BROWSER_API_ORIGIN requires BROWSER_ORIGIN');
   if (deployedOrigin) {
     for (const origin of [deployedOrigin, deployedApiOrigin ?? deployedOrigin]) {
@@ -210,6 +214,7 @@ try {
     assert.ok(password, 'Set HOST_PASSWORD for the deployed browser run');
     assert.ok(!simulateFirstFailure, 'Failure injection requires the test-managed app server');
   } else {
+    if (splitFixture) fixture = await startSplitFixture(dataDir);
     const importVideo = synthetic
       ? async ({ output, update, signal }) => {
           update({ title: '合成验收视频' });
@@ -231,10 +236,13 @@ try {
           return fetch(...args);
         },
       });
-    app = await startServer({ dataDir, password, port: 0, importVideo });
+    app = await startServer({
+      dataDir, password, port: 0, importVideo, webOrigin: fixture?.webOrigin, publicOrigin: fixture?.apiOrigin,
+    });
+    fixture?.bind(app);
   }
-  const origin = deployedOrigin ?? app.origin;
-  const apiOrigin = deployedApiOrigin ?? origin;
+  const origin = deployedOrigin ?? fixture?.webOrigin ?? app.origin;
+  const apiOrigin = deployedApiOrigin ?? fixture?.apiOrigin ?? origin;
   for (const [engine, profile] of [[chromium, 'Pixel 7'], [webkit, 'iPhone 13']]) {
     const browser = await engine.launch();
     try {
@@ -250,6 +258,7 @@ try {
     .replaceAll(mediaDir ?? '\0', '[temporary data]'));
   process.exitCode = 1;
 } finally {
+  await fixture?.close();
   await app?.close();
   if (dataDir) await rm(dataDir, { recursive: true, force: true });
 }

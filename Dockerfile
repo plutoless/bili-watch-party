@@ -11,4 +11,6 @@ COPY public ./public
 COPY package.json ./
 USER node
 ENV DATA_DIR=/data
+ARG RELEASE_SHA
+ENV RELEASE_SHA=${RELEASE_SHA}
 CMD ["node", "src/server.js"]
