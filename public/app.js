@@ -6,10 +6,11 @@ const sourceForm = byId('source-form');
 const retry = byId('retry');
 const roomError = byId('room-error');
 const actionMessage = byId('action-message');
+const apiOrigin = document.querySelector('meta[name="watch-api-origin"]')?.content ?? '';
 const visitor = location.pathname.startsWith('/invite/');
 const path = visitor ? location.pathname.replace('/invite/', '/rooms/') : location.pathname;
 const roomPath = path.startsWith('/rooms/') ? '/api' + path : null;
-const player = createPlayer({ roomPath, role: visitor ? 'visitor' : 'host' });
+const player = createPlayer({ apiOrigin, roomPath, role: visitor ? 'visitor' : 'host' });
 let invitationToken = visitor ? location.hash.slice(1) : '';
 let pollVersion = 0;
 let actionPending = false;
@@ -44,7 +45,8 @@ function show(section) {
 async function request(path, body) {
   let response;
   try {
-    response = await fetch(path, {
+    response = await fetch(apiOrigin + path, {
+      credentials: 'include',
       ...(body !== undefined && {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       }),

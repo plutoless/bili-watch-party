@@ -70,6 +70,13 @@ function sessionCookie(name, token, secure) {
   return name + '=' + token + '; Path=/; HttpOnly; SameSite=Strict' + (secure ? '; Secure' : '');
 }
 
+function validateHttpsOrigin(value, name) {
+  const origin = URL.parse(value);
+  if (origin?.protocol !== 'https:' || origin.origin !== value) {
+    throw new Error(name + ' 必须是 HTTPS 源地址，且无结尾斜杠。');
+  }
+}
+
 function hostSession(password) {
   const secret = randomBytes(32);
   const digest = value => createHash('sha256').update(value).digest();
@@ -152,14 +159,18 @@ export async function startServer({
   now = Date.now,
   retentionMs = 24 * 60 * 60_000,
   publicOrigin,
+  webOrigin,
   importVideo = createImporter(),
 } = {}) {
   if (typeof password !== 'string' || password.length < 16) {
     throw new Error('设置至少 16 字符的 HOST_PASSWORD。');
   }
-  if (publicOrigin && (new URL(publicOrigin).protocol !== 'https:' ||
-      new URL(publicOrigin).origin !== publicOrigin)) {
-    throw new Error('PUBLIC_ORIGIN 必须是 HTTPS 源地址，且无结尾斜杠。');
+  if (publicOrigin) validateHttpsOrigin(publicOrigin, 'PUBLIC_ORIGIN');
+  if (webOrigin) {
+    validateHttpsOrigin(webOrigin, 'WEB_ORIGIN');
+    if (!publicOrigin || webOrigin === publicOrigin) {
+      throw new Error('拆分部署需要不同的 WEB_ORIGIN 和 PUBLIC_ORIGIN。');
+    }
   }
   if (!Number.isSafeInteger(retentionMs) || retentionMs < 1) {
     throw new Error('房间保留期限必须是正数。');
@@ -275,7 +286,24 @@ export async function startServer({
   async function route(req, res) {
     const path = new URL(req.url, 'http://localhost').pathname;
     const method = req.method;
-    if (method === 'POST' && req.headers.origin !== origin) {
+    const requestOrigin = req.headers.origin;
+    if (webOrigin && (path.startsWith('/api/') || path.startsWith('/media/'))) {
+      res.setHeader('Vary', 'Origin');
+      if (requestOrigin !== undefined && requestOrigin !== webOrigin) {
+        throw new HttpError(403, '请从本应用网页访问。');
+      }
+      if (requestOrigin === webOrigin) {
+        res.setHeader('Access-Control-Allow-Origin', webOrigin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Access-Control-Expose-Headers', 'Accept-Ranges, Content-Range');
+        if (method === 'OPTIONS') {
+          res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST');
+          res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range');
+          return send(res, 204);
+        }
+      }
+    }
+    if (method === 'POST' && requestOrigin !== (webOrigin || origin)) {
       throw new HttpError(403, '请从本应用网页提交。');
     }
     if (path === '/api/session' && method === 'POST') {
@@ -342,9 +370,11 @@ export async function startServer({
     await rooms.close();
     throw error;
   }
-  origin ??= 'http://127.0.0.1:' + server.address().port;
+  const localOrigin = 'http://127.0.0.1:' + server.address().port;
+  origin ??= localOrigin;
   return {
     origin,
+    localOrigin,
     async close() {
       await new Promise(resolve => {
         server.close(resolve);
@@ -362,6 +392,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     retentionMs: Number(process.env.ENDED_ROOM_RETENTION_HOURS ?? 24) * 60 * 60_000,
     port: Number(process.env.PORT ?? 3000),
     publicOrigin: process.env.PUBLIC_ORIGIN,
+    webOrigin: process.env.WEB_ORIGIN,
     importVideo: createImporter({ ffmpeg: process.env.FFMPEG_PATH, ffprobe: process.env.FFPROBE_PATH }),
   });
   console.log('房主入口已启动。');
