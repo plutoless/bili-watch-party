@@ -25,8 +25,8 @@ export function createPlayer({ roomPath, role }) {
   let primed = false;
   let claim = false;
   let gestureFailed = false;
-  let reportBlocked = false;
-  let starting = false;
+  let reportBlocked;
+  let pendingStart;
   let networkError = false;
   let commandMessage = '';
   let clockSamples = [];
@@ -51,14 +51,14 @@ export function createPlayer({ roomPath, role }) {
   }
 
   function render() {
-    const canControl = host && state?.ownsSeat && primed && !networkError;
+    const canControl = host && state?.ownsSeat && !networkError;
     const bothReady = state?.ready.host && state.ready.visitor;
     prepare.hidden = primed || Boolean(state?.otherPlayer);
     prepare.disabled = priming || !state || networkError || video.readyState < video.HAVE_CURRENT_DATA;
     prepare.textContent = gestureFailed ? '再次点按以准备' : '准备好了';
     play.hidden = !host;
     play.textContent = state?.wantsPlay ? '暂停' : '播放';
-    play.disabled = !canControl || Boolean(queuedCommand) || (!state.wantsPlay && !bothReady);
+    play.disabled = !canControl || Boolean(queuedCommand) || (!state.wantsPlay && (!bothReady || !primed));
     byId('seek-controls').hidden = !host;
     seek.disabled = !canControl || Boolean(queuedCommand);
 
@@ -93,29 +93,33 @@ export function createPlayer({ roomPath, role }) {
     }
   }
 
-  function allowPlaybackRetry() {
+  function markGestureFailed() {
     primed = false;
     claim = false;
     gestureFailed = true;
-    reportBlocked = Boolean(state?.ownsSeat);
     pauseVideo();
-    wake();
   }
 
   function beginPlayback(target) {
-    if (starting || video.seeking) return;
+    if (pendingStart || video.seeking) return;
     if (Math.abs(video.currentTime - target) > 0.25) {
       video.currentTime = target;
       return;
     }
-    const generation = loadGeneration;
-    starting = true;
+    const { epoch, version } = state;
+    const attempt = { action: 'blocked', epoch, version };
+    pendingStart = attempt;
     video.play().catch(error => {
-      if (generation === loadGeneration && error.name !== 'AbortError') allowPlaybackRetry();
+      if (pendingStart === attempt && error.name !== 'AbortError') {
+        reportBlocked = attempt;
+        pauseVideo();
+        wake();
+      }
     }).finally(() => {
-      if (generation !== loadGeneration) return;
-      starting = false;
-      render();
+      if (pendingStart === attempt) {
+        pendingStart = undefined;
+        render();
+      }
     });
   }
 
@@ -139,7 +143,11 @@ export function createPlayer({ roomPath, role }) {
   function followTimeline() {
     clearTimeout(startTimer);
     if (!state || priming) return;
-    if (state.startsAt === null || !state.ownsSeat || !primed || networkError) {
+    if (reportBlocked || networkError) {
+      pauseVideo();
+      return;
+    }
+    if (state.startsAt === null || !state.ownsSeat || !primed) {
       pauseAndAlign(state.position);
       return;
     }
@@ -169,7 +177,7 @@ export function createPlayer({ roomPath, role }) {
     if (!state) return { action: 'observe' };
     const { epoch, version } = state;
     if (queuedCommand) return queuedCommand;
-    if (reportBlocked) return { action: 'blocked', epoch, version };
+    if (reportBlocked) return reportBlocked;
     const buffered = video.readyState >= video.HAVE_FUTURE_DATA ||
       (video.readyState >= video.HAVE_CURRENT_DATA && state.position >= video.duration - alignmentTolerance);
     if (primed && !priming && buffered && !video.seeking && !state.ready[role] &&
@@ -179,49 +187,60 @@ export function createPlayer({ roomPath, role }) {
     return { action: 'observe' };
   }
 
+  async function requestPlayback(operation) {
+    const sent = performance.now();
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ role, playerId, ...operation }),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (!response.ok && response.status !== 409) throw new Error('Playback request failed');
+    const result = await response.json();
+    return { ok: response.ok, result, sent, received: performance.now() };
+  }
+
   async function synchronize() {
     const generation = loadGeneration;
     const operation = nextOperation();
-    const sent = performance.now();
     inFlight = true;
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role, playerId, ...operation }),
-        signal: AbortSignal.timeout(2000),
-      });
-      if (!response.ok && response.status !== 409) throw new Error('Playback request failed');
-      const result = await response.json();
+      const reply = await requestPlayback(operation).catch(() => null);
       if (generation !== loadGeneration) return;
+      if (!reply) {
+        networkError = true;
+        clearTimeout(startTimer);
+        if (!priming) pauseVideo();
+        if (operation === queuedCommand) commandMessage = '连接中断，请确认播放状态后重试。';
+        return;
+      }
+      const { ok, result, sent, received } = reply;
       networkError = false;
       if (result.epoch !== state?.epoch) {
         clockSamples = [];
         if (state) primed = claim = false;
       }
-      updateClock(sent, performance.now(), result.serverTime);
+      updateClock(sent, received, result.serverTime);
       if (state?.ownsSeat && !result.ownsSeat) primed = claim = false;
       state = result;
       if (operation === queuedCommand) {
-        commandMessage = response.ok ? '' : '播放状态已更新，请重试操作。';
+        commandMessage = ok ? '' : '播放状态已更新，请重试操作。';
       }
-      if (operation.action === 'blocked' && (response.ok || !state.ownsSeat)) reportBlocked = false;
+      if (operation === reportBlocked) {
+        reportBlocked = undefined;
+        if (ok || state.blocked.includes(role)) markGestureFailed();
+      }
       if (state.ownsSeat && state.ready[role]) claim = false;
       if (claim && state.otherPlayer) primed = claim = false;
 
       const timeline = state.epoch + ':' + state.version;
       if (timeline !== currentTimeline) {
         currentTimeline = timeline;
+        pendingStart = undefined;
         hardDriftSamples = 0;
         nextHardSeek = 0;
       }
       followTimeline();
-    } catch {
-      if (generation !== loadGeneration) return;
-      networkError = true;
-      clearTimeout(startTimer);
-      if (!priming) pauseVideo();
-      if (operation === queuedCommand) commandMessage = '连接中断，请确认播放状态后重试。';
     } finally {
       if (generation === loadGeneration) {
         if (operation === queuedCommand) queuedCommand = undefined;
@@ -258,7 +277,7 @@ export function createPlayer({ roomPath, role }) {
       claim = true;
       gestureFailed = false;
     } catch {
-      if (generation === loadGeneration) allowPlaybackRetry();
+      if (generation === loadGeneration) markGestureFailed();
     } finally {
       if (generation === loadGeneration) {
         priming = false;
@@ -299,7 +318,8 @@ export function createPlayer({ roomPath, role }) {
       clearTimeout(startTimer);
       state = undefined;
       queuedCommand = undefined;
-      inFlight = priming = primed = claim = gestureFailed = reportBlocked = starting = networkError = false;
+      reportBlocked = pendingStart = undefined;
+      inFlight = priming = primed = claim = gestureFailed = networkError = false;
       seekPreview = false;
       commandMessage = '';
       clockSamples = [];

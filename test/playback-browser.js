@@ -52,8 +52,9 @@ async function checkStability(hostPage, visitorPage) {
   const samples = await Promise.all([hostPage, visitorPage].map(async (page, index) => {
     const { offset } = clocks[index];
     const samples = await sample(page, start - offset);
-    assert.ok(samples.every((sample, index) => !sample.paused && !sample.seeking &&
-      (!index || sample.position >= samples[index - 1].position)), 'Scheduled stable window must play throughout');
+    const paused = samples.filter(sample => sample.paused).length;
+    const seeking = samples.filter(sample => sample.seeking).length;
+    assert.ok(!paused && !seeking, 'Stable window observed ' + paused + ' paused and ' + seeking + ' seeking samples');
     assert.ok(samples.at(-1).position - samples[0].position >= 9, 'Both playheads must advance');
     return samples.map(sample => ({ ...sample, time: sample.time + offset }));
   }));
@@ -127,6 +128,21 @@ function denyNextPlay(page) {
     video.play = function () {
       video.play = play;
       return Promise.reject(new DOMException('Injected play rejection', 'NotAllowedError'));
+    };
+  });
+}
+
+function delayNextPlayFailure(page) {
+  return page.locator('video').evaluate(video => {
+    const play = video.play;
+    video.play = function () {
+      video.play = play;
+      return new Promise((resolve, reject) => {
+        video.addEventListener('test-reject-play', () => {
+          reject(new DOMException('Injected obsolete play rejection', 'NotAllowedError'));
+        }, { once: true });
+        video.dataset.delayedPlay = 'true';
+      });
     };
   });
 }
@@ -237,4 +253,29 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await visitorPage.getByRole('button', { name: '再次点按以准备' }).tap();
   await Promise.all([waitForPlaying(hostPage, restartPosition + 0.25), waitForPlaying(visitorPage, restartPosition + 0.25)]);
   console.log('Paused seek stayed paused; scheduled gesture rejection held the room until the next tap.');
+
+  const waitForPause = () => Promise.all([hostPage, visitorPage].map(page =>
+    page.getByText('已暂停，等待房主播放。').waitFor()));
+  await play.tap();
+  await waitForPause();
+  await delayNextPlayFailure(visitorPage);
+  await play.tap();
+  await visitorPage.locator('video[data-delayed-play]').waitFor();
+  await play.tap();
+  await waitForPause();
+  await visitorPage.locator('video').dispatchEvent('test-reject-play');
+  await delay(600);
+  assert.equal(await visitorPage.getByRole('button', { name: '再次点按以准备' }).isVisible(), false);
+  await waitForPause();
+
+  await denyNextPlay(hostPage);
+  await play.tap();
+  await hostPage.getByText(/浏览器阻止了起播/).waitFor();
+  assert.ok(await play.isEnabled(), 'Host must be able to cancel a blocked start');
+  await play.tap();
+  await hostPage.getByRole('button', { name: '再次点按以准备' }).tap();
+  await waitForPause();
+  await delay(1100);
+  assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+  console.log('Obsolete rejection was ignored; host could cancel a blocked start and re-prepare without resuming.');
 }
