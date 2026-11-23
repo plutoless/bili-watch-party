@@ -26,6 +26,7 @@ npm start
 | `PORT` | 本机端口，默认 3000 |
 | `DATA_DIR` | 运行数据目录，默认 `~/.bili-watch-party` |
 | `PUBLIC_ORIGIN` | 浏览器访问的 HTTPS 源地址，本机 HTTP 运行时留空 |
+| `WEB_ORIGIN` | 拆分部署时允许的正式网页 HTTPS 源地址，单机运行时留空 |
 | `ENDED_ROOM_RETENTION_HOURS` | 已结束房间的成品与结束记录保留小时数，默认 24 |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | 可选，指定程序路径，默认从 PATH 读取 |
 
@@ -55,6 +56,10 @@ HTTPS 模式下房主和访客 Cookie 都带 `Secure`、`HttpOnly` 和 `SameSite
 
 4. 从配置的 HTTPS 域名打开房主入口。Caddy 为域名申请及续期证书，并在同一个容器网络命名空间内通过回环地址访问应用。对主机只发布代理的 TCP 80 和 443。应用数据卷保存 SQLite、暂存文件和成品，Caddy 数据卷保存证书及其私钥。配置和这些卷仅供服务器管理员访问。
 5. 升级应用时使用 `up -d --build --force-recreate` 一起重建两个容器。迁移时先停止服务，再将应用数据卷复制至新主机的对应卷，保留卷内文件的权限和属主。复用域名时也可迁移 Caddy 数据卷。验证新主机的 DNS、HTTPS 和导入后再切换访问。日常停止用 `stop` 保留卷。
+
+## Vercel 网页与 Vultr 后台
+
+需要分别托管时，按 [拆分部署与验收](docs/split-deployment.md) 手动发布。房主和访客使用同一个网页域，播放器和网页 API 直接访问同站的后台 HTTPS 域。影片保存在 Vultr 数据卷中，并继续按房间会话授权。
 
 ## 支持的片源与恢复
 

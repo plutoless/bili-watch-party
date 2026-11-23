@@ -7,14 +7,15 @@ function formatTime(seconds) {
   return Math.floor(whole / 60) + ':' + String(whole % 60).padStart(2, '0');
 }
 
-export function createPlayer({ roomPath, role }) {
+export function createPlayer({ apiOrigin, roomPath, role }) {
   const byId = id => document.getElementById(id);
   const video = byId('video');
   const prepare = byId('prepare');
   const play = byId('play');
   const seek = byId('seek');
   const host = role === 'host';
-  const endpoint = roomPath + '/playback';
+  const endpoint = apiOrigin + roomPath + '/playback';
+  if (apiOrigin) video.crossOrigin = 'use-credentials';
   const playerId = crypto.randomUUID();
   let loadGeneration = 0;
   let state;
@@ -203,6 +204,7 @@ export function createPlayer({ roomPath, role }) {
   async function requestPlayback(operation) {
     const sent = performance.now();
     const response = await fetch(endpoint, {
+      credentials: 'include',
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ role, playerId, ...operation }),
@@ -319,6 +321,7 @@ export function createPlayer({ roomPath, role }) {
 
   return {
     load(url) {
+      url = apiOrigin + url;
       if (video.getAttribute('src') === url) return;
       video.src = url;
       clearInterval(driftTimer);

@@ -5,6 +5,7 @@ services:
     environment:
       HOST_PASSWORD: ${HOST_PASSWORD:?Set HOST_PASSWORD in the server configuration}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the HTTPS site URL}
+      WEB_ORIGIN: ${WEB_ORIGIN:-}
       ENDED_ROOM_RETENTION_HOURS: ${ENDED_ROOM_RETENTION_HOURS:-24}
     volumes:
       - rooms:/data

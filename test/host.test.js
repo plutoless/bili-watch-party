@@ -22,7 +22,7 @@ async function setup(t, importVideo, options = {}) {
   }
   await start();
   function request(path, { cookie, method = 'GET', body, headers } = {}) {
-    return fetch(app.origin + path, {
+    return fetch(app.localOrigin + path, {
       method,
       headers: {
         ...(cookie && { Cookie: cookie }),
@@ -78,6 +78,49 @@ test('anonymous requests cannot create, inspect, retry, or read media from a roo
   assert.equal((await app.request('/api/rooms', {
     cookie, method: 'POST', body: { url: source }, headers: { Origin: 'https://example.org' },
   })).status, 403);
+});
+
+test('split HTTPS mode limits credentialed API and media access to the configured web origin', async t => {
+  const publicOrigin = 'https://api-watch.example.org';
+  const webOrigin = 'https://watch.example.org';
+  const app = await setup(t, async () => assert.fail('Unexpected import'), { publicOrigin, webOrigin });
+  const otherOrigin = 'https://other.example.org';
+  const session = '/api/session';
+  const preflight = origin => app.request(session, {
+    method: 'OPTIONS',
+    headers: { Origin: origin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'content-type' },
+  });
+  const allowed = await preflight(webOrigin);
+  assert.equal(allowed.status, 204);
+  assert.equal(allowed.headers.get('access-control-allow-origin'), webOrigin);
+  assert.equal(allowed.headers.get('access-control-allow-credentials'), 'true');
+  assert.match(allowed.headers.get('access-control-allow-methods'), /POST/);
+  assert.match(allowed.headers.get('access-control-allow-headers'), /Content-Type/);
+  const denied = await preflight(otherOrigin);
+  assert.equal(denied.status, 403);
+  assert.equal(denied.headers.get('access-control-allow-origin'), null);
+  assert.equal(denied.headers.get('vary'), 'Origin');
+
+  const loginOptions = { method: 'POST', body: { password: fixturePassword } };
+  assert.equal((await app.request(session, loginOptions)).status, 403);
+  const login = await app.request(session, { ...loginOptions, headers: { Origin: webOrigin } });
+  assert.equal(login.status, 204);
+  const setCookie = login.headers.get('set-cookie');
+  assert.match(setCookie, /; HttpOnly; SameSite=Strict; Secure;/);
+  assert.doesNotMatch(setCookie, /; Domain=/i);
+  const cookie = setCookie.split(';')[0];
+  for (const [origin, status] of [[webOrigin, 204], [otherOrigin, 403], ['null', 403]]) {
+    const response = await app.request(session, { cookie, headers: { Origin: origin } });
+    assert.equal(response.status, status);
+    assert.equal(response.headers.get('access-control-allow-origin'), status === 204 ? webOrigin : null);
+  }
+  const media = '/media/00000000-0000-4000-8000-000000000000.mp4';
+  const response = await app.request(media, {
+    method: 'HEAD', headers: { Origin: webOrigin, Range: 'bytes=0-0' },
+  });
+  assert.equal(response.status, 401);
+  assert.equal(response.headers.get('access-control-allow-origin'), webOrigin);
+  assert.equal(response.headers.get('cache-control'), 'private, no-store');
 });
 
 test('supported links normalize to one room per part; unsupported links fail before import', async t => {
