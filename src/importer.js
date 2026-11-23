@@ -21,6 +21,8 @@ const failures = {
   limit: ['视频超出导入大小上限。请换一个较短的视频。', false],
   network: ['暂时无法从 B 站获取视频。请稍后在此房间重试。', true],
   processing: ['视频准备失败。请检查服务端 FFmpeg、FFprobe 和磁盘空间，然后重试。', true],
+  publication: ['暂时无法发布视频。请检查 R2 写入和公开媒体域设置，然后重试。', true],
+  'media-expired': ['公开视频已过期。房主可以重新导入。', true],
   interrupted: ['导入因服务重启而中断。请在此房间重试。', true],
 };
 

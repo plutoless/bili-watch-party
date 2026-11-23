@@ -15,7 +15,6 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   const seek = byId('seek');
   const host = role === 'host';
   const endpoint = apiOrigin + roomPath + '/playback';
-  if (apiOrigin) video.crossOrigin = 'use-credentials';
   const playerId = crypto.randomUUID();
   let loadGeneration = 0;
   let state;
@@ -38,6 +37,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let nextHardSeek = 0;
   let currentTimeline;
   let seekPreview = false;
+  let useRateCorrection = true;
 
   function setText(id, message) {
     const element = byId(id);
@@ -148,7 +148,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
-    } else if (distance > 0.10) {
+    } else if (distance > 0.10 && useRateCorrection) {
       setRate(drift > 0 ? 1.05 : 0.95);
     } else if (distance < 0.04 || drift * (video.playbackRate - 1) < 0) {
       setRate(1);
@@ -319,32 +319,41 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   video.addEventListener('timeupdate', renderTime);
   video.addEventListener('playing', render);
 
+  function stop() {
+    if (!video.hasAttribute('src')) return;
+    loadGeneration++;
+    clearTimeout(poll);
+    clearTimeout(startTimer);
+    clearInterval(driftTimer);
+    state = undefined;
+    queuedCommand = undefined;
+    reportBlocked = pendingStart = undefined;
+    inFlight = priming = primed = claim = gestureFailed = networkError = false;
+    seekPreview = false;
+    commandMessage = '';
+    clockSamples = [];
+    video.removeAttribute('src');
+    video.load();
+    byId('player').hidden = true;
+  }
+
   return {
-    load(url) {
-      url = apiOrigin + url;
+    load(url, publicMedia) {
+      if (!publicMedia) url = apiOrigin + url;
       if (video.getAttribute('src') === url) return;
+      stop();
+      if (publicMedia) video.crossOrigin = 'anonymous';
+      else if (apiOrigin) video.crossOrigin = 'use-credentials';
+      else video.removeAttribute('crossorigin');
+      // Keep direct streams at normal speed. Rate changes can stall WebKit
+      // on this path; larger offsets still use the existing corrective seek.
+      useRateCorrection = !publicMedia;
       video.src = url;
       clearInterval(driftTimer);
       driftTimer = setInterval(correctDrift, driftCheckMs);
       byId('player').hidden = false;
       wake();
     },
-    stop() {
-      if (!video.hasAttribute('src')) return;
-      loadGeneration++;
-      clearTimeout(poll);
-      clearTimeout(startTimer);
-      clearInterval(driftTimer);
-      state = undefined;
-      queuedCommand = undefined;
-      reportBlocked = pendingStart = undefined;
-      inFlight = priming = primed = claim = gestureFailed = networkError = false;
-      seekPreview = false;
-      commandMessage = '';
-      clockSamples = [];
-      video.removeAttribute('src');
-      video.load();
-      byId('player').hidden = true;
-    },
+    stop,
   };
 }

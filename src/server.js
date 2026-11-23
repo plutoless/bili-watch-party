@@ -8,6 +8,7 @@ import { pipeline } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 import { createImporter, ImportError, parseSource } from './importer.js';
 import { createPlayback } from './playback.js';
+import { configuredR2Media } from './r2-media.js';
 import { openRooms } from './rooms.js';
 
 const lifetime = 12 * 60 * 60;
@@ -162,6 +163,7 @@ export async function startServer({
   webOrigin,
   releaseSha,
   importVideo = createImporter(),
+  r2Media,
 } = {}) {
   if (typeof password !== 'string' || password.length < 16) {
     throw new Error('设置至少 16 字符的 HOST_PASSWORD。');
@@ -178,7 +180,7 @@ export async function startServer({
   }
   const secure = Boolean(publicOrigin);
   const sessions = hostSession(password);
-  const rooms = openRooms(dataDir, importVideo, { now, retentionMs });
+  const rooms = openRooms(dataDir, importVideo, { now, retentionMs, r2Media });
   const { admission } = rooms;
   const mediaResponses = new Map();
   const playback = new Map();
@@ -210,9 +212,11 @@ export async function startServer({
     }
     if (rooms.isEnded(id)) throw new HttpError(410, '房间已结束。');
     const room = rooms.get(id);
-    if (room?.status !== 'ready') throw new HttpError(404, '视频还不可用。');
-    if (!playback.has(id)) playback.set(id, createPlayback(room.duration));
-    const { conflict, state } = playback.get(id).update(body, playbackNow());
+    if (!room?.mediaUrl) throw new HttpError(404, '视频还不可用。');
+    if (playback.get(id)?.mediaUrl !== room.mediaUrl) {
+      playback.set(id, { mediaUrl: room.mediaUrl, timeline: createPlayback(room.duration) });
+    }
+    const { conflict, state } = playback.get(id).timeline.update(body, playbackNow());
     return send(res, conflict ? 409 : 200, state);
   }
 
@@ -231,7 +235,13 @@ export async function startServer({
     else if (token && ['expired', 'ended'].includes(status.state)) {
       res.setHeader('Set-Cookie', sessionCookie(name, '', secure) + '; Max-Age=0');
     }
-    if (status.state === 'approved') status.room = room;
+    if (status.state === 'approved') {
+      await rooms.refreshMedia(id);
+      const current = rooms.get(id);
+      if (!current) return send(res, 200, { state: rooms.isEnded(id) ? 'ended' : 'expired' });
+      if (!admission.isApproved(id, newToken ?? token)) return send(res, 200, { state: 'expired' });
+      status.room = current;
+    }
     return send(res, 200, status);
   }
 
@@ -239,7 +249,9 @@ export async function startServer({
     requireHost(req);
     const body = action ? await readJson(req) : null;
     if (rooms.isEnded(id)) return send(res, 200, { status: 'ended' });
+    if (!action) await rooms.refreshMedia(id);
     let room = rooms.get(id);
+    if (!room && rooms.isEnded(id)) return send(res, 200, { status: 'ended' });
     if (!room) throw new HttpError(404, '找不到房间。');
 
     switch (action) {
@@ -272,7 +284,8 @@ export async function startServer({
       throw new HttpError(401, '仅房主和已批准的访客可读取视频。');
     }
     if (rooms.isEnded(id)) throw new HttpError(410, '房间已结束。');
-    if (rooms.get(id)?.status !== 'ready') throw new HttpError(404, '视频还不可用。');
+    const room = rooms.get(id);
+    if (!room?.mediaUrl || room.mediaPublic) throw new HttpError(404, '视频还不可用。');
     let responses = mediaResponses.get(id);
     if (!responses) mediaResponses.set(id, responses = new Set());
     responses.add(res);
@@ -355,7 +368,8 @@ export async function startServer({
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('Content-Security-Policy',
-      "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+      "default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" +
+      (r2Media ? "; media-src 'self' " + r2Media.origin : ''));
     route(req, res).catch(error => {
       if (res.destroyed) return;
       if (res.headersSent) return res.destroy();
@@ -398,6 +412,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
     publicOrigin: process.env.PUBLIC_ORIGIN,
     webOrigin: process.env.WEB_ORIGIN,
     releaseSha: process.env.RELEASE_SHA,
+    r2Media: configuredR2Media(process.env, process.env.WEB_ORIGIN || process.env.PUBLIC_ORIGIN),
     importVideo: createImporter({ ffmpeg: process.env.FFMPEG_PATH, ffprobe: process.env.FFPROBE_PATH }),
   });
   console.log('房主入口已启动。');

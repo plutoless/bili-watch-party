@@ -47,7 +47,7 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
     ...process.env, PATH: bin + ':' + process.env.PATH, FIXTURE_STATE: stateFile, FIXTURE_REMOTE_HOME: home,
     DEPLOY_SSH_HOST: sshHost, DEPLOY_SSH_USER: 'fixture', DEPLOY_SSH_KEY: 'synthetic-ssh-key',
     DEPLOY_SSH_KNOWN_HOSTS: sshHost + ' ' + hostKey, DEPLOY_SSH_PORT: '',
-    API_ORIGIN: 'https://api.fixture.test', WEB_ORIGIN: 'https://web.fixture.test',
+    API_ORIGIN: 'https://api.fixture.test', WEB_ORIGIN: 'https://web.fixture.test', MEDIA_ORIGIN: '',
     VERCEL_ORG_ID: 'team_fixture', VERCEL_PROJECT_ID: 'prj_fixture', VERCEL_TOKEN: 'synthetic-vercel-token',
     VERCEL_AUTOMATION_BYPASS_SECRET: '',
   };
@@ -91,7 +91,9 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   assert.equal(release(second, '', undefined, custom).liveId, 'dpl_' + second);
 
   const third = advance();
-  assert.equal(release(third).liveId, 'dpl_' + third);
+  state = release(third, '', undefined, { MEDIA_ORIGIN: 'https://media.fixture.test' });
+  assert.equal(state.liveId, 'dpl_' + third);
+  assert.match(state.pages[state.liveId], /media-src https:\/\/api\.fixture\.test https:\/\/media\.fixture\.test/);
   git('checkout', '-q', '--detach', second);
   state = release(second);
   assert.equal(state.liveId, 'dpl_' + third);

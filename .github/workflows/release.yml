@@ -68,6 +68,7 @@ jobs:
           DEPLOY_SSH_KNOWN_HOSTS: ${{ secrets.DEPLOY_SSH_KNOWN_HOSTS }}
           DEPLOY_SSH_PORT: ${{ vars.DEPLOY_SSH_PORT }}
           API_ORIGIN: ${{ vars.API_ORIGIN }}
+          MEDIA_ORIGIN: ${{ vars.MEDIA_ORIGIN }}
           WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
           VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}

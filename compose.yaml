@@ -6,6 +6,11 @@ services:
       HOST_PASSWORD: ${HOST_PASSWORD:?Set HOST_PASSWORD in the server configuration}
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:?Set PUBLIC_ORIGIN to the HTTPS site URL}
       WEB_ORIGIN: ${WEB_ORIGIN:-}
+      MEDIA_ORIGIN: ${MEDIA_ORIGIN:-}
+      R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      R2_BUCKET: ${R2_BUCKET:-}
+      R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
       ENDED_ROOM_RETENTION_HOURS: ${ENDED_ROOM_RETENTION_HOURS:-24}
     volumes:
       - rooms:/data

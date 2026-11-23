@@ -83,7 +83,7 @@ async function waitForPlaying(page, after) {
   }, after);
 }
 
-async function checkDriftCorrection(visitorPage, getTimeline) {
+async function checkDriftCorrection(visitorPage, getTimeline, publicMedia) {
   const video = visitorPage.locator('video');
   async function waitFor(predicate, expected) {
     await visitorPage.waitForFunction(predicate, undefined, { timeout: 10_000 }).catch(async () => {
@@ -99,11 +99,19 @@ async function checkDriftCorrection(visitorPage, getTimeline) {
   const received = performance.now();
   assert.ok(startsAt !== null, 'An active timeline is required for the drift probe');
   const projected = position + (serverTime - startsAt + (received - sent) / 2) / 1000;
-  await video.evaluate((video, projected) => {
+  await video.evaluate((video, { projected, publicMedia }) => {
     video.dataset.seeks = '0';
     video.addEventListener('seeking', () => { video.dataset.seeks = Number(video.dataset.seeks) + 1; });
-    video.currentTime = projected + 0.30;
-  }, projected);
+    video.currentTime = projected + (publicMedia ? 1.4 : 0.30);
+  }, { projected, publicMedia });
+  if (publicMedia) {
+    await waitFor(() => Number(document.querySelector('video').dataset.seeks) === 2,
+      'Expected one corrective seek for public media');
+    await visitorPage.waitForFunction(() => !document.querySelector('video').seeking);
+    assert.equal(await video.evaluate(video => video.playbackRate), 1);
+    console.log('Public media drift: a 1.4 s offset recovered with one corrective seek at normal playback rate.');
+    return;
+  }
   await waitFor(() => document.querySelector('video').playbackRate < 1, 'Expected a reduced rate for small drift');
   await waitFor(() => document.querySelector('video').playbackRate === 1, 'Expected rate to return to normal');
   assert.equal(await video.getAttribute('data-seeks'), '1', 'Small drift must recover through rate changes');
@@ -152,7 +160,9 @@ function delayNextPlayFailure(page) {
   });
 }
 
-export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath }) {
+export async function checkSharedPlayback({
+  hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia = false,
+}) {
   const endpoint = apiOrigin + '/api' + hostPath + '/playback';
   const post = (context, data) => context.request.post(endpoint, { data, headers: { Origin: origin } });
   const playerId = randomUUID();
@@ -204,7 +214,7 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
   console.log('Initial start: both past 0.25 s after ' + Math.round(performance.now() - started) + ' ms.');
   await checkStability(hostPage, visitorPage);
-  await checkDriftCorrection(visitorPage, getTimeline);
+  await checkDriftCorrection(visitorPage, getTimeline, publicMedia);
 
   holdSeek = true;
   started = performance.now();
@@ -287,4 +297,22 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await delay(1100);
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
   console.log('Obsolete rejection was ignored; host could cancel a blocked start and re-prepare without resuming.');
+}
+
+export async function checkPlaybackReconnect(hostPage, visitorPage) {
+  const play = hostPage.locator('#play');
+  const before = (await playhead(hostPage)).position;
+  await play.tap();
+  await Promise.all([hostPage, visitorPage].map(page => waitForPlaying(page, before + 0.25)));
+  const disconnect = route => route.abort('internetdisconnected');
+  await visitorPage.route(playbackRoute, disconnect);
+  await visitorPage.getByText('连接中断，等待播放状态。').waitFor();
+  assert.ok((await playhead(visitorPage)).paused);
+  await visitorPage.unroute(playbackRoute, disconnect);
+  await Promise.all([hostPage, visitorPage].map(page => waitForPlaying(page, before + 0.75)));
+  await play.tap();
+  await Promise.all([hostPage, visitorPage].map(page => page.getByText('已暂停，等待房主播放。').waitFor()));
+  const [host, visitor] = await Promise.all([playhead(hostPage), playhead(visitorPage)]);
+  assert.ok(host.paused && visitor.paused && Math.abs(host.position - visitor.position) < 0.12);
+  console.log('Reconnect: interrupted visitor paused, resumed on reconnect, and realigned on shared pause.');
 }

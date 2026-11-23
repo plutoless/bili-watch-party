@@ -2,6 +2,8 @@
 
 由 GitHub Actions 管理的生产项目请使用 [自动发布与恢复](production-release.md)。以下手动步骤适用于独立实例。
 
+可选的公开媒体存储见 [R2 公开媒体](r2-media.md)。
+
 | 入口 | 示例 | 用途 |
 | --- | --- | --- |
 | Vercel 网页 | `https://watch.example.org` | 房主登录、房间和邀请链接 |

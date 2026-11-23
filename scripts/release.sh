@@ -70,7 +70,7 @@ fi
 printf '%s\n' 'SSH 检查通过'
 
 git archive --format=tar --output="$work/backend.tar" "$RELEASE_SHA" \
-  Dockerfile .dockerignore compose.yaml compose.release.yaml Caddyfile package.json src public scripts/deploy-backend.sh
+  Dockerfile .dockerignore compose.yaml compose.release.yaml Caddyfile package.json package-lock.json src public scripts/deploy-backend.sh
 mkdir -p "$work/web/.vercel"
 git archive "$RELEASE_SHA" vercel.json package.json package-lock.json public scripts/build-web.js |
   tar -x -C "$work/web"
