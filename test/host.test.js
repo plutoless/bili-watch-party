@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
@@ -10,21 +10,23 @@ import { startServer } from '../src/server.js';
 const source = 'https://www.bilibili.com/video/BV1TDyazeEuY';
 const fixturePassword = 'synthetic-test-password';
 
-async function setup(t, importVideo) {
+async function setup(t, importVideo, options = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'watch-party-test-'));
   let app;
   t.after(async () => {
     await app?.close();
     await rm(dataDir, { recursive: true, force: true });
   });
-  app = await startServer({ dataDir, password: fixturePassword, port: 0, importVideo });
-  const { origin } = app;
+  async function start() {
+    app = await startServer({ dataDir, password: fixturePassword, port: 0, importVideo, ...options });
+  }
+  await start();
   function request(path, { cookie, method = 'GET', body, headers } = {}) {
-    return fetch(origin + path, {
+    return fetch(app.origin + path, {
       method,
       headers: {
         ...(cookie && { Cookie: cookie }),
-        ...(method === 'POST' && { Origin: origin, 'Content-Type': 'application/json' }),
+        ...(method === 'POST' && { Origin: app.origin, 'Content-Type': 'application/json' }),
         ...headers,
       },
       body: JSON.stringify(body),
@@ -51,7 +53,15 @@ async function setup(t, importVideo) {
     }
     assert.fail('Room did not reach ' + expected);
   }
-  return { request, login, submit, status };
+  return {
+    request, login, submit, status,
+    dataDir,
+    async restart() {
+      await app.close();
+      app = null;
+      await start();
+    },
+  };
 }
 
 test('anonymous requests cannot create, inspect, retry, or read media from a room', async t => {
@@ -247,4 +257,193 @@ test('media download tries backup URLs and distinguishes a refusal from a transi
       assert.equal(failed.mediaUrl, null);
     });
   }
+});
+
+test('only the explicitly approved visitor can watch, including during competing approvals', async t => {
+  const download = Promise.withResolvers();
+  const app = await setup(t, async ({ output, signal }) => {
+    await Promise.race([download.promise, setTimeout(2000, undefined, { signal })]);
+    await writeFile(output, 'abcd');
+    return 5;
+  });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  const path = '/api/rooms/' + room.id;
+  const media = '/media/' + room.id + '.mp4';
+  const post = (action, body = {}, cookie = host) =>
+    app.request(path + '/' + action, { method: 'POST', body, cookie });
+  const invitation = await post('invitation', { action: 'generate' });
+  assert.equal(invitation.status, 200);
+  const { token } = (await invitation.json()).invitation;
+  const visitors = await Promise.all([1, 2].map(async () => {
+    const response = await post('join', { token }, '');
+    assert.equal(response.status, 200);
+    const { state, requestId } = await response.json();
+    assert.equal(state, 'pending');
+    return { requestId, cookie: response.headers.get('set-cookie').split(';')[0] };
+  }));
+  assert.notEqual(visitors[0].requestId, visitors[1].requestId);
+  for (const visitor of visitors) {
+    assert.equal((await post('approve', { requestId: visitor.requestId }, visitor.cookie)).status, 401);
+    assert.equal((await app.request(path, { cookie: visitor.cookie })).status, 401);
+  }
+  const approvals = await Promise.all(visitors.map(({ requestId }) => post('approve', { requestId })));
+  assert.deepEqual(approvals.map(response => response.status).sort(), [200, 409]);
+  const approved = approvals.findIndex(response => response.status === 200);
+  const winner = visitors[approved].cookie;
+  const other = visitors[1 - approved].cookie;
+  const status = cookie => app.request(path + '/join', { cookie }).then(response => response.json());
+  assert.equal((await status(winner)).room.mediaUrl, null);
+  assert.equal((await status(other)).state, 'full');
+  const lateArrival = await post('join', { token }, '');
+  assert.deepEqual(await lateArrival.json(), { state: 'full' });
+  assert.equal(lateArrival.headers.get('set-cookie'), null);
+  download.resolve();
+  await app.status(host, room.id, 'ready');
+  for (const cookie of [undefined, other]) {
+    for (const method of ['GET', 'HEAD']) {
+      assert.equal((await app.request(media, { cookie, method })).status, 401);
+      assert.equal((await app.request(media, { cookie, method, headers: { Range: 'bytes=1-2' } })).status, 401);
+    }
+  }
+  const response = await app.request(media, { cookie: winner, headers: { Range: 'bytes=1-2' } });
+  assert.equal(response.status, 206);
+  assert.equal(await response.text(), 'bc');
+  const [, otherRoom] = await app.submit(host, source + '?p=2');
+  assert.equal((await app.request('/media/' + otherRoom.id + '.mp4', { cookie: winner })).status, 401);
+});
+
+test('invitation rotation, revocation and expiry invalidate pending requests', async t => {
+  let now = 1_000_000;
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic data');
+    return 5;
+  }, { now: () => now });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  const path = '/api/rooms/' + room.id;
+  const post = (action, body, cookie) =>
+    app.request(path + '/' + action, { method: 'POST', body, cookie });
+  const generate = async () => (await (await post('invitation', { action: 'generate' }, host)).json()).invitation;
+  const join = async token => {
+    const response = await post('join', { token });
+    return { ...(await response.json()), cookie: response.headers.get('set-cookie')?.split(';')[0] };
+  };
+  const verifyRevoked = async (token, { requestId, cookie }) => {
+    assert.equal((await join(token)).state, 'expired');
+    const status = await app.request(path + '/join', { cookie });
+    assert.deepEqual(await status.json(), { state: 'expired' });
+    assert.match(status.headers.get('set-cookie'), /Max-Age=0/);
+    assert.equal((await post('approve', { requestId }, host)).status, 409);
+  };
+
+  const first = await generate();
+  const firstRequest = await join(first.token);
+  assert.equal(firstRequest.state, 'pending');
+  const replacement = await generate();
+  assert.ok(replacement.token !== first.token);
+  await verifyRevoked(first.token, firstRequest);
+  const replacementRequest = await join(replacement.token);
+  assert.equal(replacementRequest.state, 'pending');
+  assert.equal((await post('invitation', { action: 'revoke' }, host)).status, 200);
+  await verifyRevoked(replacement.token, replacementRequest);
+
+  const expiring = await generate();
+  const expiringRequest = await join(expiring.token);
+  assert.equal(expiringRequest.state, 'pending');
+  now = expiring.expiresAt;
+  await verifyRevoked(expiring.token, expiringRequest);
+});
+
+test('approved session persists across restart, then room end revokes access and cleanup removes media', async t => {
+  let now = 1_000_000;
+  const retentionMs = 1000;
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic data');
+    return 5;
+  }, { now: () => now, retentionMs });
+  let host = await app.login();
+  const [, room] = await app.submit(host);
+  const path = '/api/rooms/' + room.id;
+  const { mediaUrl } = await app.status(host, room.id, 'ready');
+  const post = (action, body, cookie = host) =>
+    app.request(path + '/' + action, { method: 'POST', body, cookie });
+  const invitationResponse = await post('invitation', { action: 'generate' });
+  const { invitation } = await invitationResponse.json();
+  const apply = await post('join', { token: invitation.token }, '');
+  const visitor = apply.headers.get('set-cookie').split(';')[0];
+  const { requestId } = await apply.json();
+  assert.equal((await post('approve', { requestId })).status, 200);
+
+  now = invitation.expiresAt;
+  await app.restart();
+  host = await app.login();
+  const range = { Range: 'bytes=0-1' };
+  assert.equal((await app.request(mediaUrl, { cookie: visitor, headers: range })).status, 206);
+  assert.equal((await post('end', {})).status, 200);
+  assert.deepEqual(await (await post('join', { token: invitation.token }, '')).json(), { state: 'ended' });
+  assert.deepEqual(await (await app.request(path + '/join', { cookie: visitor })).json(), { state: 'ended' });
+  assert.equal((await app.request(mediaUrl, { cookie: host, headers: range })).status, 410);
+  assert.equal((await app.request(mediaUrl, { cookie: visitor, headers: range })).status, 401);
+  const mediaFile = join(app.dataDir, mediaUrl);
+  await access(mediaFile);
+  const [created, replacement] = await app.submit(host);
+  assert.equal(created, 201);
+  assert.notEqual(replacement.id, room.id);
+
+  now += retentionMs;
+  await app.restart();
+  host = await app.login();
+  assert.equal((await app.request(path, { cookie: host })).status, 404);
+  await assert.rejects(access(mediaFile), { code: 'ENOENT' });
+});
+
+test('ending a room during download cancels the import and frees the queue', async t => {
+  const cancelled = Promise.withResolvers();
+  let attempts = 0;
+  const app = await setup(t, async ({ output, signal }) => {
+    if (++attempts === 1) {
+      try {
+        await setTimeout(2000, undefined, { signal });
+      } catch (error) {
+        cancelled.resolve();
+        throw error;
+      }
+    }
+    await writeFile(output, 'synthetic data');
+    return 5;
+  });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  await app.status(host, room.id, 'downloading');
+  const path = '/api/rooms/' + room.id;
+  assert.equal((await app.request(path + '/end', { method: 'POST', body: {}, cookie: host })).status, 200);
+  const [created, replacement] = await app.submit(host);
+  assert.equal(created, 201);
+  await app.status(host, replacement.id, 'ready');
+  await cancelled.promise;
+  await assert.rejects(access(join(app.dataDir, 'media', room.id + '.mp4')), { code: 'ENOENT' });
+});
+
+test('ending a room interrupts a media transfer already in progress', { timeout: 5000 }, async t => {
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic data');
+    await truncate(output, 32 * 1024 * 1024);
+    return 5;
+  });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  const ready = await app.status(host, room.id, 'ready');
+  const response = await app.request(ready.mediaUrl, { cookie: host, headers: { Range: 'bytes=0-' } });
+  assert.equal(response.status, 206);
+  const media = response.body.getReader();
+  assert.ok((await media.read()).value.length > 0);
+
+  const end = await app.request('/api/rooms/' + room.id + '/end', { method: 'POST', body: {}, cookie: host });
+  assert.equal(end.status, 200);
+  await assert.rejects(async () => {
+    while (!(await media.read()).done) {
+      // Drain only after end, so the server cannot finish streaming before revocation.
+    }
+  }, TypeError);
 });

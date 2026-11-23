@@ -47,7 +47,26 @@
         <button id="play" type="button">播放</button>
       </div>
       <button id="retry" type="button" hidden>重试导入</button>
-      <a class="back" href="/">提交其他视频</a>
+      <p id="request-code" class="hint" hidden></p>
+      <section id="host-tools" aria-label="管理房间" hidden>
+        <h2>访客邀请</h2>
+        <p id="invitation-status" class="hint" role="status"></p>
+        <div id="invitation-link" hidden>
+          <label for="invite-url">邀请链接</label>
+          <input id="invite-url" type="url" readonly spellcheck="false">
+        </div>
+        <div class="actions">
+          <button id="generate-invite" type="button">生成邀请</button>
+          <button id="copy-invite" type="button" hidden>复制邀请</button>
+          <button id="revoke-invite" class="secondary" type="button" hidden>撤销邀请</button>
+        </div>
+        <p id="action-message" class="hint" role="status"></p>
+        <ul id="join-requests" aria-label="加入申请"></ul>
+        <div class="actions">
+          <button id="end-room" class="secondary" type="button">结束房间</button>
+        </div>
+      </section>
+      <a id="back" class="back" href="/">提交其他视频</a>
     </section>
   </main>
 </body>

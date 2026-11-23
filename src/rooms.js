@@ -3,12 +3,14 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { mkdtemp, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { openAdmission } from './admission.js';
 import { ImportError } from './importer.js';
 
-export function openRooms(dataDir, importVideo) {
+export function openRooms(dataDir, importVideo, { now, retentionMs }) {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const lock = new DatabaseSync(join(dataDir, 'worker.sqlite'));
   let db;
+  let admission;
   const workRoot = join(dataDir, 'work');
   const mediaRoot = join(dataDir, 'media');
   const mediaPath = id => join(mediaRoot, id + '.mp4');
@@ -20,6 +22,8 @@ export function openRooms(dataDir, importVideo) {
     mkdirSync(mediaRoot, { recursive: true, mode: 0o700 });
     db = new DatabaseSync(join(dataDir, 'rooms.sqlite'));
     db.exec(`
+      PRAGMA foreign_keys = ON;
+      PRAGMA secure_delete = ON;
       CREATE TABLE IF NOT EXISTS rooms (
         id TEXT PRIMARY KEY,
         bvid TEXT NOT NULL,
@@ -32,7 +36,9 @@ export function openRooms(dataDir, importVideo) {
         duration REAL,
         UNIQUE (bvid, part)
       );
+      CREATE TABLE IF NOT EXISTS ended_rooms (id TEXT PRIMARY KEY, endedAt INTEGER NOT NULL);
     `);
+    admission = openAdmission(db, now);
     const interrupted = db.prepare(`
       UPDATE rooms SET status = 'failed', error = 'interrupted'
       WHERE status IN ('downloading', 'preparing') RETURNING id
@@ -54,9 +60,15 @@ export function openRooms(dataDir, importVideo) {
   `);
   const setStatus = db.prepare('UPDATE rooms SET status = ?, error = ?, duration = ? WHERE id = ?');
   const setMetadata = db.prepare('UPDATE rooms SET title = ?, partTitle = ? WHERE id = ?');
-  const controller = new AbortController();
+  const findEnded = db.prepare('SELECT 1 FROM ended_rooms WHERE id = ?');
+  const markEnded = db.prepare('INSERT INTO ended_rooms VALUES (?, ?)');
+  const removeRoom = db.prepare('DELETE FROM rooms WHERE id = ?');
+  const expiredRooms = db.prepare('SELECT id FROM ended_rooms WHERE endedAt <= ?');
+  const removeEnded = db.prepare('DELETE FROM ended_rooms WHERE id = ?');
+  let job;
   let active;
   let scheduled;
+  let closing = false;
 
   function get(id) {
     const room = find.get(id);
@@ -68,7 +80,7 @@ export function openRooms(dataDir, importVideo) {
     };
   }
 
-  async function process(room) {
+  async function process(room, signal) {
     let workDir;
     setStatus.run('downloading', null, null, room.id);
     try {
@@ -82,12 +94,13 @@ export function openRooms(dataDir, importVideo) {
           if (metadata.status === 'preparing') setStatus.run('preparing', null, null, room.id);
           else setMetadata.run(metadata.title ?? null, metadata.partTitle ?? null, room.id);
         },
-        signal: controller.signal,
+        signal,
       });
+      signal.throwIfAborted();
       await rename(output, mediaPath(room.id));
       setStatus.run('ready', null, duration, room.id);
     } catch (error) {
-      const failure = controller.signal.aborted ? 'interrupted'
+      const failure = signal.aborted ? 'interrupted'
         : error instanceof ImportError ? error.code : 'processing';
       setStatus.run('failed', failure, null, room.id);
     } finally {
@@ -96,22 +109,56 @@ export function openRooms(dataDir, importVideo) {
   }
 
   function schedule() {
-    if (active || scheduled || controller.signal.aborted) return;
+    if (active || scheduled || closing) return;
     scheduled = setImmediate(() => {
       scheduled = null;
       const room = next.get();
       if (!room) return;
-      active = process(room)
+      job = { id: room.id, controller: new AbortController() };
+      active = process(room, job.controller.signal)
         .catch(() => console.error('无法保存导入状态或清理临时文件。请检查数据目录。'))
         .finally(() => {
+          job = null;
           active = null;
           schedule();
         });
     });
   }
 
+  function sweep() {
+    admission.sweep();
+    for (const { id } of expiredRooms.all(now() - retentionMs)) {
+      if (job?.id === id) continue;
+      try {
+        rmSync(mediaPath(id), { force: true });
+        removeEnded.run(id);
+      } catch {
+        console.error('无法清理已结束房间的文件。请检查数据目录。');
+      }
+    }
+  }
+
+  sweep();
+  const cleanup = setInterval(sweep, 60_000);
+  cleanup.unref();
   schedule();
   return {
+    admission,
+    isEnded: id => Boolean(findEnded.get(id)),
+    end(id) {
+      if (!find.get(id)) return false;
+      db.exec('BEGIN');
+      try {
+        markEnded.run(id, now());
+        removeRoom.run(id);
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
+      if (job?.id === id) job.controller.abort();
+      return true;
+    },
     get,
     mediaPath,
     submit({ bvid, part }) {
@@ -132,7 +179,9 @@ export function openRooms(dataDir, importVideo) {
       return get(id);
     },
     async close() {
-      controller.abort();
+      closing = true;
+      job?.controller.abort();
+      clearInterval(cleanup);
       clearImmediate(scheduled);
       await active;
       db.close();

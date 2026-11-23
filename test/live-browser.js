@@ -12,114 +12,212 @@ const run = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH ?? 'ffmpeg';
 const ffprobe = process.env.FFPROBE_PATH ?? 'ffprobe';
 const source = 'https://www.bilibili.com/video/BV1TDyazeEuY';
-const password = 'synthetic-browser-test-password';
-const dataDir = await mkdtemp(join(tmpdir(), 'watch-party-live-'));
+const deployedOrigin = process.env.BROWSER_ORIGIN;
+const password = deployedOrigin ? process.env.HOST_PASSWORD : 'synthetic-browser-test-password';
+const dataDir = deployedOrigin ? null : await mkdtemp(join(tmpdir(), 'watch-party-live-'));
+const mediaDir = dataDir ?? process.env.BROWSER_DATA_DIR;
 const simulateFirstFailure = process.env.SIMULATE_FIRST_FAILURE === '1';
-let failNextRequest = simulateFirstFailure;
+const ignoreHTTPSErrors = process.env.BROWSER_LOCAL_TLS === '1';
 let app;
-try {
-  app = await startServer({
-    dataDir, password, port: 0,
-    importVideo: createImporter({
-      ffmpeg, ffprobe,
-      async fetch(...args) {
-        if (failNextRequest) {
-          failNextRequest = false;
-          throw new TypeError('Synthetic connection reset during first import');
-        }
-        return fetch(...args);
-      },
-    }),
+let failNextRequest = simulateFirstFailure;
+
+async function playAndSeek(page) {
+  await page.getByRole('button', { name: '播放', exact: true }).tap();
+  await page.waitForFunction(() => {
+    const video = document.querySelector('video');
+    return !video.paused && video.currentTime > 0.25 && video.videoWidth > 0 && !video.muted;
   });
-  let roomPath;
-  for (const [engine, profile] of [[chromium, 'Pixel 7'], [webkit, 'iPhone 13']]) {
-    const browser = await engine.launch();
-    try {
-      const context = await browser.newContext(devices[profile]);
-      const page = await context.newPage();
-      await page.goto(app.origin);
-      await page.getByLabel('房主密码').fill(password);
-      await page.getByRole('button', { name: '登录' }).tap();
-      await page.getByLabel('B 站视频链接').fill(source);
-      await page.getByRole('button', { name: '创建房间并导入' }).tap();
-      if (!roomPath && simulateFirstFailure) {
-        await page.locator('#status[data-status="failed"]').waitFor();
-        assert.match(await page.locator('#room-error').textContent(), /暂时无法.*重试/);
-        const failedPath = new URL(page.url()).pathname;
-        await page.getByRole('button', { name: '重试导入' }).tap();
-        await page.locator('#status:not([data-status="failed"])').waitFor();
-        assert.ok(new URL(page.url()).pathname === failedPath, 'Retry must stay in the original room');
-        console.log('Synthetic connection reset: actionable error and same-room retry passed.');
-      }
-      await page.locator('#status[data-status="ready"], #status[data-status="failed"]')
-        .waitFor({ timeout: 360_000 });
-      assert.equal(await page.locator('#status').textContent(), '视频已就绪',
-        await page.locator('#room-error').textContent());
-      assert.match(await page.locator('#source-detail').textContent(), /BV1TDyazeEuY/);
-      assert.notEqual(await page.locator('#title').textContent(), '观影房间');
-      const path = new URL(page.url()).pathname;
-      if (roomPath) assert.ok(path === roomPath, 'Duplicate browser submission must reuse the room');
-      roomPath = path;
-      assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
-        'Mobile page must fit the viewport');
+  // Both engines exercise HTMLMediaElement seeking through the real player.
+  await page.locator('video').evaluate(video => { video.currentTime = 600; });
+  await page.waitForFunction(() => {
+    const video = document.querySelector('video');
+    return !video.paused && !video.seeking && video.readyState >= 2 &&
+      video.currentTime > 600.2 && video.currentTime < 615;
+  });
+}
 
-      const media = await page.locator('video').getAttribute('src');
-      const first = await context.request.get(app.origin + media, { headers: { Range: 'bytes=0-1023' } });
-      assert.equal(first.status(), 206);
-      assert.equal(first.headers()['content-type'], 'video/mp4');
-      assert.equal(first.headers()['accept-ranges'], 'bytes');
-      assert.match(first.headers()['content-range'], /^bytes 0-1023\/\d+$/);
-      assert.equal((await first.body()).length, 1024);
-      const last = await context.request.get(app.origin + media, { headers: { Range: 'bytes=-128' } });
-      assert.equal(last.status(), 206);
-      assert.equal((await last.body()).length, 128);
-      const stranger = await browser.newContext(devices[profile]);
-      const strangerPage = await stranger.newPage();
-      await strangerPage.goto(app.origin + path);
-      await strangerPage.getByRole('heading', { name: '房主登录' }).waitFor();
-      assert.equal(await strangerPage.locator('video').getAttribute('src'), null);
-      assert.equal((await stranger.request.get(app.origin + media, {
-        headers: { Range: 'bytes=0-1' },
-      })).status(), 401);
-      await stranger.close();
-
-      await page.getByRole('button', { name: '播放', exact: true }).tap();
-      await page.waitForFunction(() => {
-        const video = document.querySelector('video');
-        return !video.paused && video.currentTime > 0.25 && video.videoWidth > 0 && !video.muted;
-      });
-      // Both engines exercise real HTMLMediaElement seeking. Native controls differ between engines.
-      await page.locator('video').evaluate(video => { video.currentTime = 600; });
-      await page.waitForFunction(() => {
-        const video = document.querySelector('video');
-        return !video.paused && !video.seeking && video.readyState >= 2 &&
-          video.currentTime > 600.2 && video.currentTime < 610;
-      });
-      console.log(engine.name() + ' (' + profile + '): authenticated playback, 600 s seek, ranges and anonymous denial passed');
-    } finally {
-      await browser.close();
-    }
-  }
-  const output = join(dataDir, 'media', roomPath.split('/').at(-1) + '.mp4');
+async function checkMediaFile(media) {
+  const output = join(mediaDir, 'media', media.split('/').at(-1));
   const { stdout } = await run(ffprobe, [
     '-v', 'error', '-show_entries', 'stream=codec_name,codec_type,height:format=duration',
     '-of', 'json', output,
   ]);
-  const media = JSON.parse(stdout);
-  const video = media.streams.find(stream => stream.codec_type === 'video');
+  const file = JSON.parse(stdout);
+  const video = file.streams.find(stream => stream.codec_type === 'video');
   assert.equal(video?.codec_name, 'h264');
-  assert.equal(media.streams.find(stream => stream.codec_type === 'audio')?.codec_name, 'aac');
-  assert.ok(Number(media.format.duration) > 810);
+  assert.equal(file.streams.find(stream => stream.codec_type === 'audio')?.codec_name, 'aac');
+  assert.ok(Number(file.format.duration) > 810);
   await run(ffmpeg, ['-v', 'error', '-xerror', '-i', output, '-map', '0:v:0', '-map', '0:a:0', '-f', 'null', '-'],
     { timeout: 180_000 });
-  console.log('Public sample: H.264 ' + video.height + 'p + AAC, ' + Number(media.format.duration).toFixed(2) +
+  console.log('Public sample: H.264 ' + video.height + 'p + AAC, ' + Number(file.format.duration).toFixed(2) +
     ' s, complete audio/video decode passed.');
+}
+
+async function checkSessions(browser, profile, origin, checkFile) {
+  const options = { ...devices[profile], ignoreHTTPSErrors };
+  const host = await browser.newContext(options);
+  const visitor = await browser.newContext(options);
+  const stranger = await browser.newContext(options);
+  const hostPage = await host.newPage();
+  const visitorPage = await visitor.newPage();
+  const strangerPage = await stranger.newPage();
+  const inviteLink = hostPage.getByLabel('邀请链接');
+  const generate = hostPage.locator('#generate-invite');
+  const watchStatus = (page, state) => page.locator('#status[data-status="' + state + '"]');
+  const range = { Range: 'bytes=0-1023' };
+
+  const home = await hostPage.goto(origin);
+  assert.equal((await home.allHeaders())['permissions-policy'], 'microphone=()');
+  assert.equal((await stranger.request.get(origin + '/api/rooms')).status(), 401);
+  await hostPage.getByLabel('房主密码').fill(password);
+  await hostPage.getByRole('button', { name: '登录', exact: true }).tap();
+  await hostPage.getByLabel('B 站视频链接').fill(source);
+  await hostPage.getByRole('button', { name: '创建房间并导入' }).tap();
+
+  if (simulateFirstFailure && checkFile) {
+    await watchStatus(hostPage, 'failed').waitFor();
+    assert.match(await hostPage.locator('#room-error').textContent(), /暂时无法.*重试/);
+    const failedPath = new URL(hostPage.url()).pathname;
+    await hostPage.getByRole('button', { name: '重试导入' }).tap();
+    await hostPage.locator('#status:not([data-status="failed"])').waitFor();
+    assert.ok(new URL(hostPage.url()).pathname === failedPath, 'Retry must stay in the original room');
+    console.log('Synthetic connection reset: actionable error and same-room retry passed.');
+  }
+
+  await generate.tap();
+  await inviteLink.waitFor();
+  const hostPath = new URL(hostPage.url()).pathname;
+  const revokedLink = await inviteLink.inputValue();
+  await hostPage.getByRole('button', { name: '撤销邀请' }).tap();
+  await inviteLink.waitFor({ state: 'hidden' });
+  await strangerPage.goto(revokedLink, { waitUntil: 'domcontentloaded' });
+  await watchStatus(strangerPage, 'expired').waitFor();
+  await generate.tap();
+  await inviteLink.waitFor();
+  const replacedLink = await inviteLink.inputValue();
+  await generate.tap();
+  await hostPage.waitForFunction(old => document.querySelector('#invite-url').value !== old, replacedLink);
+  const invitation = await inviteLink.inputValue();
+  assert.ok(invitation.startsWith(origin + '/invite/') && invitation !== revokedLink);
+  await hostPage.getByRole('button', { name: '复制邀请' }).tap();
+  await hostPage.locator('#action-message').filter({ hasText: /已复制邀请|请复制已选中/ }).waitFor();
+
+  await strangerPage.goto(replacedLink, { waitUntil: 'domcontentloaded' });
+  await strangerPage.waitForFunction(() => !location.hash);
+  await watchStatus(strangerPage, 'expired').waitFor();
+  await visitorPage.goto(invitation, { waitUntil: 'domcontentloaded' });
+  await watchStatus(visitorPage, 'pending').waitFor();
+  const requestCode = (await visitorPage.locator('#request-code').textContent()).match(/[a-f0-9]{8}/)[0];
+  await strangerPage.goto(invitation, { waitUntil: 'domcontentloaded' });
+  await watchStatus(strangerPage, 'pending').waitFor();
+
+  const media = '/media/' + hostPath.split('/').at(-1) + '.mp4';
+  assert.equal((await visitor.request.get(origin + media, { headers: range })).status(), 401);
+  await hostPage.getByRole('button', { name: '批准访客 ' + requestCode, exact: true }).tap();
+  await watchStatus(strangerPage, 'full').waitFor();
+  const visitorStatus = visitorPage.locator('#status[data-status="waiting"], #status[data-status="ready"], #status[data-status="failed"]');
+  await visitorStatus.waitFor();
+  const waitedForVideo = await visitorStatus.getAttribute('data-status') === 'waiting';
+  await visitorPage.reload({ waitUntil: 'domcontentloaded' });
+  for (const page of [hostPage, visitorPage]) {
+    await page.locator('#status[data-status="ready"], #status[data-status="failed"]').waitFor({ timeout: 360_000 });
+    assert.equal(await page.locator('#status').textContent(), '视频已就绪',
+      await page.locator('#room-error').textContent());
+    assert.match(await page.locator('#source-detail').textContent(), /BV1TDyazeEuY/);
+    assert.notEqual(await page.locator('#title').textContent(), '观影房间');
+    assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
+      'Mobile page must fit the viewport');
+  }
+
+  if (deployedOrigin) {
+    for (const [context, cookiePrefix] of [[host, 'watch_party_host'], [visitor, 'watch_party_visitor_']]) {
+      const cookie = (await context.cookies()).find(cookie => cookie.name.startsWith(cookiePrefix));
+      assert.ok(cookie?.secure && cookie.httpOnly && cookie.sameSite === 'Strict');
+    }
+  }
+  for (const context of [host, visitor]) {
+    const first = await context.request.get(origin + media, { headers: range });
+    assert.equal(first.status(), 206);
+    assert.equal(first.headers()['content-type'], 'video/mp4');
+    assert.equal(first.headers()['accept-ranges'], 'bytes');
+    assert.match(first.headers()['content-range'], /^bytes 0-1023\/\d+$/);
+    assert.equal((await first.body()).length, 1024);
+    const last = await context.request.get(origin + media, { headers: { Range: 'bytes=-128' } });
+    assert.equal(last.status(), 206);
+    assert.equal((await last.body()).length, 128);
+  }
+  for (const headers of [undefined, range]) {
+    assert.equal((await stranger.request.get(origin + media, { headers })).status(), 401);
+    assert.equal((await stranger.request.head(origin + media, { headers })).status(), 401);
+  }
+  await strangerPage.goto(origin + hostPath);
+  await strangerPage.getByRole('heading', { name: '房主登录' }).waitFor();
+  assert.equal(await strangerPage.locator('video').getAttribute('src'), null);
+
+  const duplicateTab = await host.newPage();
+  await duplicateTab.goto(origin);
+  await duplicateTab.getByLabel('B 站视频链接').fill(source);
+  await duplicateTab.getByRole('button', { name: '创建房间并导入' }).tap();
+  await watchStatus(duplicateTab, 'ready').waitFor();
+  assert.ok(new URL(duplicateTab.url()).pathname === hostPath, 'Duplicate submission must reuse the active room');
+  await duplicateTab.close();
+
+  await Promise.all([playAndSeek(hostPage), playAndSeek(visitorPage)]);
+  if (checkFile && mediaDir) await checkMediaFile(media);
+
+  hostPage.once('dialog', dialog => dialog.accept());
+  await hostPage.getByRole('button', { name: '结束房间' }).tap();
+  await watchStatus(hostPage, 'ended').waitFor();
+  await watchStatus(visitorPage, 'ended').waitFor();
+  assert.equal(await visitorPage.locator('video').getAttribute('src'), null);
+  assert.equal((await host.request.get(origin + media, { headers: range })).status(), 410);
+  assert.equal((await visitor.request.get(origin + media, { headers: range })).status(), 401);
+  await strangerPage.goto(invitation);
+  await watchStatus(strangerPage, 'ended').waitFor();
+  console.log(profile + ': independent approval, mobile playback/600 s seek, denied third session, and room end passed. ' +
+    'Observed approved visitor waiting for import: ' + waitedForVideo + '.');
+}
+
+try {
+  if (deployedOrigin) {
+    assert.equal(new URL(deployedOrigin).protocol, 'https:', 'Deployed browser run requires HTTPS');
+    assert.ok(password, 'Set HOST_PASSWORD for the deployed browser run');
+    assert.ok(!simulateFirstFailure, 'Failure injection requires the test-managed app server');
+    if (ignoreHTTPSErrors) {
+      assert.ok(['localhost', '127.0.0.1'].includes(new URL(deployedOrigin).hostname),
+        'Test trust bypass is for isolated loopback HTTPS only');
+    }
+  } else {
+    app = await startServer({
+      dataDir, password, port: 0,
+      importVideo: createImporter({
+        ffmpeg, ffprobe,
+        async fetch(...args) {
+          if (failNextRequest) {
+            failNextRequest = false;
+            throw new TypeError('Synthetic connection reset during first import');
+          }
+          return fetch(...args);
+        },
+      }),
+    });
+  }
+  const origin = deployedOrigin ?? app.origin;
+  for (const [engine, profile] of [[chromium, 'Pixel 7'], [webkit, 'iPhone 13']]) {
+    const browser = await engine.launch();
+    try {
+      console.log(engine.name() + ' ' + browser.version() + ' (' + profile + '), ' + new URL(origin).protocol);
+      await checkSessions(browser, profile, origin, engine === chromium);
+    } finally {
+      await browser.close();
+    }
+  }
 } catch (error) {
-  // Avoid publishing paths and room IDs from Playwright or process diagnostics.
-  console.error('Live check failed:', error.message.replace(/\/(rooms|media)\/[\w-]+(?:\.mp4)?/g, '/$1/[redacted]')
-    .replaceAll(dataDir, '[temporary data]'));
+  console.error('Live check failed:', error.message
+    .replace(/\/(rooms|media|invite)\/[a-f0-9-]+(?:\.mp4|#[a-f0-9]+)?/g, '/$1/[redacted]')
+    .replaceAll(mediaDir ?? '\0', '[temporary data]'));
   process.exitCode = 1;
 } finally {
   await app?.close();
-  await rm(dataDir, { recursive: true, force: true });
+  if (dataDir) await rm(dataDir, { recursive: true, force: true });
 }

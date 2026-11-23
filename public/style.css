@@ -74,3 +74,10 @@ video { width: 100%; display: block; aspect-ratio: 16 / 9; }
 #play { position: absolute; inset: 50% auto auto 50%; transform: translate(-50%, -50%); }
 .back { margin-top: .75rem; }
 #retry { display: block; margin-top: 1rem; }
+
+#host-tools { border-top: 1px solid #516071; margin-top: 1.5rem; padding-top: 1rem; }
+#host-tools h2 { font-size: 1.125rem; margin: 0; }
+.actions { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
+.secondary { color: #e6f0fa; background: #263649; border-color: #516071; }
+#join-requests { list-style: none; display: grid; gap: .5rem; padding: 0; }
+#join-requests:empty { display: none; }
