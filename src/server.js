@@ -182,14 +182,16 @@ export async function startServer({
 
   async function roomPlayback(req, res, id) {
     const body = await readJson(req);
-    const { role, action, playerId, position } = body ?? {};
+    const { role, action, playerId, previousPlayerId, position, reason } = body ?? {};
     if (role === 'host') requireHost(req);
     else if (role !== 'visitor' || !admission.isApproved(id, visitorToken(req, id))) {
       throw new HttpError(401, '仅房主和已批准的访客可读取播放状态。');
     }
     const hostCommand = ['play', 'pause', 'seek'].includes(action);
-    if ((!hostCommand && !['observe', 'ready', 'blocked'].includes(action)) ||
+    if ((!hostCommand && !['observe', 'ready', 'blocked', 'unavailable', 'recover'].includes(action)) ||
         typeof playerId !== 'string' || !playerIdPattern.test(playerId) ||
+        (action === 'recover' && (typeof previousPlayerId !== 'string' || !playerIdPattern.test(previousPlayerId))) ||
+        (action === 'unavailable' && !['buffering', 'connection', 'background'].includes(reason)) ||
         (['ready', 'seek'].includes(action) && !Number.isFinite(position))) {
       throw new HttpError(400, '播放操作无效。');
     }

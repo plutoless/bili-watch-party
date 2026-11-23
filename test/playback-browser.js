@@ -80,7 +80,13 @@ async function waitForPlaying(page, after) {
     const video = document.querySelector('video');
     return !video.paused && !video.seeking && video.currentTime > after &&
       video.videoWidth > 0 && !video.muted;
-  }, after);
+  }, after, { timeout: 10_000 }).catch(async () => {
+    const observed = await page.locator('video').evaluate(video => ({
+      paused: video.paused, position: video.currentTime, seeking: video.seeking, readyState: video.readyState,
+      mediaError: video.error?.code, status: document.querySelector('#playback-status').textContent,
+    }));
+    assert.fail('Expected playback past ' + after.toFixed(2) + ' s, observed ' + JSON.stringify(observed));
+  });
 }
 
 async function checkDriftCorrection(visitorPage, getTimeline) {
@@ -152,6 +158,18 @@ function delayNextPlayFailure(page) {
   });
 }
 
+async function waitForSignal(promise, message) {
+  let timeout;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error(message)), 8000); }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, hostPath }) {
   const endpoint = origin + '/api' + hostPath + '/playback';
   const post = (context, data) => context.request.post(endpoint, { data, headers: { Origin: origin } });
@@ -208,13 +226,9 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
 
   holdSeek = true;
   started = performance.now();
-  let timeout;
   try {
     await dragSeek(hostPage, 0.72);
-    const target = await Promise.race([
-      seekAcknowledgment.promise,
-      new Promise((_, reject) => { timeout = setTimeout(() => reject(new Error('Visitor seek was not acknowledged')), 8000); }),
-    ]);
+    const target = await waitForSignal(seekAcknowledgment.promise, 'Visitor seek was not acknowledged');
     assert.ok(target > 30);
     await hostPage.getByText('访客 · 未就绪').waitFor();
     await hostPage.waitForFunction(target => {
@@ -232,7 +246,6 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
     console.log('Seek: both aligned and held for 1100 ms with visitor acknowledgment withheld; ' +
       'both passed seek target + 0.25 s after ' + Math.round(performance.now() - started) + ' ms.');
   } finally {
-    clearTimeout(timeout);
     releaseAcknowledgment.resolve();
   }
 
@@ -287,4 +300,198 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await delay(1100);
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
   console.log('Obsolete rejection was ignored; host could cancel a blocked start and re-prepare without resuming.');
+
+  await checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause });
+}
+
+async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause }) {
+  const play = hostPage.locator('#play');
+  let started;
+
+  async function assertAligned() {
+    const [host, visitor] = await Promise.all([playhead(hostPage), playhead(visitorPage)]);
+    const difference = Math.abs(host.position - visitor.position);
+    assert.ok(difference < 0.5, 'Recovery must leave the two players within 0.5 s');
+    return difference.toFixed(3);
+  }
+
+  async function waitForRecovery(label, started, position, { acceptGesture = false } = {}) {
+    const playing = Promise.all([waitForPlaying(hostPage, position + 0.25), waitForPlaying(visitorPage, position + 0.25)]);
+    let usedGesture = false;
+    if (acceptGesture) {
+      const retry = visitorPage.getByRole('button', { name: '再次点按以准备' });
+      usedGesture = await Promise.race([playing.then(() => false), retry.waitFor().then(() => true)]);
+      if (usedGesture) await retry.tap();
+    }
+    await playing;
+    console.log(label + ': ' + Math.round(performance.now() - started) + ' ms to both advancing 0.25 s; ' +
+      'paired position difference ' + await assertAligned() + ' s' + (usedGesture ? '; browser required a new tap.' : '.'));
+  }
+
+  async function stallVisitor(whileStalled) {
+    const mediaRoute = '**/media/*.mp4';
+    const requested = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    const gate = async route => {
+      requested.resolve();
+      await release.promise;
+      await route.continue();
+    };
+    await visitorPage.route(mediaRoute, gate);
+    try {
+      // Discard cached ranges and withhold actual MP4 responses from this player.
+      const interrupted = performance.now();
+      await visitorPage.locator('video').evaluate(video => video.load());
+      await Promise.all([
+        waitForSignal(requested.promise, 'Visitor did not request media after its buffer was cleared'),
+        hostPage.getByText('缓冲中，等待双方在同一位置就绪。').waitFor(),
+      ]);
+      assert.ok((await playhead(hostPage)).paused);
+      assert.ok((await playhead(visitorPage)).paused);
+      assert.ok(await visitorPage.locator('video').evaluate(video => video.readyState < video.HAVE_FUTURE_DATA));
+      const frozen = await getTimeline();
+      assert.equal(frozen.startsAt, null);
+      assert.equal(frozen.ready.visitor, false);
+      console.log('Actual media response withheld: both waiting after ' + Math.round(performance.now() - interrupted) + ' ms.');
+      await whileStalled(frozen);
+    } finally {
+      release.resolve();
+      await visitorPage.unroute(mediaRoute, gate);
+    }
+  }
+
+  await play.tap();
+  const beforeBuffer = (await playhead(hostPage)).position;
+  await Promise.all([waitForPlaying(hostPage, beforeBuffer + 0.25), waitForPlaying(visitorPage, beforeBuffer + 0.25)]);
+  let frozen;
+  await stallVisitor(async state => {
+    frozen = state;
+    await delay(1100);
+    assert.equal((await getTimeline()).startsAt, null);
+  });
+  await waitForRecovery('Buffer release', performance.now(), frozen.position);
+
+  await stallVisitor(async state => {
+    frozen = state;
+    await play.tap();
+    await hostPage.locator('#play').filter({ hasText: '播放' }).waitFor();
+    assert.equal((await getTimeline()).wantsPlay, false);
+  });
+  started = performance.now();
+  await waitForPause();
+  assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+  assert.ok(Math.abs((await playhead(visitorPage)).position - frozen.position) < 0.12);
+  console.log('Buffer release after host pause: ' + Math.round(performance.now() - started) + ' ms to aligned pause.');
+
+  const firstReady = Promise.withResolvers();
+  const releaseFirst = Promise.withResolvers();
+  let held = false;
+  const holdFirstReady = async route => {
+    const operation = route.request().postDataJSON();
+    if (operation.action !== 'ready' || held) return route.fallback();
+    held = true;
+    firstReady.resolve(operation.position);
+    await releaseFirst.promise;
+    await route.fallback();
+  };
+  const inRange = (page, low, high) => page.waitForFunction(({ low, high }) => {
+    const video = document.querySelector('video');
+    const fraction = video.currentTime / video.duration;
+    return video.paused && !video.seeking && fraction > low && fraction < high;
+  }, { low, high });
+  await visitorPage.route(playbackRoute, holdFirstReady);
+  try {
+    await dragSeek(hostPage, 0.25);
+    const firstPosition = await waitForSignal(firstReady.promise, 'Visitor did not acknowledge the first seek');
+    await dragSeek(hostPage, 0.55);
+    started = performance.now();
+    await inRange(hostPage, 0.48, 0.62);
+    const staleReply = visitorPage.waitForResponse(response =>
+      response.url() === endpoint && response.request().postDataJSON().action === 'ready' &&
+      response.request().postDataJSON().position === firstPosition);
+    releaseFirst.resolve();
+    assert.equal((await staleReply).status(), 409);
+    await inRange(visitorPage, 0.48, 0.62);
+    await waitForPause();
+    console.log('Repeated seeks with late readiness: newest target settled paused after ' +
+      Math.round(performance.now() - started) + ' ms; difference ' + await assertAligned() + ' s.');
+  } finally {
+    releaseFirst.resolve();
+    await visitorPage.unroute(playbackRoute, holdFirstReady);
+  }
+
+  const beforeOffline = (await playhead(hostPage)).position;
+  await play.tap();
+  await Promise.all([waitForPlaying(hostPage, beforeOffline + 0.25), waitForPlaying(visitorPage, beforeOffline + 0.25)]);
+  const offline = route => route.abort('internetdisconnected');
+  await visitorPage.route(playbackRoute, offline);
+  started = performance.now();
+  await visitor.setOffline(true);
+  try {
+    await visitorPage.getByText('连接中断，等待播放状态。').waitFor();
+    await hostPage.getByText('等待重新连接并对齐进度。').waitFor();
+    frozen = await getTimeline();
+    assert.equal(frozen.startsAt, null);
+    assert.equal(frozen.wantsPlay, true);
+    assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+    console.log('Visitor offline: both waiting after ' + Math.round(performance.now() - started) + ' ms.');
+  } finally {
+    await visitorPage.unroute(playbackRoute, offline);
+    started = performance.now();
+    await visitor.setOffline(false);
+  }
+  await waitForRecovery('Network restored', started, frozen.position);
+
+  const alternate = await visitor.newPage();
+  await alternate.bringToFront();
+  const nativeVisibility = await visitorPage.evaluate(() => document.hidden);
+  const setHidden = (hidden) => visitorPage.evaluate(hidden => {
+    Object.defineProperty(document, 'hidden', { configurable: true, value: hidden });
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+  if (!nativeVisibility) await setHidden(true);
+  try {
+    await hostPage.getByText('等待双方回到观影页面。').waitFor();
+    frozen = await getTimeline();
+    assert.equal(frozen.startsAt, null);
+    assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+  } finally {
+    started = performance.now();
+    await visitorPage.bringToFront();
+    if (!nativeVisibility) await setHidden(false);
+    await alternate.close();
+  }
+  await waitForRecovery('Foreground return (' + (nativeVisibility ? 'native tab visibility' : 'injected visibility event') + ')',
+    started, frozen.position);
+
+  const refreshPosition = (await playhead(hostPage)).position;
+  started = performance.now();
+  await visitorPage.reload({ waitUntil: 'domcontentloaded' });
+  await visitorPage.getByText('视频已就绪').waitFor();
+  assert.equal(await visitorPage.getByText('等待房主批准').isVisible(), false);
+  await waitForRecovery('Approved visitor refresh', started, refreshPosition, { acceptGesture: true });
+  await checkStability(hostPage, visitorPage);
+
+  await hostPage.route(playbackRoute, offline);
+  await host.setOffline(true);
+  try {
+    await hostPage.getByText('连接中断，等待播放状态。').waitFor();
+    await play.tap();
+    await hostPage.getByText('已请求暂停，重新连接后将同步。').waitFor();
+    await visitorPage.getByText('等待重新连接并对齐进度。').waitFor();
+    assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+  } finally {
+    await hostPage.unroute(playbackRoute, offline);
+    started = performance.now();
+    await host.setOffline(false);
+  }
+  await waitForPause();
+  assert.equal((await getTimeline()).wantsPlay, false);
+  const pausePosition = (await playhead(hostPage)).position;
+  const alignedAfter = Math.round(performance.now() - started);
+  await delay(1100);
+  assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+  assert.ok(Math.abs((await playhead(hostPage)).position - pausePosition) < 0.12);
+  console.log('Host pause requested offline: ' + alignedAfter +
+    ' ms to aligned pause after reconnect; difference ' + await assertAligned() + ' s.');
 }

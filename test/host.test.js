@@ -527,10 +527,64 @@ test('only the host directs playback and both players must acknowledge the curre
   assert.ok(rearmed.startsAt > now);
   assert.deepEqual(rearmed.blocked, []);
 
-  now += 4_000;
+  now = rearmed.startsAt + 250;
+  const playingVersion = { epoch: rearmed.epoch, version: rearmed.version };
+  const buffering = await send('visitor', 'unavailable', {
+    ...playingVersion, reason: 'buffering',
+  }).then(r => r.json());
+  assert.equal(buffering.position, 26);
+  assert.equal(buffering.startsAt, null);
+  assert.equal(buffering.wantsPlay, true);
+  assert.deepEqual(buffering.ready, { host: false, visitor: false });
+  assert.equal(buffering.waiting.visitor, 'buffering');
+
+  // The host can cancel a start even when an interruption beat the pause to the server.
+  const cancel = await send('host', 'pause', playingVersion);
+  assert.equal(cancel.status, 200);
+  const cancelled = await cancel.json();
+  const firstSeek = await send('host', 'seek', { epoch: cancelled.epoch, version: cancelled.version, position: 55 })
+    .then(r => r.json());
+  const firstTarget = { epoch: firstSeek.epoch, version: firstSeek.version, position: 55 };
+  const backgrounded = await send('visitor', 'unavailable', { ...firstTarget, reason: 'background' }).then(r => r.json());
+  assert.equal(backgrounded.waiting.visitor, 'background');
+  assert.equal((await send('visitor', 'ready', firstTarget)).status, 409);
+  const latestSeek = await send('host', 'seek', { epoch: backgrounded.epoch, version: backgrounded.version, position: 70 })
+    .then(r => r.json());
+  assert.equal((await send('host', 'pause', playingVersion)).status, 409);
+  assert.equal((await send('visitor', 'unavailable', { ...playingVersion, reason: 'buffering' })).status, 409);
+  assert.equal((await send('visitor', 'ready', firstTarget)).status, 409);
+  const latest = { epoch: latestSeek.epoch, version: latestSeek.version };
+  await send('host', 'ready', { ...latest, position: 70 });
+  await send('visitor', 'ready', { ...latest, position: 70 });
+  const beforeDisconnect = await send('host', 'play', latest).then(r => r.json());
+  now = beforeDisconnect.startsAt + 500;
+  await send('host', 'observe');
+  now += 3_100;
   const expired = await send('host', 'observe').then(r => r.json());
   assert.equal(expired.startsAt, null);
-  assert.equal(expired.wantsPlay, false);
-  assert.equal(expired.ownsSeat, false);
+  assert.equal(expired.wantsPlay, true);
+  assert.equal(expired.ownsSeat, true);
   assert.deepEqual(expired.ready, { host: false, visitor: false });
+  assert.equal(expired.waiting.visitor, 'connection');
+  assert.equal(expired.position, 73.1);
+  const reconnect = { epoch: expired.epoch, version: expired.version, position: expired.position };
+  await send('host', 'ready', reconnect);
+  const afterDisconnect = await send('visitor', 'ready', reconnect).then(r => r.json());
+  assert.ok(afterDisconnect.startsAt > now);
+
+  const oldVisitorId = playerIds.visitor;
+  playerIds.visitor = '00000000-0000-4000-8000-000000000003';
+  const recovered = await send('visitor', 'recover', { previousPlayerId: oldVisitorId }).then(r => r.json());
+  assert.equal(recovered.ownsSeat, true);
+  assert.equal(recovered.startsAt, null);
+  assert.equal(recovered.position, expired.position);
+  assert.equal(recovered.wantsPlay, true);
+  assert.deepEqual(recovered.ready, { host: false, visitor: false });
+  assert.equal((await post('playback', {
+    ...reconnect, role: 'visitor', playerId: oldVisitorId, action: 'ready',
+  }, visitor)).status, 409);
+  const refreshed = { epoch: recovered.epoch, version: recovered.version, position: recovered.position };
+  await send('host', 'ready', refreshed);
+  const afterRefresh = await send('visitor', 'ready', refreshed).then(r => r.json());
+  assert.ok(afterRefresh.startsAt > now);
 });
