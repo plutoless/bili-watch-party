@@ -139,7 +139,8 @@ remote_command='set -eu
   exec 9>"$root/deploy.lock"
   flock -w 120 9 || { echo "后台发布锁超时。"; exit 1; }
   dir=$(mktemp -d "$root/releases/$1.XXXXXXXX")
-  tar -xf - -C "$dir"
+  # Keep tracked source readable by the image user inside the private host directory.
+  tar -xpf - -C "$dir"
   bash "$dir/scripts/deploy-backend.sh" "$dir" "$@"'
 "${ssh_command[@]}" "bash -c '$remote_command' bash $RELEASE_SHA $API_ORIGIN $WEB_ORIGIN" \
   <"$work/backend.tar" 2>"$work/ssh-error" || fail '后台部署失败，正式网页未切换。'
