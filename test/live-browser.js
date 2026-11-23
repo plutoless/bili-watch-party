@@ -40,10 +40,10 @@ async function checkMediaFile(media) {
     ' s, complete audio/video decode passed.');
 }
 
-async function checkSessions(browser, profile, origin, checkFile) {
+async function checkSessions(browser, profile, origin, checkFile, visitorBrowser = browser, visitorProfile = profile) {
   const options = { ...devices[profile], ignoreHTTPSErrors };
   const host = await browser.newContext(options);
-  const visitor = await browser.newContext(options);
+  const visitor = await visitorBrowser.newContext({ ...devices[visitorProfile], ignoreHTTPSErrors });
   const stranger = await browser.newContext(options);
   const hostPage = await host.newPage();
   const visitorPage = await visitor.newPage();
@@ -200,13 +200,26 @@ try {
     app = await startServer({ dataDir, password, port: 0, importVideo });
   }
   const origin = deployedOrigin ?? app.origin;
-  for (const [engine, profile] of [[chromium, 'Pixel 7'], [webkit, 'iPhone 13']]) {
-    const browser = await engine.launch();
+  if (process.env.BROWSER_MIXED_ENGINES === '1') {
+    const hostBrowser = await chromium.launch();
+    let visitorBrowser;
     try {
-      console.log(engine.name() + ' ' + browser.version() + ' (' + profile + '), ' + new URL(origin).protocol);
-      await checkSessions(browser, profile, origin, engine === chromium);
+      visitorBrowser = await webkit.launch();
+      console.log('Mixed engines: Chromium ' + hostBrowser.version() + ' (Pixel 7) host, WebKit ' +
+        visitorBrowser.version() + ' (iPhone 13) visitor, ' + new URL(origin).protocol);
+      await checkSessions(hostBrowser, 'Pixel 7', origin, true, visitorBrowser, 'iPhone 13');
     } finally {
-      await browser.close();
+      await Promise.all([hostBrowser.close(), visitorBrowser?.close()]);
+    }
+  } else {
+    for (const [engine, profile] of [[chromium, 'Pixel 7'], [webkit, 'iPhone 13']]) {
+      const browser = await engine.launch();
+      try {
+        console.log(engine.name() + ' ' + browser.version() + ' (' + profile + '), ' + new URL(origin).protocol);
+        await checkSessions(browser, profile, origin, engine === chromium);
+      } finally {
+        await browser.close();
+      }
     }
   }
 } catch (error) {

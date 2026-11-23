@@ -73,9 +73,10 @@ npx playwright install chromium webkit
 SYNTHETIC_VIDEO=1 npm run test:browser
 npm run test:browser
 SIMULATE_FIRST_FAILURE=1 npm run test:browser
+BROWSER_MIXED_ENGINES=1 npm run test:browser
 ```
 
-HTTP 测试用合成样本覆盖导入和重试、邀请轮换和过期、并发审批、媒体权限、播放命令版本与就绪门控，以及结束房间后的清理。浏览器测试在 Chromium 的 Pixel 7 和 WebKit 的 iPhone 13 模拟环境中分别使用独立的房主、访客和第三方会话，验证准入、共享播放、就绪与手势反馈、暂停、跳转、纠偏和房间结束。
+HTTP 测试用合成样本覆盖导入和重试、邀请轮换和过期、并发审批、媒体权限、播放命令版本与就绪门控，以及结束房间后的清理。浏览器测试在 Chromium 的 Pixel 7 和 WebKit 的 iPhone 13 模拟环境中分别使用独立的房主、访客和第三方会话，验证准入、共享播放、就绪与手势反馈、暂停、跳转、纠偏和房间结束。设置 `BROWSER_MIXED_ENGINES=1` 可单独验证 Chromium 房主与 WebKit 访客组合。
 
 默认浏览器测试从网页提交公开投稿 `BV1TDyazeEuY`。用 `SIMULATE_FIRST_FAILURE=1` 注入首次导入断线，再从原房间重试真实导入。本地也可以用 `SYNTHETIC_VIDEO=1` 生成临时 H.264/AAC 视频来验收房间播放。两种模式都通过服务端提供的视频，在浏览器里读取真实播放器位置。自管测试服务时还用 FFprobe 检查轨道并用 FFmpeg 完整解码一份成品。
 

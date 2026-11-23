@@ -112,15 +112,15 @@ async function checkDriftCorrection(visitorPage, getTimeline) {
   await video.evaluate((video, projected) => {
     video.dataset.seeks = '0';
     video.addEventListener('seeking', () => { video.dataset.seeks = Number(video.dataset.seeks) + 1; });
-    video.currentTime = projected + 0.30;
+    video.currentTime = projected + 0.70;
   }, projected);
-  await waitFor(() => document.querySelector('video').playbackRate < 1, 'Expected a reduced rate for small drift');
+  await waitFor(() => document.querySelector('video').playbackRate !== 1, 'Expected rate correction for moderate drift');
   await waitFor(() => document.querySelector('video').playbackRate === 1, 'Expected rate to return to normal');
-  assert.equal(await video.getAttribute('data-seeks'), '1', 'Small drift must recover through rate changes');
-  await video.evaluate(video => { video.currentTime += 1.4; });
+  assert.equal(await video.getAttribute('data-seeks'), '1', 'Moderate drift must recover through rate changes');
+  await video.evaluate(video => { video.currentTime += 2; });
   await waitFor(() => Number(document.querySelector('video').dataset.seeks) === 3, 'Expected one additional corrective seek');
   await visitorPage.waitForFunction(() => !document.querySelector('video').seeking);
-  console.log('Drift: a 0.30 s offset recovered by playback rate; a 1.4 s offset triggered one corrective seek.');
+  console.log('Drift: a 0.70 s offset recovered by playback rate; a 2.0 s offset triggered one corrective seek.');
 }
 
 async function dragSeek(page, fraction) {

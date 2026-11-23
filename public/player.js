@@ -2,6 +2,8 @@ const pollMs = 200;
 const driftCheckMs = 100;
 const stallConfirmMs = 200;
 const alignmentTolerance = 0.05;
+const initialDriftSeekLeadMs = 200;
+const maxStartLeadMs = 650;
 
 function formatTime(seconds) {
   const whole = Math.floor(seconds || 0);
@@ -19,8 +21,11 @@ export function createPlayer({ roomPath, role }) {
   const playerId = crypto.randomUUID();
   const storageKey = 'watch-party-player:' + endpoint + ':' + role;
   let previousPlayerId;
+  let playbackStartLeadMs = 0;
   try {
-    previousPlayerId = sessionStorage.getItem(storageKey);
+    const remembered = JSON.parse(sessionStorage.getItem(storageKey));
+    previousPlayerId = remembered?.playerId;
+    playbackStartLeadMs = remembered?.startLeadMs ?? 0;
   } catch {
     // Storage may be disabled. The room cookie still authorizes a fresh player.
   }
@@ -47,6 +52,8 @@ export function createPlayer({ roomPath, role }) {
   let offset = 0;
   let hardDriftSamples = 0;
   let nextHardSeek = 0;
+  let driftSeekStarted;
+  let driftSeekLeadMs = initialDriftSeekLeadMs;
   let currentTimeline;
   let seekPreview = false;
 
@@ -127,6 +134,18 @@ export function createPlayer({ roomPath, role }) {
     pauseVideo();
   }
 
+  async function measurePlaybackStart(generation, startPosition, started) {
+    // Some players resolve play() before their media clock starts moving.
+    while (generation === loadGeneration && !video.paused) {
+      const elapsed = performance.now() - started;
+      const advanced = video.currentTime - startPosition;
+      if (advanced >= 0.08) return Math.max(0, Math.min(maxStartLeadMs, elapsed - advanced * 1000));
+      if (elapsed >= 1000) break;
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    return playbackStartLeadMs;
+  }
+
   function hasPlaybackData() {
     return video.readyState >= video.HAVE_FUTURE_DATA ||
       (video.readyState >= video.HAVE_CURRENT_DATA && state.position >= video.duration - alignmentTolerance);
@@ -181,14 +200,17 @@ export function createPlayer({ roomPath, role }) {
     if (now < state.startsAt || !Number.isFinite(target) || target >= video.duration) return;
     const drift = target - video.currentTime;
     const distance = Math.abs(drift);
-    hardDriftSamples = distance > 0.45 ? hardDriftSamples + 1 : 0;
-    if ((distance > 0.75 || hardDriftSamples >= 2) && now >= nextHardSeek) {
-      video.currentTime = target;
+    hardDriftSamples = distance > 0.9 ? hardDriftSamples + 1 : 0;
+    if ((distance > 1.25 || hardDriftSamples >= 2) && now >= nextHardSeek) {
+      // Allow for the time spent decoding the destination while the room keeps playing.
+      driftSeekStarted = performance.now();
+      video.currentTime = positionAt(now + driftSeekLeadMs);
       setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
-    } else if (distance > 0.10) {
-      setRate(drift > 0 ? 1.05 : 0.95);
+    } else if (video.playbackRate === 1 && distance > 0.30) {
+      const correction = distance > 0.35 ? 0.10 : 0.05;
+      setRate(1 + Math.sign(drift) * correction);
     } else if (distance < 0.04 || drift * (video.playbackRate - 1) < 0) {
       setRate(1);
     }
@@ -206,7 +228,7 @@ export function createPlayer({ roomPath, role }) {
       return;
     }
     const now = performance.now() + offset;
-    const untilStart = state.startsAt - now;
+    const untilStart = state.startsAt - now - playbackStartLeadMs;
     if (untilStart > 0) {
       pauseAndAlign(state.position);
       startTimer = setTimeout(() => {
@@ -291,7 +313,7 @@ export function createPlayer({ roomPath, role }) {
       }
       if (result.ownsSeat && !rememberedSeat) {
         try {
-          sessionStorage.setItem(storageKey, playerId);
+          sessionStorage.setItem(storageKey, JSON.stringify({ playerId, startLeadMs: playbackStartLeadMs }));
         } catch {
           // Playback can continue in the current document.
         }
@@ -324,6 +346,7 @@ export function createPlayer({ roomPath, role }) {
         pendingStart = undefined;
         hardDriftSamples = 0;
         nextHardSeek = 0;
+        driftSeekStarted = undefined;
       }
       followTimeline();
       if (operation === queuedCommand) queuedCommand = undefined;
@@ -380,8 +403,12 @@ export function createPlayer({ roomPath, role }) {
     render();
     try {
       // Call play from the tap itself so WebKit can authorize this element for later starts.
+      const startPosition = video.currentTime;
+      const started = performance.now();
       await video.play();
+      const startLeadMs = await measurePlaybackStart(generation, startPosition, started);
       if (generation !== loadGeneration) return;
+      playbackStartLeadMs = startLeadMs;
       pauseVideo();
       primed = true;
       claim = true;
@@ -410,7 +437,14 @@ export function createPlayer({ roomPath, role }) {
     seekPreview = false;
     renderTime();
   });
-  for (const event of ['canplay', 'seeked']) video.addEventListener(event, wake);
+  video.addEventListener('canplay', wake);
+  video.addEventListener('seeked', () => {
+    if (driftSeekStarted !== undefined) {
+      driftSeekLeadMs = Math.min(750, performance.now() - driftSeekStarted);
+      driftSeekStarted = undefined;
+    }
+    wake();
+  });
   for (const event of ['waiting', 'stalled', 'emptied', 'error']) video.addEventListener(event, () => {
     // A local seek can briefly lower readyState without interrupting continuous playback.
     clearTimeout(stallTimer);
@@ -442,6 +476,8 @@ export function createPlayer({ roomPath, role }) {
       inFlight = priming = primed = claim = gestureFailed = networkError = false;
       seekPreview = false;
       commandMessage = '';
+      driftSeekStarted = undefined;
+      driftSeekLeadMs = initialDriftSeekLeadMs;
       clockSamples = [];
       video.removeAttribute('src');
       video.load();
