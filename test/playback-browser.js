@@ -75,17 +75,21 @@ async function playhead(page) {
   }));
 }
 
+function playbackDetails(page) {
+  return page.locator('video').evaluate(video => ({
+    paused: video.paused, position: video.currentTime, seeking: video.seeking, readyState: video.readyState,
+    mediaError: video.error?.code, online: navigator.onLine, status: document.querySelector('#playback-status').textContent,
+    ready: [document.querySelector('#host-ready').textContent, document.querySelector('#visitor-ready').textContent],
+  }));
+}
+
 async function waitForPlaying(page, after) {
   await page.waitForFunction(after => {
     const video = document.querySelector('video');
     return !video.paused && !video.seeking && video.currentTime > after &&
       video.videoWidth > 0 && !video.muted;
   }, after, { timeout: 10_000 }).catch(async () => {
-    const observed = await page.locator('video').evaluate(video => ({
-      paused: video.paused, position: video.currentTime, seeking: video.seeking, readyState: video.readyState,
-      mediaError: video.error?.code, status: document.querySelector('#playback-status').textContent,
-    }));
-    assert.fail('Expected playback past ' + after.toFixed(2) + ' s, observed ' + JSON.stringify(observed));
+    assert.fail('Expected playback past ' + after.toFixed(2) + ' s, observed ' + JSON.stringify(await playbackDetails(page)));
   });
 }
 
@@ -323,7 +327,10 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
       usedGesture = await Promise.race([playing.then(() => false), retry.waitFor().then(() => true)]);
       if (usedGesture) await retry.tap();
     }
-    await playing;
+    await playing.catch(async error => {
+      const players = await Promise.all([playbackDetails(hostPage), playbackDetails(visitorPage)]);
+      assert.fail(label + ' failed for host/visitor ' + JSON.stringify(players) + '. ' + error.message);
+    });
     console.log(label + ': ' + Math.round(performance.now() - started) + ' ms to both advancing 0.25 s; ' +
       'paired position difference ' + await assertAligned() + ' s' + (usedGesture ? '; browser required a new tap.' : '.'));
   }

@@ -302,7 +302,8 @@ export function createPlayer({ roomPath, role }) {
       }
       const outageAcknowledged = ok && operation.action === 'unavailable' && outage === reportedOutage && operation.reason === outage?.reason;
       if (!result.ownsSeat || outageAcknowledged) {
-        if (outage?.reason === 'connection' && video.error) video.load();
+        // The playback endpoint can recover while an interrupted media request stays stalled.
+        if (outage?.reason === 'connection' && (outageAcknowledged || video.error)) video.load();
         outage = undefined;
       }
       if (operation === reportBuffering) reportBuffering = undefined;
