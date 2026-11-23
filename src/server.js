@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { open, readFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
+import { isIP } from 'node:net';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
@@ -11,8 +12,8 @@ import { openRooms } from './rooms.js';
 const lifetime = 12 * 60 * 60;
 const cookieName = 'watch_party_host';
 const roomId = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
-const roomRoute = new RegExp('^/api/rooms/(' + roomId + ')(/retry)?$');
-const pageRoute = new RegExp('^/rooms/' + roomId + '$');
+const roomRoute = new RegExp('^/api/rooms/(' + roomId + ')(?:/(retry|invitation|approve|join|end))?$');
+const pageRoute = new RegExp('^/(?:rooms|invite)/' + roomId + '$');
 const mediaRoute = new RegExp('^/media/(' + roomId + ')\\.mp4$');
 const assets = {
   '/index.html': 'text/html; charset=utf-8',
@@ -57,31 +58,43 @@ async function readJson(req) {
   }
 }
 
+function getCookie(req, name) {
+  return req.headers.cookie?.split(';').map(value => value.trim())
+    .find(value => value.startsWith(name + '='))?.slice(name.length + 1);
+}
+
+function sessionCookie(name, token, secure) {
+  return name + '=' + token + '; Path=/; HttpOnly; SameSite=Strict' + (secure ? '; Secure' : '');
+}
+
 function hostSession(password) {
   const secret = randomBytes(32);
   const digest = value => createHash('sha256').update(value).digest();
   const passwordHash = digest(password);
   const sign = payload => createHmac('sha256', secret).update(payload).digest('base64url');
-  let failed = 0;
+  const failures = new Map();
   let resetAt = 0;
   return {
-    login(input, secure) {
+    login(input, secure, client) {
       if (Date.now() >= resetAt) {
-        failed = 0;
+        failures.clear();
         resetAt = Date.now() + 60_000;
       }
-      if (failed >= 10) throw new HttpError(429, '尝试次数过多，请等一分钟。');
+      const count = failures.get(client) ?? 0;
+      if (count >= 10) throw new HttpError(429, '尝试次数过多，请等一分钟。');
       if (typeof input !== 'string' || !timingSafeEqual(passwordHash, digest(input))) {
-        failed++;
+        if (failures.size >= 10_000 && !failures.has(client)) {
+          failures.delete(failures.keys().next().value);
+        }
+        failures.set(client, count + 1);
         throw new HttpError(401, '房主密码不正确。');
       }
+      failures.delete(client);
       const payload = Math.floor(Date.now() / 1000 + lifetime) + '.' + randomBytes(16).toString('hex');
-      return cookieName + '=' + payload + '.' + sign(payload) +
-        '; Path=/; HttpOnly; SameSite=Strict; Max-Age=' + lifetime + (secure ? '; Secure' : '');
+      return sessionCookie(cookieName, payload + '.' + sign(payload), secure) + '; Max-Age=' + lifetime;
     },
     verify(req) {
-      const cookie = req.headers.cookie?.split(';').map(value => value.trim())
-        .find(value => value.startsWith(cookieName + '='))?.slice(cookieName.length + 1);
+      const cookie = getCookie(req, cookieName);
       const token = /^(\d{10}\.[a-f0-9]{32})\.([\w-]{43})$/.exec(cookie ?? '');
       return token && Number(token[1].split('.')[0]) > Date.now() / 1000 &&
         timingSafeEqual(Buffer.from(token[2]), Buffer.from(sign(token[1])));
@@ -99,6 +112,7 @@ async function serveMedia(req, res, path) {
   }
   try {
     const { size } = await file.stat();
+    if (res.destroyed) return;
     const headers = { 'Content-Type': 'video/mp4', 'Accept-Ranges': 'bytes' };
     let start = 0;
     let end = size - 1;
@@ -132,6 +146,8 @@ export async function startServer({
   dataDir = join(homedir(), '.bili-watch-party'),
   password,
   port = 3000,
+  now = Date.now,
+  retentionMs = 24 * 60 * 60_000,
   publicOrigin,
   importVideo = createImporter(),
 } = {}) {
@@ -142,9 +158,89 @@ export async function startServer({
       new URL(publicOrigin).origin !== publicOrigin)) {
     throw new Error('PUBLIC_ORIGIN 必须是 HTTPS 源地址，且无结尾斜杠。');
   }
+  if (!Number.isSafeInteger(retentionMs) || retentionMs < 1) {
+    throw new Error('房间保留期限必须是正数。');
+  }
+  const secure = Boolean(publicOrigin);
   const sessions = hostSession(password);
-  const rooms = openRooms(dataDir, importVideo);
+  const rooms = openRooms(dataDir, importVideo, { now, retentionMs });
+  const { admission } = rooms;
+  const mediaResponses = new Map();
   let origin = publicOrigin;
+
+  function requireHost(req) {
+    if (!sessions.verify(req)) throw new HttpError(401, '请先以房主身份登录。');
+  }
+
+  const visitorCookieName = id => 'watch_party_visitor_' + id;
+  const visitorToken = (req, id) => getCookie(req, visitorCookieName(id));
+
+  async function joinRoom(req, res, id) {
+    const body = req.method === 'POST' ? await readJson(req) : null;
+    const name = visitorCookieName(id);
+    const token = visitorToken(req, id);
+    let result;
+    const room = rooms.get(id);
+    if (!room) result = { state: rooms.isEnded(id) ? 'ended' : 'expired' };
+    else if (req.method === 'POST') result = admission.request(id, body?.token, token);
+    else result = admission.state(id, token);
+
+    const { visitorToken: newToken, ...status } = result;
+    if (newToken) res.setHeader('Set-Cookie', sessionCookie(name, newToken, secure));
+    else if (token && ['expired', 'ended'].includes(status.state)) {
+      res.setHeader('Set-Cookie', sessionCookie(name, '', secure) + '; Max-Age=0');
+    }
+    if (status.state === 'approved') status.room = room;
+    return send(res, 200, status);
+  }
+
+  async function hostRoom(req, res, id, action) {
+    requireHost(req);
+    const body = action ? await readJson(req) : null;
+    if (rooms.isEnded(id)) return send(res, 200, { status: 'ended' });
+    let room = rooms.get(id);
+    if (!room) throw new HttpError(404, '找不到房间。');
+
+    switch (action) {
+      case 'retry':
+        if (!Number.isSafeInteger(body?.attempt) || body.attempt < 1) {
+          throw new HttpError(400, '缺少导入次数。请刷新房间后重试。');
+        }
+        room = rooms.retry(id, body.attempt);
+        break;
+      case 'invitation':
+        if (!['generate', 'revoke'].includes(body?.action)) throw new HttpError(400, '请选择邀请操作。');
+        admission.changeInvitation(id, body.action);
+        break;
+      case 'approve':
+        if (typeof body?.requestId !== 'string' || !admission.approve(id, body.requestId)) {
+          throw new HttpError(409, '申请已失效，或唯一访客席位已被占用。');
+        }
+        break;
+      case 'end':
+        rooms.end(id);
+        for (const response of mediaResponses.get(id) ?? []) response.destroy();
+        return send(res, 200, { status: 'ended' });
+    }
+    return send(res, 200, { ...room, ...admission.hostView(id) });
+  }
+
+  async function roomMedia(req, res, id) {
+    if (!sessions.verify(req) && !admission.isApproved(id, visitorToken(req, id))) {
+      throw new HttpError(401, '仅房主和已批准的访客可读取视频。');
+    }
+    if (rooms.isEnded(id)) throw new HttpError(410, '房间已结束。');
+    if (rooms.get(id)?.status !== 'ready') throw new HttpError(404, '视频还不可用。');
+    let responses = mediaResponses.get(id);
+    if (!responses) mediaResponses.set(id, responses = new Set());
+    responses.add(res);
+    try {
+      await serveMedia(req, res, rooms.mediaPath(id));
+    } finally {
+      responses.delete(res);
+      if (!responses.size) mediaResponses.delete(id);
+    }
+  }
 
   async function route(req, res) {
     const path = new URL(req.url, 'http://localhost').pathname;
@@ -154,33 +250,29 @@ export async function startServer({
     }
     if (path === '/api/session' && method === 'POST') {
       const body = await readJson(req);
-      res.setHeader('Set-Cookie', sessions.login(body?.password, Boolean(publicOrigin)));
+      // The application binds exclusively to loopback. Its HTTPS proxy must overwrite this header.
+      const forwarded = req.headers['x-forwarded-for'];
+      const client = secure && typeof forwarded === 'string' && isIP(forwarded)
+        ? forwarded : req.socket.remoteAddress;
+      res.setHeader('Set-Cookie', sessions.login(body?.password, secure, client));
       return send(res, 204);
     }
 
+    const match = roomRoute.exec(path);
+    if (match) {
+      const [, id, action] = match;
+      if (action === 'join' && ['GET', 'POST'].includes(method)) return joinRoom(req, res, id);
+      if (method === (action ? 'POST' : 'GET')) return hostRoom(req, res, id, action);
+    }
+    const media = mediaRoute.exec(path);
+    if (media && ['GET', 'HEAD'].includes(method)) return roomMedia(req, res, media[1]);
     if (path.startsWith('/api/') || path.startsWith('/media/')) {
-      if (!sessions.verify(req)) throw new HttpError(401, '请先以房主身份登录。');
+      requireHost(req);
       if (path === '/api/session' && method === 'GET') return send(res, 204);
       if (path === '/api/rooms' && method === 'POST') {
         const body = await readJson(req);
         const { created, room } = rooms.submit(parseSource(body?.url));
         return send(res, created ? 201 : 200, room);
-      }
-      const match = roomRoute.exec(path);
-      if (match && ((method === 'GET' && !match[2]) || (method === 'POST' && match[2]))) {
-        const body = match[2] ? await readJson(req) : null;
-        if (match[2] && (!Number.isSafeInteger(body?.attempt) || body.attempt < 1)) {
-          throw new HttpError(400, '缺少导入次数。请刷新房间后重试。');
-        }
-        const room = match[2] ? rooms.retry(match[1], body.attempt) : rooms.get(match[1]);
-        if (!room) throw new HttpError(404, '找不到房间。');
-        return send(res, 200, room);
-      }
-      const media = mediaRoute.exec(path);
-      if (media && ['GET', 'HEAD'].includes(method)) {
-        const room = rooms.get(media[1]);
-        if (room?.status !== 'ready') throw new HttpError(404, '视频还不可用。');
-        return serveMedia(req, res, rooms.mediaPath(room.id));
       }
     }
 
@@ -196,6 +288,7 @@ export async function startServer({
   const server = createServer((req, res) => {
     res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Permissions-Policy', 'microphone=()');
     res.setHeader('Referrer-Policy', 'no-referrer');
     res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
     res.setHeader('Content-Security-Policy',
@@ -235,6 +328,7 @@ if (process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.m
   const app = await startServer({
     dataDir: process.env.DATA_DIR,
     password: process.env.HOST_PASSWORD,
+    retentionMs: Number(process.env.ENDED_ROOM_RETENTION_HOURS ?? 24) * 60 * 60_000,
     port: Number(process.env.PORT ?? 3000),
     publicOrigin: process.env.PUBLIC_ORIGIN,
     importVideo: createImporter({ ffmpeg: process.env.FFMPEG_PATH, ffprobe: process.env.FFPROBE_PATH }),

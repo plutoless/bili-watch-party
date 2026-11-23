@@ -1,6 +1,8 @@
 # B 站一起看
 
-房主登录后，可粘贴 B 站普通投稿链接创建私密房间。后台下载对应分 P 的公开音画轨道，合并为 MP4。房间显示已识别的影片、导入阶段与失败原因。就绪后用原生播放器播放和拖动进度条。
+房主登录后粘贴 B 站普通投稿链接，后台自动导入可公开播放的对应分 P 并合并为 MP4。导入开始后即可生成和复制私密邀请。访客在手机浏览器打开链接就会发出加入申请，无需安装或注册。访客可把页面显示的申请编号发给房主核对。房主批准后，访客占用唯一席位，等待视频就绪，然后在网页播放和跳转。播放时间线同步由 #4 跟踪。
+
+邀请有效期为 30 分钟。更换或撤销邀请会使旧链接和未批准申请失效，已批准的访客可继续观看。结束房间会立即撤销邀请、访客会话和媒体访问，包括已开始传输的响应，正在运行的导入也会取消。服务保留最小的结束记录和成品到清理期限，默认 24 小时。服务启动时和运行中每分钟检查一次清理期限。
 
 ## 本机运行
 
@@ -14,26 +16,49 @@ export HOST_PASSWORD
 npm start
 ```
 
-打开 `http://127.0.0.1:3000`。使用独立的高强度房主密码。服务只监听本机回环地址。如需通过已有 HTTPS 反向代理访问，将 `PUBLIC_ORIGIN` 设为浏览器使用的 HTTPS 源地址，例如 `https://watch.example.org`，末尾省略斜杠。代理需转发 Cookie、Origin 和 Range 请求头，并保留 206 响应。房主 Cookie 在 HTTPS 模式下带 `Secure`，有效期 12 小时。进程重启后需重新登录，房间和成品保留。
-
-当前登录限速由同一服务进程共享。公网部署前需在可信代理下按客户端隔离登录限速，避免其他访问者的失败尝试影响房主登录。
+打开 `http://127.0.0.1:3000`。服务监听本机回环地址。若使用已有 HTTPS 反向代理，将 `PUBLIC_ORIGIN` 设为浏览器使用的 HTTPS 源地址，末尾省略斜杠。代理需在回环地址转发 Cookie、Origin 和 Range，保留 206 响应，并用真实对端 IP 覆盖 `X-Forwarded-For`，供应用按客户端隔离登录限速。
 
 | 环境变量 | 用途 |
 | --- | --- |
-| `HOST_PASSWORD` | 房主密码，必填 |
+| `HOST_PASSWORD` | 房主密码，至少 16 字符，必填 |
 | `PORT` | 本机端口，默认 3000 |
 | `DATA_DIR` | 运行数据目录，默认 `~/.bili-watch-party` |
-| `PUBLIC_ORIGIN` | 反向代理的 HTTPS 源地址，本机运行时留空 |
+| `PUBLIC_ORIGIN` | 浏览器访问的 HTTPS 源地址，本机 HTTP 运行时留空 |
+| `ENDED_ROOM_RETENTION_HOURS` | 已结束房间的成品与结束记录保留小时数，默认 24 |
 | `FFMPEG_PATH` / `FFPROBE_PATH` | 可选，指定程序路径，默认从 PATH 读取 |
 
-请把运行数据、配置和日志保存在仓库之外。一个数据目录由一个服务进程使用。导入按顺序执行，下载和合并临时文件会在导入结束后删除，重启时也会清理遗留临时文件。成品和房间数据保留在数据目录，若需清理，请先停服务，再清理该目录。
+HTTPS 模式下房主和访客 Cookie 都带 `Secure`、`HttpOnly` 和 `SameSite=Strict`。房主会话有效期为 12 小时，服务重启后需重新登录。已批准访客可使用同一浏览器会话刷新和访问；房间结束时该会话失效。运行数据、配置和日志保存在仓库之外。一个数据目录由一个服务进程使用。导入按顺序执行，下载和合并的临时文件会在导入结束后删除，重启时也会清理遗留文件。
+
+## Linux 单机 HTTPS 部署
+
+1. 在一台可访问 B 站公开 API 和媒体 CDN 的 Linux 主机上准备 Docker Engine 和 Docker Compose v2。将部署域名解析到主机，放行 TCP 80 和 443，并确认这两个端口可用。发布 AAAA 记录前确认对应 IPv6 地址也能访问这两个端口。
+2. 在服务器上获取项目源码，以服务器实际域名替换示例。把配置写进仓库外的文件，并保持只对部署用户可读。首次生成的随机密码供房主登录，请按私密凭证保管。
+
+   ```sh
+   mkdir -p "$HOME/.config/bili-watch-party"
+   (
+     umask 077
+     printf 'PUBLIC_ORIGIN=%s\nHOST_PASSWORD=%s\n' \
+       'https://watch.example.org' "$(openssl rand -hex 32)" \
+       > "$HOME/.config/bili-watch-party/compose.env"
+   )
+   ```
+
+3. 可在该配置中设置 `WATCH_DATA_VOLUME`（默认 `bili-watch-party-rooms`）、`WATCH_TLS_VOLUME`（默认 `bili-watch-party-tls`）和 `ENDED_ROOM_RETENTION_HOURS`。在仓库根目录启动：
+
+   ```sh
+   docker compose --env-file "$HOME/.config/bili-watch-party/compose.env" config --quiet
+   docker compose --env-file "$HOME/.config/bili-watch-party/compose.env" up -d --build
+   ```
+
+4. 从配置的 HTTPS 域名打开房主入口。Caddy 为域名申请及续期证书，并在同一个容器网络命名空间内通过回环地址访问应用。对主机只发布代理的 TCP 80 和 443。应用数据卷保存 SQLite、暂存文件和成品，Caddy 数据卷保存证书及其私钥。配置和这些卷仅供服务器管理员访问。
+5. 升级应用时使用 `up -d --build --force-recreate` 一起重建两个容器。迁移时先停止服务，再将应用数据卷复制至新主机的对应卷，保留卷内文件的权限和属主。复用域名时也可迁移 Caddy 数据卷。验证新主机的 DNS、HTTPS 和导入后再切换访问。日常停止用 `stop` 保留卷。
 
 ## 支持的片源与恢复
 
-- 支持 `https://www.bilibili.com/video/BV1TDyazeEuY` 形式的 BV 投稿地址。用 `?p=2` 等参数指定分 P，省略时导入 P1。同一投稿和分 P 的再次提交打开原房间。
-- 房间显示等待、下载、准备、就绪或失败。网络异常、服务重启导致中断等可恢复错误可在原房间重试。重试请求针对页面上显示的失败尝试，重复发送同一请求只会开始一次新尝试。
-- 此版本使用可公开获取的 H.264/AAC 分离轨道（至多 480p，每条轨道最大 512 MiB）。支持范围为 BV 投稿及其分 P。短链、AV 链接、番剧地址和需要会员或登录权限的片源属于后续兼容范围。
-- 房主会话保护房间数据和 MP4（含 HEAD 与单个字节范围）。此版本提供单房主入口。访客邀请、审批和双端同步由后续工单实现。
+- 支持 `https://www.bilibili.com/video/BV1TDyazeEuY` 形式的 BV 投稿地址。用 `?p=2` 等参数指定分 P，省略时导入 P1。同一投稿和分 P 的再次提交打开原有活动房间。结束后可以为同一片源创建新房间。
+- 导入页显示等待、下载、准备、就绪或失败。网络异常、服务重启导致中断等可恢复错误可在原房间重试。重试请求针对页面上显示的失败尝试，同一请求只会启动一次新尝试。
+- 使用可公开获取的 H.264/AAC 分离轨道（至多 480p，每条轨道最大 512 MiB）。支持范围为 BV 投稿及其分 P。
 
 ## 验收
 
@@ -45,4 +70,6 @@ npm run test:browser
 SIMULATE_FIRST_FAILURE=1 npm run test:browser
 ```
 
-HTTP 测试用合成样本覆盖未登录访问、链接校验、并发重复提交、首次网络失败、重复重试、片源权限、试看和字节范围。浏览器测试从网页提交公开投稿 `BV1TDyazeEuY`，在 Chromium 的 Pixel 7 和 WebKit 的 iPhone 13 模拟环境播放，跳转至第 600 秒，并检查未登录会话无法获取视频。测试用 FFprobe 确认轨道，再用 FFmpeg 完整解码。打开 `SIMULATE_FIRST_FAILURE` 可注入首次导入断线，然后从同一房间点击重试并实际导入。测试所用的影片与运行数据保存在系统临时目录，结束即清理。
+HTTP 测试用合成样本覆盖导入和重试、邀请轮换和过期、并发审批、媒体权限以及结束房间后的清理。浏览器测试从网页提交公开投稿 `BV1TDyazeEuY`，在 Chromium 的 Pixel 7 和 WebKit 的 iPhone 13 模拟环境中分别使用独立的房主、访客、第三方会话。验证邀请、批准、拒绝读取视频、播放、跳转至第 600 秒和结束房间。测试管理服务时还用 FFprobe 检查轨道并用 FFmpeg 完整解码一份导入结果。用 `SIMULATE_FIRST_FAILURE` 注入首次导入断线，再从原房间重试真实导入。
+
+在专用部署上，把 `BROWSER_ORIGIN` 设为部署后的 HTTPS 源地址，并向测试进程提供该环境的 `HOST_PASSWORD`，运行 `npm run test:browser`。测试会提交真实导入并结束相应房间。独立的 Compose 回环实例可设置 `WATCH_BIND_IP=127.0.0.1`、`WATCH_HTTPS_PORT=8443` 和 `PUBLIC_ORIGIN=https://localhost:8443`。如果该实例使用本地 CA，可为测试进程设 `BROWSER_LOCAL_TLS=1`，并用该 CA 单独校验 TLS。可选的 `BROWSER_DATA_DIR` 指向该部署的本地运行数据目录，供 FFprobe 和 FFmpeg 检查成品。请在仓库之外保存临时运行数据和任何测试日志。
