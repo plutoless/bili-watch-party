@@ -83,7 +83,7 @@ async function waitForPlaying(page, after) {
   }, after);
 }
 
-async function checkDriftCorrection(visitorPage) {
+async function checkDriftCorrection(visitorPage, getTimeline) {
   const video = visitorPage.locator('video');
   async function waitFor(predicate, expected) {
     await visitorPage.waitForFunction(predicate, undefined, { timeout: 10_000 }).catch(async () => {
@@ -94,11 +94,16 @@ async function checkDriftCorrection(visitorPage) {
       assert.fail(expected + ', observed ' + JSON.stringify(observed));
     });
   }
-  await video.evaluate(video => {
+  const sent = performance.now();
+  const { startsAt, position, serverTime } = await getTimeline();
+  const received = performance.now();
+  assert.ok(startsAt !== null, 'An active timeline is required for the drift probe');
+  const projected = position + (serverTime - startsAt + (received - sent) / 2) / 1000;
+  await video.evaluate((video, projected) => {
     video.dataset.seeks = '0';
     video.addEventListener('seeking', () => { video.dataset.seeks = Number(video.dataset.seeks) + 1; });
-    video.currentTime += 0.30;
-  });
+    video.currentTime = projected + 0.30;
+  }, projected);
   await waitFor(() => document.querySelector('video').playbackRate < 1, 'Expected a reduced rate for small drift');
   await waitFor(() => document.querySelector('video').playbackRate === 1, 'Expected rate to return to normal');
   assert.equal(await video.getAttribute('data-seeks'), '1', 'Small drift must recover through rate changes');
@@ -183,8 +188,12 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await hostPage.getByText('访客 · 已就绪').waitFor();
   await visitorPage.getByText('房主 · 已就绪').waitFor();
 
-  const beforePlay = await post(host, { role: 'host', action: 'observe', playerId });
-  const { epoch, version } = await beforePlay.json();
+  const getTimeline = async () => {
+    const response = await post(host, { role: 'host', action: 'observe', playerId });
+    assert.ok(response.ok());
+    return response.json();
+  };
+  const { epoch, version } = await getTimeline();
   const command = { playerId, epoch, version, action: 'seek', position: 9 };
   assert.equal((await post(stranger, { ...command, role: 'visitor' })).status(), 401);
   assert.equal((await post(visitor, { ...command, role: 'host' })).status(), 401);
@@ -195,7 +204,7 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
   console.log('Initial start: both past 0.25 s after ' + Math.round(performance.now() - started) + ' ms.');
   await checkStability(hostPage, visitorPage);
-  await checkDriftCorrection(visitorPage);
+  await checkDriftCorrection(visitorPage, getTimeline);
 
   holdSeek = true;
   started = performance.now();

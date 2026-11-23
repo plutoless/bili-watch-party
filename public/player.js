@@ -1,4 +1,5 @@
 const pollMs = 200;
+const driftCheckMs = 100;
 const alignmentTolerance = 0.05;
 
 function formatTime(seconds) {
@@ -19,6 +20,7 @@ export function createPlayer({ roomPath, role }) {
   let state;
   let poll;
   let startTimer;
+  let driftTimer;
   let inFlight = false;
   let queuedCommand;
   let priming = false;
@@ -80,9 +82,13 @@ export function createPlayer({ roomPath, role }) {
     renderTime();
   }
 
+  function setRate(rate) {
+    if (video.playbackRate !== rate) video.playbackRate = rate;
+  }
+
   function pauseVideo() {
     video.pause();
-    video.playbackRate = 1;
+    setRate(1);
   }
 
   function pauseAndAlign(target) {
@@ -123,20 +129,28 @@ export function createPlayer({ roomPath, role }) {
     });
   }
 
-  function correctDrift(target, now) {
-    if (video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
+  function positionAt(serverTime) {
+    return Math.min(video.duration, state.position + Math.max(0, serverTime - state.startsAt) / 1000);
+  }
+
+  function correctDrift() {
+    if (state?.startsAt == null || !state.ownsSeat || !primed || priming || networkError || reportBlocked ||
+        video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
+    const now = performance.now() + offset;
+    const target = positionAt(now);
+    if (now < state.startsAt || !Number.isFinite(target) || target >= video.duration) return;
     const drift = target - video.currentTime;
     const distance = Math.abs(drift);
-    hardDriftSamples = distance > 0.65 ? hardDriftSamples + 1 : 0;
-    if (hardDriftSamples >= 2 && now >= nextHardSeek) {
+    hardDriftSamples = distance > 0.45 ? hardDriftSamples + 1 : 0;
+    if ((distance > 0.75 || hardDriftSamples >= 2) && now >= nextHardSeek) {
       video.currentTime = target;
-      video.playbackRate = 1;
+      setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
     } else if (distance > 0.10) {
-      video.playbackRate = drift > 0 ? 1.05 : 0.95;
+      setRate(drift > 0 ? 1.05 : 0.95);
     } else if (distance < 0.04 || drift * (video.playbackRate - 1) < 0) {
-      video.playbackRate = 1;
+      setRate(1);
     }
   }
 
@@ -161,10 +175,9 @@ export function createPlayer({ roomPath, role }) {
       }, untilStart);
       return;
     }
-    const target = Math.min(video.duration, state.position - untilStart / 1000);
+    const target = positionAt(now);
     if (!Number.isFinite(target) || target >= video.duration) return;
     if (video.paused) beginPlayback(target);
-    else correctDrift(target, now);
   }
 
   function updateClock(sent, received, serverTime) {
@@ -308,6 +321,8 @@ export function createPlayer({ roomPath, role }) {
     load(url) {
       if (video.getAttribute('src') === url) return;
       video.src = url;
+      clearInterval(driftTimer);
+      driftTimer = setInterval(correctDrift, driftCheckMs);
       byId('player').hidden = false;
       wake();
     },
@@ -316,6 +331,7 @@ export function createPlayer({ roomPath, role }) {
       loadGeneration++;
       clearTimeout(poll);
       clearTimeout(startTimer);
+      clearInterval(driftTimer);
       state = undefined;
       queuedCommand = undefined;
       reportBlocked = pendingStart = undefined;
