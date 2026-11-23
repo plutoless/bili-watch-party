@@ -6,7 +6,9 @@
     "start": "node src/server.js",
     "build:web": "node scripts/build-web.js",
     "test:browser": "node test/live-browser.js",
-    "check": "node --check src/server.js && node --check src/importer.js && node --check src/rooms.js && node --check src/admission.js && node --check src/playback.js && node --check public/app.js && node --check public/player.js && node --check scripts/build-web.js"
+    "test:release": "node --test test/release.test.js",
+    "test:release:compose": "bash test/compose-release.sh",
+    "check": "node --check src/server.js && node --check src/importer.js && node --check src/rooms.js && node --check src/admission.js && node --check src/playback.js && node --check public/app.js && node --check public/player.js && node --check scripts/build-web.js && bash -n scripts/release.sh && bash -n scripts/deploy-backend.sh && bash -n test/compose-release.sh"
   },
   "type": "module",
   "engines": {

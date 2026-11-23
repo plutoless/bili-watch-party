@@ -59,7 +59,7 @@ HTTPS 模式下房主和访客 Cookie 都带 `Secure`、`HttpOnly` 和 `SameSite
 
 ## Vercel 网页与 Vultr 后台
 
-需要分别托管时，按 [拆分部署与验收](docs/split-deployment.md) 手动发布。房主和访客使用同一个网页域，播放器和网页 API 直接访问同站的后台 HTTPS 域。影片保存在 Vultr 数据卷中，并继续按房间会话授权。
+分别托管时，按 [自动发布与恢复](docs/production-release.md) 设置 GitHub Actions、Vercel 和 Vultr。房主和访客使用同一个网页域，播放器和网页 API 直接访问同站的后台 HTTPS 域。影片保存在 Vultr 数据卷中，并继续按房间会话授权。[手动拆分部署](docs/split-deployment.md) 提供独立 HTTPS 验收步骤。
 
 ## 支持的片源与恢复
 

@@ -1,0 +1,15 @@
+services:
+  app:
+    image: ${COMPOSE_PROJECT_NAME:?Set the existing Compose project name}-app:${RELEASE_SHA:?Set the release SHA}
+    build:
+      args:
+        RELEASE_SHA: ${RELEASE_SHA}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:3000/api/release').then(r => r.json()).then(r => { if (r.sha !== process.env.RELEASE_SHA) process.exitCode = 1 })
+      interval: 3s
+      timeout: 3s
+      retries: 10
