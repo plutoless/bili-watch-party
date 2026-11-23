@@ -1,14 +1,15 @@
+import { createPlayer } from './player.js';
+
 const byId = id => document.getElementById(id);
 const loginForm = byId('login-form');
 const sourceForm = byId('source-form');
-const video = byId('video');
-const play = byId('play');
 const retry = byId('retry');
 const roomError = byId('room-error');
 const actionMessage = byId('action-message');
 const visitor = location.pathname.startsWith('/invite/');
 const path = visitor ? location.pathname.replace('/invite/', '/rooms/') : location.pathname;
 const roomPath = path.startsWith('/rooms/') ? '/api' + path : null;
+const player = createPlayer({ roomPath, role: visitor ? 'visitor' : 'host' });
 let invitationToken = visitor ? location.hash.slice(1) : '';
 let pollVersion = 0;
 let actionPending = false;
@@ -35,7 +36,7 @@ function show(section) {
   for (const name of ['signin', 'create', 'room']) byId(name).hidden = name !== section;
   if (section === 'signin') {
     clearTimeout(pollTimer);
-    stopPlayer();
+    player.stop();
     byId('invite-url').value = '';
   }
 }
@@ -70,18 +71,9 @@ function setStatus(state) {
   status.textContent = statusLabels[state];
 }
 
-function stopPlayer() {
-  if (video.hasAttribute('src')) {
-    video.removeAttribute('src');
-    video.load();
-  }
-  byId('player').hidden = true;
-  play.hidden = false;
-}
-
 function showTerminal(state) {
   setStatus(state);
-  stopPlayer();
+  player.stop();
   byId('title').textContent = '观影房间';
   byId('source-detail').hidden = true;
   byId('host-tools').hidden = true;
@@ -102,10 +94,7 @@ function render(room) {
   setText(roomError, room.error?.message ?? '');
   failedAttempt = room.error?.retryable ? room.attempt : undefined;
   retry.hidden = visitor || !room.error?.retryable;
-  if (room.mediaUrl) {
-    if (video.getAttribute('src') !== room.mediaUrl) video.setAttribute('src', room.mediaUrl);
-    byId('player').hidden = false;
-  }
+  if (room.mediaUrl) player.load(room.mediaUrl);
   if (!visitor) renderHostTools(room);
 }
 
@@ -268,18 +257,6 @@ byId('end-room').addEventListener('click', event => {
   if (confirm('结束房间后，邀请和视频访问将立即失效。确定结束？')) {
     hostAction('end', {}, event.currentTarget);
   }
-});
-
-play.addEventListener('click', async () => {
-  try {
-    await video.play();
-  } catch {
-    roomError.textContent = '无法播放。请刷新页面或重新登录后再试。';
-  }
-});
-video.addEventListener('playing', () => { play.hidden = true; });
-video.addEventListener('error', () => {
-  roomError.textContent = '无法读取视频。请刷新页面或重新登录后再试。';
 });
 
 async function connect() {
