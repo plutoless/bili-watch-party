@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 const startLeadMs = 900;
 const playerLeaseMs = 4_000;
 const alignmentTolerance = 0.12;
+const maxRecoveryRewind = 2;
 const roles = ['host', 'visitor'];
 
 export function createPlayback(duration) {
@@ -38,9 +39,10 @@ export function createPlayback(duration) {
   function interrupt(player, reason, now, observedPosition) {
     const projected = currentPosition(now);
     const reported = observedPosition ?? (player.progress?.version === version ? player.progress.position : undefined);
-    // Resume no later than the last confirmed frame on this timeline.
+    // Allow a short recovery rewind without treating a participant's report as a seek.
+    const floor = Math.max(position, projected - maxRecoveryRewind);
     const target = startsAt === null || !Number.isFinite(reported) ? projected
-      : Math.max(position, Math.min(projected, reported));
+      : Math.max(floor, Math.min(projected, reported));
     align(target, wantsPlay && target < duration);
     player.waiting = reason;
   }

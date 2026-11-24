@@ -701,4 +701,20 @@ test('only the host directs playback and both players must acknowledge the curre
   await send('host', 'ready', refreshed);
   const afterRefresh = await send('visitor', 'ready', refreshed).then(r => r.json());
   assert.ok(afterRefresh.startsAt > now);
+
+  now = afterRefresh.startsAt + 3_000;
+  await send('host', 'observe');
+  await send('visitor', 'observe');
+  now += 3_000;
+  const refreshedVersion = { epoch: afterRefresh.epoch, version: afterRefresh.version };
+  const current = await send('host', 'observe').then(r => r.json());
+  const interrupted = await send('visitor', 'unavailable', {
+    ...refreshedVersion, reason: 'buffering', position: 0,
+  }).then(r => r.json());
+  assert.equal(interrupted.startsAt, null);
+  assert.equal(interrupted.waiting.visitor, 'buffering');
+  assert.ok(interrupted.position >= current.position,
+    'An outlying visitor report must not rewind to the start of the room');
+  assert.ok(Math.abs(interrupted.position - (current.position + 4)) < 0.00001,
+    'A visitor report may only rewind within the recovery window');
 });
