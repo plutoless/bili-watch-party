@@ -165,7 +165,15 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
       const existing = findSource.get(bvid, part);
       if (existing) return { created: false, room: get(existing.id) };
       const id = randomUUID();
-      insert.run(id, bvid, part);
+      db.exec('BEGIN');
+      try {
+        insert.run(id, bvid, part);
+        admission.createInvitation(id);
+        db.exec('COMMIT');
+      } catch (error) {
+        db.exec('ROLLBACK');
+        throw error;
+      }
       schedule();
       return { created: true, room: get(id) };
     },

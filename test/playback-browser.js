@@ -174,8 +174,8 @@ async function waitForSignal(promise, message) {
   }
 }
 
-export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, hostPath }) {
-  const endpoint = origin + '/api' + hostPath + '/playback';
+export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath }) {
+  const endpoint = apiOrigin + '/api' + hostPath + '/playback';
   const post = (context, data) => context.request.post(endpoint, { data, headers: { Origin: origin } });
   const playerId = randomUUID();
   const play = hostPage.locator('#play');

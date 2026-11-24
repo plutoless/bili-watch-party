@@ -1,0 +1,22 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "git": { "deploymentEnabled": false },
+  "framework": null,
+  "buildCommand": "npm run build:web",
+  "outputDirectory": "dist",
+  "rewrites": [
+    { "source": "/rooms/:id([a-f0-9-]+)", "destination": "/index.html" },
+    { "source": "/invite/:id([a-f0-9-]+)", "destination": "/index.html" }
+  ],
+  "headers": [
+    {
+      "source": "/:path*",
+      "headers": [
+        { "key": "Content-Security-Policy", "value": "frame-ancestors 'none'" },
+        { "key": "Permissions-Policy", "value": "microphone=()" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "X-Content-Type-Options", "value": "nosniff" }
+      ]
+    }
+  ]
+}
