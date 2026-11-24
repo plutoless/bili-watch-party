@@ -71,6 +71,7 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   assert.deepEqual(release(first, 'web-build', /网页构建失败/).stages, ['ssh-offline', 'web-build']);
   assert.equal(release(first, 'stage-web', /候选网页部署失败/).backend, undefined);
   assert.equal(release(first, 'stage-https', /候选网页 HTTPS/).backend, undefined);
+  assert.equal(release(first, 'candidate-project', /候选网页不属于配置的项目/).backend, undefined);
   assert.equal(release(first, 'backend-build', /镜像构建或拉取失败/).backend, undefined);
   assert.equal(release(first, 'compose-up', /Compose 启动或健康检查失败/).liveId, undefined);
   let state = release(first);
@@ -82,7 +83,7 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   const custom = { DEPLOY_SSH_PORT: '2222', DEPLOY_SSH_KNOWN_HOSTS: '[ssh.fixture.test]:2222 ' + hostKey };
   assert.equal(release(second, 'backend-build', /现有容器仍在运行/, custom).backend, first);
   assert.equal(release(second, 'backend-https', /后台 HTTPS.*未切换/, custom).liveId, 'dpl_' + first);
-  state = release(second, 'promote', /上一个正式网页部署已恢复/, custom);
+  state = release(second, 'promote', /HTTP 403 \(forbidden\)[\s\S]*上一个正式网页部署已恢复/, custom);
   assert.equal(state.liveId, 'dpl_' + first);
   assert.equal(state.backend, second);
   state = release(second, 'live-https', /上一个正式网页部署已恢复/, custom);
