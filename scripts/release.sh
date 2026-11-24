@@ -88,11 +88,16 @@ curl_request() {
   curl --disable --silent --show-error --connect-timeout 10 --max-time 20 "$@" 2>/dev/null
 }
 
+vercel_promote_options=(--yes --token "$VERCEL_TOKEN")
+vercel_team_query=''
+if [[ $VERCEL_ORG_ID == team_* ]]; then
+  vercel_promote_options+=(--scope "$VERCEL_ORG_ID")
+  vercel_team_query="?teamId=$VERCEL_ORG_ID"
+fi
+
 vercel_api() {
-  local query=''
-  if [[ $VERCEL_ORG_ID == team_* ]]; then query="?teamId=$VERCEL_ORG_ID"; fi
   curl_request -H "Authorization: Bearer $VERCEL_TOKEN" \
-    -o "$work/vercel-response" -w '%{http_code}' "https://api.vercel.com$1$query"
+    -o "$work/vercel-response" -w '%{http_code}' "https://api.vercel.com$1$vercel_team_query"
 }
 
 previous_web() {
@@ -170,7 +175,7 @@ printf '后台正式 HTTPS 检查通过 %s\n' "$RELEASE_SHA"
 current_main
 
 promote() {
-  "${vercel_cli[@]}" promote "$1" --yes --token "$VERCEL_TOKEN" >/dev/null 2>&1
+  "${vercel_cli[@]}" promote "$1" "${vercel_promote_options[@]}" >/dev/null 2>&1
 }
 
 check_previous_web() {

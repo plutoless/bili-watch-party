@@ -91,7 +91,7 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   assert.equal(release(second, '', undefined, custom).liveId, 'dpl_' + second);
 
   const third = advance();
-  assert.equal(release(third).liveId, 'dpl_' + third);
+  assert.equal(release(third, '', undefined, { VERCEL_ORG_ID: 'account_fixture' }).liveId, 'dpl_' + third);
   git('checkout', '-q', '--detach', second);
   state = release(second);
   assert.equal(state.liveId, 'dpl_' + third);

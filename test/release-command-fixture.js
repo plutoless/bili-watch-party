@@ -80,6 +80,8 @@ switch (command) {
       console.log('https://staged-fixture.vercel.app');
     } else {
       assert.ok(has('promote'));
+      const scope = has('--scope') ? value('--scope') : undefined;
+      assert.equal(scope, process.env.VERCEL_ORG_ID.startsWith('team_') ? process.env.VERCEL_ORG_ID : undefined);
       const target = value('promote');
       if (target === 'https://staged-fixture.vercel.app') {
         if (stage('promote')) fail();
