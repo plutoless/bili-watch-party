@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, rm, truncate, writeFile } from 'node:fs/promises';
+import { access, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
@@ -300,6 +300,51 @@ test('media download tries backup URLs and distinguishes a refusal from a transi
       assert.equal(failed.mediaUrl, null);
     });
   }
+});
+
+test('media import requests full byte ranges and skips incomplete tracks', async t => {
+  const workDir = await mkdtemp(join(tmpdir(), 'watch-media-range-'));
+  t.after(() => rm(workDir, { recursive: true, force: true }));
+  const attempted = [];
+  const response = (body, range) => new Response(body, {
+    status: 206, headers: { 'Content-Range': range },
+  });
+  const importer = createImporter({ ffmpeg: 'false', fetch: async (url, options) => {
+    if (url.pathname.endsWith('/view')) {
+      return Response.json({ code: 0, data: {
+        title: '验收影片', pages: [{ page: 1, cid: 123, duration: 4 }],
+      } });
+    }
+    if (url.pathname.endsWith('/playurl')) {
+      return Response.json({ code: 0, data: { dash: {
+        video: [{
+          id: 32, codecs: 'avc1.64001f',
+          baseUrl: 'https://cdn.bilivideo.com/partial',
+          backupUrl: [
+            'https://other.akamaized.net/unrelated',
+            'https://upos-hz-mirrorakam.akamaized.net/truncated',
+            'https://cdn.bilivideo.com/video',
+          ],
+        }],
+        audio: [{ codecs: 'mp4a.40.2', baseUrl: 'https://upos-hz-mirrorakam.akamaized.net/audio' }],
+      } } });
+    }
+    attempted.push(url.pathname);
+    if (options.headers.Range !== 'bytes=0-') return new Response(null, { status: 567 });
+    if (url.pathname === '/partial') return response('ab', 'bytes 0-1/4');
+    if (url.pathname === '/truncated') return response('abc', 'bytes 0-3/4');
+    if (url.pathname === '/video') return response('abcd', 'bytes 0-3/4');
+    if (url.pathname === '/audio') return response('xyz', 'bytes 0-2/3');
+    assert.fail('Untrusted CDN requested');
+  } });
+  // Stop at FFmpeg so the fixture can assert exactly which bytes reached it.
+  await assert.rejects(importer({
+    source: { bvid: 'BV1TDyazeEuY', part: 1 }, workDir, output: join(workDir, 'ready.mp4'),
+    update() {}, signal: new AbortController().signal,
+  }), { code: 'processing' });
+  assert.deepEqual(attempted, ['/partial', '/truncated', '/video', '/audio']);
+  assert.equal(await readFile(join(workDir, 'video.m4s'), 'utf8'), 'abcd');
+  assert.equal(await readFile(join(workDir, 'audio.m4s'), 'utf8'), 'xyz');
 });
 
 test('only the explicitly approved visitor can watch, including during competing approvals', async t => {
