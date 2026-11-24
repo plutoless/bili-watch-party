@@ -52,7 +52,9 @@ async function checkStability(hostPage, visitorPage) {
   const samples = await Promise.all([hostPage, visitorPage].map(async (page, index) => {
     const { offset } = clocks[index];
     const samples = await sample(page, start - offset);
-    assert.ok(samples.every(sample => !sample.paused), 'Both players must stay unpaused in the stable window');
+    if (samples.some(sample => sample.paused)) {
+      assert.fail('Unexpected pause in the stable window: ' + JSON.stringify(await playbackDetails(page)));
+    }
     assert.ok(samples.at(-1).position - samples[0].position >= 9, 'Both playheads must advance');
     return samples.map(sample => ({ ...sample, time: sample.time + offset }));
   }));
@@ -158,6 +160,47 @@ function delayNextPlayFailure(page) {
         }, { once: true });
         video.dataset.delayedPlay = 'true';
       });
+    };
+  });
+}
+
+async function simulateLateStart(page) {
+  await page.locator('video').evaluate(video => {
+    const originalFetch = window.fetch;
+    const currentTime = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'currentTime');
+    const seeking = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'seeking');
+    let startsLate = false;
+    let seekEndsAt = 0;
+    // A seek may take longer than the 250 ms it takes the timeline to move away again.
+    Object.defineProperties(video, {
+      currentTime: {
+        configurable: true,
+        get() { return currentTime.get.call(this); },
+        set(value) {
+          if (startsLate && this.paused) seekEndsAt = performance.now() + 475;
+          currentTime.set.call(this, value);
+        },
+      },
+      seeking: {
+        configurable: true,
+        get() { return seeking.get.call(this) || performance.now() < seekEndsAt; },
+      },
+    });
+    window.fetch = async function(url, options) {
+      const response = await originalFetch(url, options);
+      if (String(url).endsWith('/playback')) {
+        const read = response.json.bind(response);
+        response.json = async () => {
+          const state = await read();
+          if (!startsLate && state.startsAt !== null) {
+            startsLate = true;
+            window.fetch = originalFetch;
+            await new Promise(resolve => setTimeout(resolve, 1450));
+          }
+          return state;
+        };
+      }
+      return response;
     };
   });
 }
@@ -304,6 +347,23 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await delay(1100);
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
   console.log('Obsolete rejection was ignored; host could cancel a blocked start and re-prepare without resuming.');
+
+  if (process.env.SYNTHETIC_VIDEO === '1') {
+    const position = (await playhead(hostPage)).position;
+    await simulateLateStart(visitorPage);
+    await play.tap();
+    try {
+      await Promise.all([waitForPlaying(hostPage, position + 0.25), waitForPlaying(visitorPage, position + 0.25)]);
+    } finally {
+      await visitorPage.locator('video').evaluate(video => {
+        delete video.currentTime;
+        delete video.seeking;
+      });
+    }
+    await play.tap();
+    await waitForPause();
+    console.log('Delayed start notification and slow seeks did not prevent either player from starting.');
+  }
 
   await checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause });
 }

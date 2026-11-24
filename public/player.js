@@ -180,16 +180,13 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     wake();
   }
 
-  function beginPlayback(target) {
+  function beginPlayback() {
     if (!hasPlaybackData()) {
       checkBuffering();
       return;
     }
     if (pendingStart || video.seeking) return;
-    if (Math.abs(video.currentTime - target) > 0.25) {
-      video.currentTime = target;
-      return;
-    }
+    // Readiness already aligned the media. Chasing a moving target before starting can seek forever on slow media.
     const { epoch, version } = state;
     const attempt = { action: 'blocked', epoch, version };
     pendingStart = attempt;
@@ -259,7 +256,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     }
     const target = positionAt(now);
     if (!Number.isFinite(target) || target >= video.duration) return;
-    if (video.paused) beginPlayback(target);
+    if (video.paused) beginPlayback();
   }
 
   function updateClock(sent, received, serverTime) {
