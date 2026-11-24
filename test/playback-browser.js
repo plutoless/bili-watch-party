@@ -436,10 +436,12 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
   await visitor.setOffline(true);
   try {
     await visitorPage.getByText('连接中断，等待播放状态。').waitFor();
+    const disconnectedPosition = (await playhead(visitorPage)).position;
     await hostPage.getByText('等待重新连接并对齐进度。').waitFor();
     frozen = await getTimeline();
     assert.equal(frozen.startsAt, null);
     assert.equal(frozen.wantsPlay, true);
+    assert.ok(frozen.position <= disconnectedPosition + 0.12, 'The frozen room must not skip unplayed media');
     assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
     console.log('Visitor offline: both waiting after ' + Math.round(performance.now() - started) + ' ms.');
   } finally {
@@ -487,11 +489,17 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
     await hostPage.getByText('已请求暂停，重新连接后将同步。').waitFor();
     await visitorPage.getByText('等待重新连接并对齐进度。').waitFor();
     assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+    // Restore page navigation first while the playback endpoint remains unreachable.
+    await host.setOffline(false);
+    await hostPage.reload({ waitUntil: 'domcontentloaded' });
+    await hostPage.getByText('连接中断，等待播放状态。').waitFor();
   } finally {
     await hostPage.unroute(playbackRoute, offline);
     started = performance.now();
     await host.setOffline(false);
   }
+  await hostPage.locator('#play').filter({ hasText: '播放' }).waitFor();
+  await hostPage.waitForFunction(() => document.querySelector('#playback-status').textContent === '已暂停，等待房主播放。');
   await waitForPause();
   assert.equal((await getTimeline()).wantsPlay, false);
   const pausePosition = (await playhead(hostPage)).position;
@@ -499,6 +507,6 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
   await delay(1100);
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
   assert.ok(Math.abs((await playhead(hostPage)).position - pausePosition) < 0.12);
-  console.log('Host pause requested offline: ' + alignedAfter +
+  console.log('Host pause requested offline and preserved after refresh: ' + alignedAfter +
     ' ms to aligned pause after reconnect; difference ' + await assertAligned() + ' s.');
 }

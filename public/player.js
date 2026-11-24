@@ -22,11 +22,13 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   const playerId = crypto.randomUUID();
   const storageKey = 'watch-party-player:' + endpoint + ':' + role;
   let previousPlayerId;
+  let queuedCommand;
   let playbackStartLeadMs = 0;
   try {
     const remembered = JSON.parse(sessionStorage.getItem(storageKey));
     previousPlayerId = remembered?.playerId;
     playbackStartLeadMs = remembered?.startLeadMs ?? 0;
+    if (host && previousPlayerId && remembered.pause?.action === 'pause') queuedCommand = remembered.pause;
   } catch {
     // Storage may be disabled. The room cookie still authorizes a fresh player.
   }
@@ -37,7 +39,6 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let driftTimer;
   let stallTimer;
   let inFlight = false;
-  let queuedCommand;
   let priming = false;
   let primed = false;
   let claim = false;
@@ -45,6 +46,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let reportBlocked;
   let reportBuffering;
   let outage;
+  let reloadAfterReconnect = false;
   let rememberedSeat = false;
   let pendingStart;
   let networkError = false;
@@ -152,10 +154,27 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       (video.readyState >= video.HAVE_CURRENT_DATA && state.position >= video.duration - alignmentTolerance);
   }
 
+  function mediaPosition() {
+    return video.seeking ? undefined : video.currentTime;
+  }
+
+  function playbackOutage(reason) {
+    return { reason, position: mediaPosition(), epoch: state?.epoch, version: state?.version };
+  }
+
+  function rememberSeat() {
+    try {
+      const pause = queuedCommand?.action === 'pause' ? queuedCommand : undefined;
+      sessionStorage.setItem(storageKey, JSON.stringify({ playerId, startLeadMs: playbackStartLeadMs, pause }));
+    } catch {
+      // Playback can continue in the current document.
+    }
+  }
+
   function checkBuffering() {
     if (reportBuffering || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData()) return;
     const { epoch, version } = state;
-    reportBuffering = { action: 'unavailable', reason: 'buffering', epoch, version };
+    reportBuffering = { action: 'unavailable', reason: 'buffering', epoch, version, position: mediaPosition() };
     pendingStart = undefined;
     pauseVideo();
     wake();
@@ -255,13 +274,16 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     const { epoch, version } = state;
     if (queuedCommand) return queuedCommand;
     if (reportBlocked) return reportBlocked;
-    if (outage && state.ownsSeat) return { action: 'unavailable', ...outage, epoch, version };
+    if (outage && state.ownsSeat) {
+      const position = outage.epoch === epoch && outage.version === version ? outage.position : undefined;
+      return { action: 'unavailable', reason: outage.reason, epoch, version, position };
+    }
     if (reportBuffering) return reportBuffering;
     if (primed && !priming && !document.hidden && hasPlaybackData() && !video.seeking && !state.ready[role] &&
         (claim || state.ownsSeat) && Math.abs(state.position - video.currentTime) <= alignmentTolerance) {
       return { action: 'ready', epoch, version, position: video.currentTime, claim };
     }
-    return { action: 'observe' };
+    return { action: 'observe', epoch, version, position: mediaPosition() };
   }
 
   function sendPlayback(operation, options) {
@@ -292,7 +314,8 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       if (generation !== loadGeneration) return;
       if (!reply) {
         networkError = true;
-        outage ??= { reason: 'connection' };
+        reloadAfterReconnect = true;
+        outage ??= playbackOutage('connection');
         clearTimeout(startTimer);
         if (!priming) pauseVideo();
         if (operation === queuedCommand) {
@@ -314,20 +337,17 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
         primed = result.ownsSeat;
       }
       if (result.ownsSeat && !rememberedSeat) {
-        try {
-          sessionStorage.setItem(storageKey, JSON.stringify({ playerId, startLeadMs: playbackStartLeadMs }));
-        } catch {
-          // Playback can continue in the current document.
-        }
+        rememberSeat();
         rememberedSeat = true;
       }
       if (document.hidden && result.ready[role] && result.ownsSeat) {
-        outage ??= { reason: 'background' };
+        outage ??= playbackOutage('background');
       }
       const outageAcknowledged = ok && operation.action === 'unavailable' && outage === reportedOutage && operation.reason === outage?.reason;
       if (!result.ownsSeat || outageAcknowledged) {
         // The playback endpoint can recover while an interrupted media request stays stalled.
-        if (outage?.reason === 'connection' && (outageAcknowledged || video.error)) video.load();
+        if (reloadAfterReconnect && (outageAcknowledged || video.error)) video.load();
+        reloadAfterReconnect = false;
         outage = undefined;
       }
       if (operation === reportBuffering) reportBuffering = undefined;
@@ -351,7 +371,10 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
         driftSeekStarted = undefined;
       }
       followTimeline();
-      if (operation === queuedCommand) queuedCommand = undefined;
+      if (operation === queuedCommand) {
+        queuedCommand = undefined;
+        if (operation.action === 'pause' && state.ownsSeat) rememberSeat();
+      }
     } finally {
       if (generation === loadGeneration) {
         if (networkError && operation === queuedCommand && operation.action !== 'pause') queuedCommand = undefined;
@@ -372,13 +395,15 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   function command(action, details) {
     if (!state?.ownsSeat || queuedCommand || (networkError && action !== 'pause')) return;
     queuedCommand = { action, ...details, epoch: state.epoch, version: state.version };
+    if (action === 'pause') rememberSeat();
     commandMessage = '';
     wake();
   }
 
   function reportOutage(reason) {
     if (!video.hasAttribute('src')) return;
-    outage = { reason };
+    if (reason === 'connection') reloadAfterReconnect = true;
+    outage = playbackOutage(reason);
     clearTimeout(startTimer);
     pendingStart = undefined;
     pauseVideo();
@@ -396,7 +421,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     if (!state?.ownsSeat || !video.hasAttribute('src')) return;
     const { epoch, version } = state;
     reportOutage('background');
-    sendPlayback({ action: 'unavailable', reason: 'background', epoch, version }, { keepalive: true }).catch(() => {});
+    sendPlayback({ action: 'unavailable', ...outage, epoch, version }, { keepalive: true }).catch(() => {});
   });
 
   prepare.addEventListener('click', async () => {
@@ -476,6 +501,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       state = undefined;
       queuedCommand = undefined;
       reportBlocked = reportBuffering = outage = pendingStart = undefined;
+      reloadAfterReconnect = false;
       inFlight = priming = primed = claim = gestureFailed = networkError = false;
       seekPreview = false;
       commandMessage = '';

@@ -35,8 +35,12 @@ export function createPlayback(duration) {
 
   const bothReady = () => players.host?.ready && players.visitor?.ready;
 
-  function interrupt(player, reason, now) {
-    const target = currentPosition(now);
+  function interrupt(player, reason, now, observedPosition) {
+    const projected = currentPosition(now);
+    const reported = observedPosition ?? (player.progress?.version === version ? player.progress.position : undefined);
+    // Resume no later than the last confirmed frame on this timeline.
+    const target = startsAt === null || !Number.isFinite(reported) ? projected
+      : Math.max(position, Math.min(projected, reported));
     align(target, wantsPlay && target < duration);
     player.waiting = reason;
   }
@@ -46,7 +50,7 @@ export function createPlayback(duration) {
       .filter(player => player?.lastSeen != null && now - player.lastSeen >= playerLeaseMs)
       .sort((first, second) => first.lastSeen - second.lastSeen);
     for (const player of expiring) {
-      interrupt(player, 'connection', player.lastSeen + playerLeaseMs);
+      interrupt(player, 'connection', player.lastSeen);
       player.lastSeen = null;
     }
   }
@@ -84,7 +88,7 @@ export function createPlayback(duration) {
           }
         } else if (!ownsSeat) conflict = true;
         else if (action === 'unavailable') {
-          interrupt(player, command.reason, now);
+          interrupt(player, command.reason, now, command.position);
         } else if (action === 'blocked') {
           interrupt(player, null, now);
           player.blocked = true;
@@ -109,7 +113,13 @@ export function createPlayback(duration) {
         }
       }
       const currentPlayer = players[role];
-      if (!conflict && currentPlayer?.id === playerId) currentPlayer.lastSeen = now;
+      if (!conflict && currentPlayer?.id === playerId) {
+        currentPlayer.lastSeen = now;
+        if (action === 'observe' && startsAt !== null && command.epoch === epoch &&
+            command.version === version && Number.isFinite(command.position)) {
+          currentPlayer.progress = { version, position: command.position };
+        }
+      }
       return {
         conflict,
         state: {

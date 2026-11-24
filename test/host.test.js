@@ -641,9 +641,9 @@ test('only the host directs playback and both players must acknowledge the curre
   now = rearmed.startsAt + 250;
   const playingVersion = { epoch: rearmed.epoch, version: rearmed.version };
   const buffering = await send('visitor', 'unavailable', {
-    ...playingVersion, reason: 'buffering',
+    ...playingVersion, reason: 'buffering', position: 25.9,
   }).then(r => r.json());
-  assert.equal(buffering.position, 26);
+  assert.equal(buffering.position, 25.9);
   assert.equal(buffering.startsAt, null);
   assert.equal(buffering.wantsPlay, true);
   assert.deepEqual(buffering.ready, { host: false, visitor: false });
@@ -669,15 +669,18 @@ test('only the host directs playback and both players must acknowledge the curre
   await send('visitor', 'ready', { ...latest, position: 70 });
   const beforeDisconnect = await send('host', 'play', latest).then(r => r.json());
   now = beforeDisconnect.startsAt + 500;
+  await send('visitor', 'observe', { ...latest, version: beforeDisconnect.version, position: 70.35 });
   await send('host', 'observe');
   now += 3_100;
+  await send('host', 'observe');
+  now += 900;
   const expired = await send('host', 'observe').then(r => r.json());
   assert.equal(expired.startsAt, null);
   assert.equal(expired.wantsPlay, true);
   assert.equal(expired.ownsSeat, true);
   assert.deepEqual(expired.ready, { host: false, visitor: false });
   assert.equal(expired.waiting.visitor, 'connection');
-  assert.equal(expired.position, 73.1);
+  assert.equal(expired.position, 70.35);
   const reconnect = { epoch: expired.epoch, version: expired.version, position: expired.position };
   await send('host', 'ready', reconnect);
   const afterDisconnect = await send('visitor', 'ready', reconnect).then(r => r.json());
