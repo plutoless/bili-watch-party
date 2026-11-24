@@ -149,7 +149,14 @@ test('supported links normalize to one room per part; unsupported links fail bef
   ]);
   assert.deepEqual(submissions.map(([status]) => status).sort(), [200, 200, 201]);
   const id = submissions[0][1].id;
-  for (const [, room] of submissions) assert.equal(room.id, id);
+  const firstInvitation = submissions.find(([status]) => status === 201)[1].invitation;
+  assert.ok(/^[a-f0-9]{64}$/.test(firstInvitation.token));
+  assert.ok(firstInvitation.expiresAt > Date.now());
+  for (const [, room] of submissions) {
+    assert.equal(room.id, id);
+    assert.ok(room.invitation?.token === firstInvitation.token, 'Deduplication must keep the original invitation');
+    assert.equal(room.invitation.expiresAt, firstInvitation.expiresAt);
+  }
   assert.equal((await app.status(cookie, id, 'ready')).part, 1);
   assert.deepEqual(jobs, [{ bvid: 'BV1TDyazeEuY', part: 1 }]);
 
@@ -187,9 +194,20 @@ test('a transient first failure can be retried once in the same room and publish
   assert.equal(duplicate.status, 'failed');
   const roomUrl = '/api/rooms/' + submitted.id;
   const mediaUrl = '/media/' + submitted.id + '.mp4';
+  const application = await app.request(roomUrl + '/join', {
+    method: 'POST', body: { token: submitted.invitation.token },
+  });
+  const { state, requestId } = await application.json();
+  assert.equal(state, 'pending');
   const retries = await Promise.all(Array.from({ length: 3 }, () =>
     app.request(roomUrl + '/retry', { cookie, method: 'POST', body: { attempt: failed.attempt } })));
-  for (const response of retries) assert.equal((await response.json()).id, submitted.id);
+  for (const response of retries) {
+    const room = await response.json();
+    assert.equal(room.id, submitted.id);
+    assert.ok(room.invitation?.token === submitted.invitation.token, 'Retry must keep the original invitation');
+    assert.equal(room.invitation.expiresAt, submitted.invitation.expiresAt);
+    assert.ok(room.requests.length === 1 && room.requests[0].id === requestId, 'Retry must keep the pending request');
+  }
   const pending = await app.status(cookie, submitted.id, 'downloading');
   assert.equal(pending.title, '验收影片');
   assert.equal(pending.partTitle, '第一部分');
@@ -360,9 +378,7 @@ test('only the explicitly approved visitor can watch, including during competing
   const media = '/media/' + room.id + '.mp4';
   const post = (action, body = {}, cookie = host) =>
     app.request(path + '/' + action, { method: 'POST', body, cookie });
-  const invitation = await post('invitation', { action: 'generate' });
-  assert.equal(invitation.status, 200);
-  const { token } = (await invitation.json()).invitation;
+  const { token } = room.invitation;
   const visitors = await Promise.all([1, 2].map(async () => {
     const response = await post('join', { token }, '');
     assert.equal(response.status, 200);
@@ -425,7 +441,8 @@ test('invitation rotation, revocation and expiry invalidate pending requests', a
     assert.equal((await post('approve', { requestId }, host)).status, 409);
   };
 
-  const first = await generate();
+  const first = room.invitation;
+  assert.equal(first.expiresAt - now, 30 * 60_000);
   const firstRequest = await join(first.token);
   assert.equal(firstRequest.state, 'pending');
   const replacement = await generate();
@@ -435,12 +452,18 @@ test('invitation rotation, revocation and expiry invalidate pending requests', a
   assert.equal(replacementRequest.state, 'pending');
   assert.equal((await post('invitation', { action: 'revoke' }, host)).status, 200);
   await verifyRevoked(replacement.token, replacementRequest);
+  const [, revokedRoom] = await app.submit(host);
+  assert.equal(revokedRoom.id, room.id);
+  assert.equal(revokedRoom.invitation, null);
 
   const expiring = await generate();
   const expiringRequest = await join(expiring.token);
   assert.equal(expiringRequest.state, 'pending');
   now = expiring.expiresAt;
   await verifyRevoked(expiring.token, expiringRequest);
+  const [, expiredRoom] = await app.submit(host);
+  assert.equal(expiredRoom.id, room.id);
+  assert.equal(expiredRoom.invitation, null);
 });
 
 test('approved session persists across restart, then room end revokes access and cleanup removes media', async t => {
