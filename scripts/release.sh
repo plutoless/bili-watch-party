@@ -88,19 +88,17 @@ curl_request() {
   curl --disable --silent --show-error --connect-timeout 10 --max-time 20 "$@" 2>/dev/null
 }
 
-vercel_promote_options=(--yes --token "$VERCEL_TOKEN")
 vercel_team_query=''
-if [[ $VERCEL_ORG_ID == team_* ]]; then
-  vercel_promote_options+=(--scope "$VERCEL_ORG_ID")
-  vercel_team_query="?teamId=$VERCEL_ORG_ID"
-fi
+if [[ $VERCEL_ORG_ID == team_* ]]; then vercel_team_query="?teamId=$VERCEL_ORG_ID"; fi
 
 vercel_api() {
-  curl_request -H "Authorization: Bearer $VERCEL_TOKEN" \
-    -o "$work/vercel-response" -w '%{http_code}' "https://api.vercel.com$1$vercel_team_query"
+  local path=$1
+  shift
+  curl_request -H "Authorization: Bearer $VERCEL_TOKEN" "$@" \
+    -o "$work/vercel-response" -w '%{http_code}' "https://api.vercel.com$path$vercel_team_query"
 }
 
-previous_web() {
+active_web() {
   local status
   status=$(vercel_api "/v4/aliases/$web_host") || return 1
   case "$status" in
@@ -125,7 +123,7 @@ printf '%s\n' 'Vercel 正式域名配置检查与候选网页部署'
 [[ $(vercel_api "/v9/projects/$VERCEL_PROJECT_ID/domains/$web_host") == 200 ]] &&
   jq -e '.verified == true and .redirect == null and .gitBranch == null' \
     "$work/vercel-response" >/dev/null 2>&1 || fail 'Vercel 正式域名未验证或未绑定到项目的生产环境。'
-prior=$(previous_web) || fail '无法读取上一个正式网页部署。'
+prior=$(active_web) || fail '无法读取上一个正式网页部署。'
 staged=$("${vercel_cli[@]}" deploy --prebuilt --prod --skip-domain --yes --token "$VERCEL_TOKEN" 2>/dev/null) ||
   fail 'Vercel 候选网页部署失败，正式域名保持原版本。'
 [[ $staged =~ ^https://[a-zA-Z0-9-]+\.vercel\.app$ ]] || fail 'Vercel 候选网页地址无效。'
@@ -135,6 +133,12 @@ if [[ -n ${VERCEL_AUTOMATION_BYPASS_SECRET:-} ]]; then
 fi
 check_web "$staged" "${stage_headers[@]}" || fail '候选网页 HTTPS 或深链接检查失败。'
 printf '候选网页 HTTPS 与深链接检查通过 %s\n' "$RELEASE_SHA"
+[[ $(vercel_api "/v13/deployments/${staged#https://}") == 200 ]] ||
+  fail '无法查询候选网页部署。'
+staged_id=$(jq -er --arg project "$VERCEL_PROJECT_ID" \
+  'select(.projectId == $project and .target == "production" and .readyState == "READY")
+   | .id | select(test("^dpl_[A-Za-z0-9]+$"))' "$work/vercel-response" 2>/dev/null) ||
+  fail '候选网页不属于配置的项目或未就绪。'
 
 current_main
 remote_command='set -eu
@@ -161,38 +165,50 @@ check_backend() {
 }
 
 retry_check() {
-  local attempt
-  for attempt in 1 2 3 4 5 6; do
+  local attempts=$1 attempt
+  shift
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
     if "$@"; then return 0; fi
-    if [[ $attempt != 6 ]]; then sleep 5; fi
+    if (( attempt < attempts )); then sleep 5; fi
   done
   return 1
 }
 
 printf '%s\n' '后台正式 HTTPS 检查'
-retry_check check_backend || fail '后台 HTTPS、版本或跨源检查失败，正式网页未切换。'
+retry_check 6 check_backend || fail '后台 HTTPS、版本或跨源检查失败，正式网页未切换。'
 printf '后台正式 HTTPS 检查通过 %s\n' "$RELEASE_SHA"
 current_main
 
 promote() {
-  "${vercel_cli[@]}" promote "$1" "${vercel_promote_options[@]}" >/dev/null 2>&1
+  local status code
+  status=$(vercel_api "/v10/projects/$VERCEL_PROJECT_ID/promote/$1" \
+    -H 'Content-Type: application/json' --data '{}') || return 1
+  if [[ $status =~ ^2[0-9]{2}$ ]]; then return 0; fi
+  code=$(jq -r '.error.code | strings | select(test("^[a-z_]{1,48}$"))' \
+    "$work/vercel-response" 2>/dev/null) || code=''
+  printf 'Vercel 切换请求失败，HTTP %s%s。\n' "$status" "${code:+ ($code)}" >&2
+  return 1
+}
+
+check_promoted_web() {
+  [[ $(active_web) == "$staged_id" ]] && check_web "$WEB_ORIGIN"
 }
 
 check_previous_web() {
-  [[ $(previous_web) == "$prior" &&
+  [[ $(active_web) == "$prior" &&
      $(curl_request -o /dev/null -w '%{http_code}' "$WEB_ORIGIN/") == 200 ]]
 }
 
 printf '%s\n' '切换 Vercel 正式网页并检查 HTTPS'
-if ! promote "$staged" || ! retry_check check_web "$WEB_ORIGIN"; then
+if ! promote "$staged_id" || ! retry_check 12 check_promoted_web; then
   if [[ -n $prior ]]; then
     promote "$prior" || true
-    if retry_check check_previous_web; then
+    if retry_check 12 check_previous_web; then
       fail 'Vercel 切换或正式 HTTPS 检查失败，上一个正式网页部署已恢复。后台保留通过检查的版本。'
     fi
     fail 'Vercel 切换或正式 HTTPS 检查失败，自动恢复未确认，请按发布文档检查域名。'
   fi
   fail '首次 Vercel 切换或正式 HTTPS 检查失败，请按发布文档检查域名后重试。'
 fi
-retry_check check_backend || fail '网页 HTTPS 已通过，后台复查失败，请按发布文档恢复。'
+retry_check 6 check_backend || fail '网页 HTTPS 已通过，后台复查失败，请按发布文档恢复。'
 printf '发布通过，后台 %s，网页 %s。\n' "$RELEASE_SHA" "$RELEASE_SHA"
