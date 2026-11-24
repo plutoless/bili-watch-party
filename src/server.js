@@ -335,7 +335,7 @@ export async function startServer({
       if (path === '/api/rooms' && method === 'POST') {
         const body = await readJson(req);
         const { created, room } = rooms.submit(parseSource(body?.url));
-        return send(res, created ? 201 : 200, room);
+        return send(res, created ? 201 : 200, { ...room, ...admission.hostView(room.id) });
       }
     }
 
