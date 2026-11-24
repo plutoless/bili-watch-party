@@ -717,4 +717,20 @@ test('only the host directs playback and both players must acknowledge the curre
     'An outlying visitor report must not rewind to the start of the room');
   assert.ok(Math.abs(interrupted.position - (current.position + 4)) < 0.00001,
     'A visitor report may only rewind within the recovery window');
+
+  const interruptedVersion = { epoch: interrupted.epoch, version: interrupted.version };
+  await send('host', 'ready', { ...interruptedVersion, position: interrupted.position });
+  const restart = await send('visitor', 'ready', {
+    ...interruptedVersion, position: interrupted.position,
+  }).then(r => r.json());
+  const restartVersion = { epoch: restart.epoch, version: restart.version };
+  now = restart.startsAt + 350;
+  await send('visitor', 'observe', { ...restartVersion, position: interrupted.position + 0.3 });
+  await send('host', 'observe');
+  now += 3_500;
+  const earlyReconnect = await send('visitor', 'unavailable', {
+    ...restartVersion, reason: 'connection', position: interrupted.position + 0.35,
+  }).then(r => r.json());
+  assert.equal(earlyReconnect.position, interrupted.position + 0.35,
+    'A short disconnect must not advance past the frame last seen by the interrupted side');
 });

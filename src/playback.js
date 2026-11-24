@@ -40,7 +40,8 @@ export function createPlayback(duration) {
     const projected = currentPosition(now);
     const reported = observedPosition ?? (player.progress?.version === version ? player.progress.position : undefined);
     // Allow a short recovery rewind without treating a participant's report as a seek.
-    const floor = Math.max(position, projected - maxRecoveryRewind);
+    const lastContact = reason === 'connection' ? player.lastSeen ?? now : now;
+    const floor = Math.max(position, currentPosition(lastContact) - maxRecoveryRewind);
     const target = startsAt === null || !Number.isFinite(reported) ? projected
       : Math.max(floor, Math.min(projected, reported));
     align(target, wantsPlay && target < duration);
