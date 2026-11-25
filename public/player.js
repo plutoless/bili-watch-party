@@ -205,12 +205,14 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const canToggle = state?.wantsPlay ? ownsControls : canPlay || (canControl && bothReady && primed);
     const waitingForAudio = awaitingLocalAudio();
     const retryAudio = audioFailed || waitingForAudio;
-    const reloadAudio = retryAudio && audio?.context.state === 'closed';
-    prepare.hidden = !admitted || !state?.wantsPlay || (!gestureFailed && !retryAudio) ||
+    const retryPlayback = state?.ownsSeat && state.waiting[role] === 'stalled' && !primed;
+    const reloadAudio = (retryAudio || retryPlayback) && audio?.context.state === 'closed';
+    prepare.hidden = !admitted || !state?.wantsPlay || (!gestureFailed && !retryAudio && !retryPlayback) ||
       Boolean(state?.otherPlayer || firstStartCancellation || queuedCommand?.action === 'pause');
     prepare.disabled = Boolean((priming && !waitingForAudio) || unavailableReport || outage) ||
       networkError || video.readyState < video.HAVE_METADATA;
-    setText('prepare', reloadAudio ? '刷新页面' : retryAudio && !gestureFailed ? '重试音频' : '允许播放');
+    setText('prepare', reloadAudio ? '刷新页面' : gestureFailed ? '允许播放'
+      : retryPlayback ? '重试播放' : retryAudio ? '重试音频' : '允许播放');
     play.hidden = !host;
     setText('play', state?.firstStartPending ? '取消开播' : state?.wantsPlay ? '暂停' : state?.ended ? '重播' : '播放');
     byId('end-after-playback').hidden = !host || !state?.ended;
@@ -240,6 +242,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       const interrupted = seats.filter(seat => state?.waiting[seat] === 'audio' ||
         (seat === role && unavailableReport?.reason === 'audio'));
       status = '等待' + describeSeats(interrupted) + '恢复音频输出。';
+    } else if (waiting.includes('stalled')) {
+      status = '等待' + describeSeats(seats.filter(seat => state.waiting[seat] === 'stalled')) + '重试播放。';
     } else if (unavailableReport?.reason === 'buffering' || waiting.includes('buffering')) {
       const buffering = seats.filter(seat => state?.waiting[seat] === 'buffering' ||
         (seat === role && unavailableReport?.reason === 'buffering'));
@@ -345,7 +349,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   }
 
   function mediaPlaying() {
-    return !priming && !video.paused && !video.seeking && hasPlaybackData() &&
+    return !priming && !video.paused && !video.ended && !video.seeking && hasPlaybackData() &&
       audioReady();
   }
 
@@ -669,7 +673,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     }
     if ((!audio || admitted) && audioReady() && primed && !priming && !document.hidden && hasPlaybackData() && !video.seeking && !state.ready[role] &&
         (claim || state.ownsSeat) && Math.abs(state.position - video.currentTime) <= alignmentTolerance) {
-      return { action: 'ready', epoch, version, position: video.currentTime, claim };
+      return { action: 'ready', epoch, version, position: video.currentTime, claim, nativeEnd: true };
     }
     const startAcknowledgment = state.awaitingStart && primed && audioReady() &&
       video.paused && !video.seeking && hasPlaybackData() ? state.startsAt : undefined;
@@ -807,6 +811,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       if (timeline !== currentTimeline) {
         currentTimeline = timeline;
         clearTimeout(stallTimer);
+        if (state.ownsSeat && state.waiting[role] === 'stalled') primed = claim = false;
         const visitorInterrupted = state.waiting.visitor === 'buffering' || state.waiting.visitor === 'connection' ||
           (wasWaitingForVisitor && state.ready.visitor && operation.action === 'observe');
         // A host stall can cancel a start scheduled after visitor buffering.
@@ -826,7 +831,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       if (!state.ownsSeat || state.ready[role] || !state.wantsPlay) mediaRecoveryRetry = undefined;
       followTimeline();
       if (state.wantsPlay && admitted && !primed && !priming && !gestureFailed && !audioRetryRequired && !state.otherPlayer &&
-          !unavailableReport && !outage &&
+          !unavailableReport && !outage && state.waiting[role] !== 'stalled' &&
           !firstStartCancellation && queuedCommand?.action !== 'pause' &&
           !document.hidden && !video.error && !video.seeking && video.readyState >= video.HAVE_CURRENT_DATA &&
           performance.now() >= authorizationRetryAt) authorize();

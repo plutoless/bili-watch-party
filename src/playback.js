@@ -47,6 +47,8 @@ export function createPlayback(duration = Infinity) {
   }
 
   function scheduleStart(now) {
+    // The published page can align and play but cannot participate in preview and release.
+    if (firstStart === 'preview' && roles.some(seat => !players[seat].nativeEnd)) firstStart = null;
     if (firstStart === 'preview' && duration - position <= minimumPreviewDuration) firstStart = 'armed';
     startsAt = now + (firstStart === 'armed' ? firstStartLeadMs : startLeadMs);
   }
@@ -58,6 +60,27 @@ export function createPlayback(duration = Infinity) {
   const startConfirmed = () => startsAt !== null &&
     roles.every(seat => players[seat]?.startConfirmation === startsAt);
 
+  function planProgress(player) {
+    const progress = player?.progress;
+    if (startsAt !== null && progress?.version === version && progress.startsAt === startsAt) return progress;
+  }
+
+  function finishedPlan(player) {
+    const progress = planProgress(player);
+    return progress && (progress.finished || (!player.nativeEnd && progress.legacyEnd));
+  }
+
+  function tailResumePosition(now, interrupted, observedPosition) {
+    if (startsAt === null) return;
+    const projected = currentPosition(now);
+    const unfinished = roles.map(seat => players[seat]).filter(player => !finishedPlan(player));
+    if (!unfinished.length || (unfinished.length > 1 && projected < duration)) return;
+    const hasPlayableReport = Number.isFinite(observedPosition) && observedPosition >= position && observedPosition < duration;
+    const checkpoints = unfinished.map(player => player === interrupted && hasPlayableReport
+      ? observedPosition : planProgress(player)?.resumePosition).filter(Number.isFinite);
+    return Math.max(position, Math.min(projected, ...(checkpoints.length ? checkpoints : [position])));
+  }
+
   function newSeat(playerId, recoveryId, now) {
     return { id: playerId, recoveryId: recoveryId ?? playerId, recoveryGeneration: 0,
       ready: false, blocked: false, waiting: null, lastSeen: now };
@@ -68,7 +91,7 @@ export function createPlayback(duration = Infinity) {
     if (firstStartPending()) startsAt = null;
     firstStart = null;
     lastHostSeek = undefined;
-    if (wantsPlay) align(currentPosition(now), false);
+    if (wantsPlay) align(tailResumePosition(now) ?? currentPosition(now), false);
     hostCommandVersion = version;
   }
 
@@ -86,12 +109,12 @@ export function createPlayback(duration = Infinity) {
 
   function interrupt(player, reason, now, observedPosition) {
     const projected = currentPosition(now);
-    const reported = observedPosition ?? (player.progress?.version === version ? player.progress.position : undefined);
+    const reported = observedPosition ?? planProgress(player)?.position;
     // Allow a short recovery rewind without treating a participant's report as a seek.
     const lastContact = reason === 'connection' ? player.lastSeen ?? now : now;
     const floor = Math.max(position, currentPosition(lastContact) - maxRecoveryRewind);
-    const target = firstStartPending() ? position : startsAt === null || !Number.isFinite(reported) ? projected
-      : Math.max(floor, Math.min(projected, reported));
+    const target = firstStartPending() ? position : tailResumePosition(now, player, observedPosition) ??
+      (startsAt === null || !Number.isFinite(reported) ? projected : Math.max(floor, Math.min(projected, reported)));
     align(target, wantsPlay && target < duration);
     player.waiting = reason;
   }
@@ -104,6 +127,33 @@ export function createPlayback(duration = Infinity) {
       interrupt(player, 'connection', player.lastSeen);
       player.lastSeen = null;
     }
+  }
+
+  function observeProgress(player, command, now) {
+    const { position: reported, ended: nativeEnded, playing } = command;
+    const nearEnd = reported >= duration - alignmentTolerance && reported <= duration + alignmentTolerance;
+    const legacy = ['ended', 'playing', 'sampledAt', 'observedAt'].every(field => !Object.hasOwn(command, field));
+    if (!Number.isFinite(reported) || reported < 0 || reported > duration + alignmentTolerance ||
+        (legacy && player.nativeEnd) || (Object.hasOwn(command, 'ended') && typeof nativeEnded !== 'boolean') ||
+        (nativeEnded === true && (!nearEnd || playing === true))) return;
+    const previous = planProgress(player);
+    const observedAt = Number.isFinite(command.observedAt)
+      ? Math.max(now - 500, Math.min(now + 100, command.observedAt)) : now;
+    const hasSampleClock = Number.isFinite(command.sampledAt);
+    const sampledAt = hasSampleClock ? command.sampledAt : now;
+    const comparable = previous?.hasSampleClock === hasSampleClock;
+    if (comparable && sampledAt < previous.sampledAt) return;
+    const finished = previous?.finished || (observedAt >= startsAt && nativeEnded === true);
+    const legacyEnd = legacy && observedAt >= startsAt && nearEnd;
+    const moving = playing === true && observedAt >= startsAt && reported > position + 0.03;
+    const advanced = moving && previous && reported > previous.position;
+    const advancedAt = advanced ? now : moving ? previous?.advancedAt : undefined;
+    const stoppedSince = observedAt >= startsAt && !advanced && !finished && !legacyEnd
+      ? (comparable ? previous.stoppedSince : undefined) ?? sampledAt : undefined;
+    // A numeric endpoint without native completion is not a playable resume target.
+    const resumePosition = observedAt >= startsAt && reported < duration ? reported : previous?.resumePosition;
+    player.progress = { version, startsAt, position: reported, at: observedAt, advancedAt, sampledAt, hasSampleClock, stoppedSince,
+      resumePosition, finished, legacyEnd, hasAdvanced: Boolean(advanced || previous?.hasAdvanced) };
   }
 
   return {
@@ -151,6 +201,7 @@ export function createPlayback(duration = Infinity) {
             player.recoveryId = command.recoveryId ?? playerId;
             player.recoveryGeneration = command.recoveryGeneration ?? 0;
             player.blocked = false;
+            player.nativeEnd = false;
           }
         }
       } else if (action !== 'observe') {
@@ -172,6 +223,7 @@ export function createPlayback(duration = Infinity) {
               id: playerId,
               recoveryId: ownsSeat ? player.recoveryId : command.recoveryId ?? playerId,
               recoveryGeneration: ownsSeat ? player.recoveryGeneration : 0,
+              nativeEnd: command.nativeEnd === true || (ownsSeat && player.nativeEnd),
               ready: true, blocked: false, waiting: null, lastSeen: now,
             };
             if (wantsPlay && bothReady()) scheduleStart(now);
@@ -206,21 +258,10 @@ export function createPlayback(duration = Infinity) {
       const currentPlayer = players[role];
       if (!conflict && currentPlayer?.id === playerId) {
         currentPlayer.lastSeen = now;
-        if (action === 'observe' && startsAt !== null && command.epoch === epoch &&
-            command.version === version && Number.isFinite(command.position)) {
-          const previous = currentPlayer.progress;
-          const sameTimeline = previous?.version === version;
-          const observedAt = Number.isFinite(command.observedAt)
-            ? Math.max(now - 500, Math.min(now + 100, command.observedAt)) : now;
-          const sampledAt = Number.isFinite(command.sampledAt) ? command.sampledAt : now;
-          const moving = command.playing === true && observedAt >= startsAt && command.position > position + 0.03;
-          const advanced = moving && sameTimeline && command.position > previous.position;
-          const advancedAt = advanced ? now : moving && sameTimeline ? previous.advancedAt : undefined;
-          const stoppedSince = observedAt >= startsAt && !advanced && command.ended !== true
-            ? (sameTimeline ? previous.stoppedSince : undefined) ?? sampledAt : undefined;
-          currentPlayer.progress = { version, position: command.position, at: observedAt, advancedAt, sampledAt, stoppedSince,
-            finished: observedAt >= startsAt && command.ended === true && command.position >= duration - alignmentTolerance };
-          if (firstStart === 'armed' && command.startAcknowledgment === startsAt &&
+        if (action === 'observe' && command.epoch === epoch && command.version === version) {
+          if (typeof command.ended === 'boolean') currentPlayer.nativeEnd = true;
+          if (startsAt !== null) observeProgress(currentPlayer, command, now);
+          if (firstStart === 'armed' && startsAt !== null && command.startAcknowledgment === startsAt &&
               Math.abs(command.position - position) <= alignmentTolerance) {
             currentPlayer.startAcknowledgment = startsAt;
             if (startAcknowledged() && command.startConfirmation === startsAt) {
@@ -231,13 +272,13 @@ export function createPlayback(duration = Infinity) {
       }
       // A missing report is different from consecutive samples proving the media clock stopped.
       const stopped = roles.filter(seat => {
-        const progress = players[seat]?.progress;
-        return progress?.version === version && progress.sampledAt - progress.stoppedSince >= progressLeaseMs;
+        const progress = planProgress(players[seat]);
+        return progress && progress.sampledAt - progress.stoppedSince >= progressLeaseMs;
       });
       const lease = firstStartPending() ? firstStartProgressLeaseMs : progressLeaseMs;
       const advancing = Object.fromEntries(roles.map(seat => {
-        const progress = players[seat]?.progress;
-        return [seat, startsAt !== null && progress?.version === version &&
+        const progress = planProgress(players[seat]);
+        return [seat, progress !== undefined &&
           !stopped.includes(seat) && now - progress.advancedAt <= lease];
       }));
       const playbackGap = advancing.host && advancing.visitor
@@ -246,12 +287,18 @@ export function createPlayback(duration = Infinity) {
       const aligned = playbackGap !== null && playbackGap < 0.5;
       if (firstStart === 'starting' && aligned) firstStart = 'confirmed';
       const shortFirstStart = firstStart === 'starting' && duration - position <= minimumPreviewDuration;
+      const atTail = startsAt !== null && currentPosition(now) >= duration;
       // The projected position can reach the end before a player has shown its terminal frame.
-      if (startsAt !== null && (!firstStartPending() || shortFirstStart) && currentPosition(now) >= duration &&
-          roles.every(seat => players[seat]?.progress?.version === version && players[seat].progress.finished)) {
+      if (atTail && (!firstStartPending() || shortFirstStart) && roles.every(seat => finishedPlan(players[seat]))) {
         align(duration, false);
         ended = true;
         firstStart = null;
+      }
+      const tailStalled = atTail && !firstStartPending() ? stopped.filter(seat => planProgress(players[seat])?.hasAdvanced) : [];
+      if (tailStalled.length) {
+        const resume = Math.min(...tailStalled.map(seat => players[seat].progress.resumePosition ?? position));
+        align(Math.max(position, resume), true);
+        for (const seat of tailStalled) players[seat].waiting = 'stalled';
       }
       // Use the silent preview as evidence that both players can advance, then start
       // the real playback from the original target after both players align again.
@@ -269,6 +316,7 @@ export function createPlayback(duration = Infinity) {
           if (stalled.includes(seat)) players[seat].waiting = 'buffering';
         }
       }
+      if (startsAt === null) for (const seat of roles) advancing[seat] = false;
       const preview = firstStart === 'preview';
       return {
         conflict,
@@ -277,8 +325,8 @@ export function createPlayback(duration = Infinity) {
           firstStartPending: firstStartPending(), preview, awaitingStart: firstStart === 'armed',
           startAcknowledged: firstStart === 'armed' && startAcknowledged(),
           startConfirmed: firstStart !== 'armed' || startConfirmed(), advancing,
-          synchronized: !firstStartPending() && aligned,
-          playbackGap: previewComplete || previewStalled || startStalled ? null : playbackGap,
+          synchronized: startsAt !== null && !firstStartPending() && aligned,
+          playbackGap: startsAt === null ? null : playbackGap,
           ready: Object.fromEntries(roles.map(seat => [seat, Boolean(players[seat]?.ready)])),
           waiting: Object.fromEntries(roles.map(seat => [seat, players[seat]?.waiting ?? null])),
           blocked: roles.filter(seat => players[seat]?.blocked),

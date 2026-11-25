@@ -45,7 +45,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
   }
 
   function schedule(callback, delay, repeat = false) {
-    const timer = { callback, due: now + delay, delay, repeat };
+    const timer = { callback, due: now + (delay > 0 ? Math.max(1, delay) : delay), delay, repeat };
     timers.add(timer);
     return timer;
   }
@@ -709,7 +709,7 @@ test('normal playback ends after both media elements finish naturally', async ()
   await app.start();
   const plan = app.snapshot();
   assert.equal(plan.synchronized, true);
-  await app.advance(plan.startsAt + 2500 - app.now());
+  await app.advance(plan.startsAt + 2850 - app.now());
   const { video: visitorVideo } = app.visitor;
   const visitorPosition = visitorVideo.currentTime;
   visitorVideo.currentTime = visitorPosition;
@@ -780,6 +780,132 @@ test('a pending tail seek reaches the native start watchdog before it can end th
   assert.ok(video.ended && app.visitor.video.ended);
   assert.equal(app.snapshot().ended, true);
   assert.deepEqual(app.snapshot().blocked, []);
+});
+
+test('losing the completed seat preserves the unfinished frame and play intent', async t => {
+  for (const loss of ['connection', 'connection before terminal report', 'lease', 'recover', 'pause']) await t.test(loss, () => {
+    const room = createPlayback(3);
+    const ids = { host: randomUUID(), visitor: randomUUID() };
+    const send = (role, action, now, fields = {}) =>
+      room.update({ role, action, playerId: ids[role], ...fields }, now);
+    const { epoch, version } = send('host', 'observe', 0).state;
+    const ready = { epoch, version, position: 0, claim: true, nativeEnd: true };
+    const recoveryId = randomUUID();
+    send('host', 'ready', 0, { ...ready, recoveryId });
+    send('visitor', 'ready', 0, ready);
+    const plan = send('host', 'play', 0, ready).state;
+    const target = { epoch, version: plan.version };
+    const at = elapsed => plan.startsAt + elapsed;
+    const finished = { ...target, position: 3, ended: true, playing: false };
+    const unfinished = { ...target, position: 2.8, ended: false, playing: true };
+    send('host', 'observe', at(2000), target);
+    send('visitor', 'observe', at(2000), target);
+    send('visitor', 'observe', at(3000), unfinished);
+    if (loss !== 'connection before terminal report') {
+      assert.equal(send('host', 'observe', at(3100), finished).state.ended, false);
+    }
+    const replacement = randomUUID();
+    const recovery = { playerId: replacement, recoveryId, recoveryGeneration: 1 };
+    let paused;
+    if (loss === 'lease') {
+      send('visitor', 'observe', at(6100), unfinished);
+      paused = send('visitor', 'observe', at(7101), unfinished).state;
+    } else if (loss === 'recover') {
+      assert.equal(send('host', 'recover', at(3150), { ...recovery, recoveryId: randomUUID() }).conflict, true);
+      paused = send('host', 'recover', at(3200), recovery).state;
+    } else if (loss === 'pause') {
+      send('visitor', 'observe', at(3150), { ...unfinished, playing: false, position: 3 });
+      paused = send('host', 'pause', at(3200), target).state;
+    } else {
+      paused = send('host', 'unavailable', at(3200), { ...target, reason: 'connection', position: 3 }).state;
+    }
+    assert.equal(paused.position, 2.8);
+    assert.equal(paused.startsAt, null);
+    assert.equal(paused.ended, false);
+    assert.equal(paused.wantsPlay, loss !== 'pause');
+    if (loss === 'pause') {
+      assert.equal(send('host', 'unavailable', at(3300), { ...target, reason: 'connection' }).conflict, true);
+      return;
+    }
+    assert.equal(paused.waiting.host, 'connection');
+    const restoredAt = at(loss === 'lease' ? 7200 : 3300);
+    if (loss !== 'recover') {
+      assert.equal(send('host', 'recover', restoredAt, recovery).state.ownsSeat, true);
+    }
+    const aligned = { epoch, version: paused.version + Number(loss !== 'recover'), position: 2.8, nativeEnd: true };
+    send('host', 'ready', restoredAt, { ...aligned, playerId: replacement });
+    const retry = send('visitor', 'ready', restoredAt, aligned).state;
+    assert.ok(retry.startsAt > restoredAt);
+    const replayed = { ...finished, version: retry.version };
+    assert.equal(send('host', 'observe', retry.startsAt + 300, replayed).state.ownsSeat, false);
+    assert.equal(send('host', 'observe', retry.startsAt + 300, { ...finished, playerId: replacement }).state.ended, false);
+    assert.equal(send('visitor', 'observe', retry.startsAt + 310, replayed).state.ended, false);
+    const cancel = send('host', 'pause', retry.startsAt + 320, { epoch, version: retry.version, playerId: replacement });
+    assert.equal(cancel.conflict, false);
+    assert.equal(cancel.state.wantsPlay, false);
+    assert.equal(send('host', 'observe', retry.startsAt + 330, { ...replayed, playerId: replacement }).state.ended, false);
+  });
+});
+
+test('a player that advanced after a seek and then froze gets a local tail retry', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  assert.equal(app.snapshot().synchronized, true);
+  const seek = app.host.element('seek');
+  seek.value = 119.4;
+  seek.dispatchEvent(new Event('change'));
+  const { video, element } = app.visitor;
+  for (let i = 0; i < 35 && video.currentTime < 119.7; i++) await app.advance(50);
+  const pausedAt = video.currentTime;
+  assert.ok(pausedAt >= 119.7 && pausedAt < 120);
+  video.currentTime = pausedAt;
+  video.stuck = true;
+  await app.advance(1500);
+  const held = app.snapshot();
+  assert.equal(held.ended, false);
+  assert.equal(held.startsAt, null);
+  assert.equal(held.wantsPlay, true);
+  assert.equal(held.position, pausedAt);
+  assert.equal(held.waiting.visitor, 'stalled');
+  assert.ok(app.host.video.paused && video.paused);
+  assert.equal(app.host.gain.value, 0);
+  assert.equal(app.visitor.gain.value, 0);
+  assert.equal(element('prepare').textContent, '重试播放');
+  assert.equal(element('prepare').hidden, false);
+  assert.equal(app.host.element('prepare').hidden, true);
+  video.stuck = false;
+  app.visitor.allowPlayback();
+  await app.advance(2400);
+  assert.equal(app.snapshot().ended, true);
+});
+
+test('tail stall uses consecutive in-order capture times, not a delayed reply', () => {
+  const room = createPlayback(3);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  const send = (role, action, now, fields = {}) =>
+    room.update({ role, action, playerId: ids[role], ...fields }, now).state;
+  const { epoch, version } = send('host', 'observe', 0);
+  const ready = { epoch, version, position: 0, claim: true, nativeEnd: true };
+  for (const role of ['host', 'visitor']) send(role, 'ready', 0, ready);
+  const plan = send('host', 'play', 0, ready);
+  const report = (role, received, captured, position, ended = false) =>
+    send(role, 'observe', plan.startsAt + received, { epoch, version: plan.version,
+      position, ended, playing: !ended, observedAt: plan.startsAt + captured, sampledAt: captured });
+  report('visitor', 2500, 2500, 2.5);
+  report('host', 2500, 2500, 2.5);
+  report('visitor', 2550, 2550, 2.55);
+  report('host', 3100, 3100, 3, true);
+  report('visitor', 3120, 2600, 2.55);
+  const delayed = report('visitor', 3730, 2800, 2.55);
+  assert.equal(delayed.startsAt, plan.startsAt);
+  assert.equal(delayed.waiting.visitor, null);
+  const stale = report('visitor', 3740, 2750, 2.6);
+  assert.equal(stale.startsAt, plan.startsAt);
+  const stopped = report('visitor', 3880, 3300, 2.55);
+  assert.equal(stopped.startsAt, null);
+  assert.equal(stopped.position, 2.55);
+  assert.equal(stopped.waiting.visitor, 'stalled');
 });
 
 test('replacing the source retires an unsent audio report and an old Observe reply', async () => {
@@ -1097,7 +1223,7 @@ test('a healthy silent preview survives staggered progress responses 800 ms apar
     room.update({ role, playerId: ids[role], action, ...fields }, now).state;
   room.startOnApproval();
   const { epoch, version } = update('host', 'observe', 0);
-  const target = { epoch, version, claim: true, position: 0 };
+  const target = { epoch, version, claim: true, position: 0, nativeEnd: true };
   update('host', 'ready', 0, target);
   const { startsAt } = update('visitor', 'ready', 0, target);
   const observe = (role, now) => update(role, 'observe', now, {
@@ -1139,7 +1265,7 @@ function firstStartAfterPreview() {
     room.update({ role, playerId: ids[role], action, ...fields }, now).state;
   room.startOnApproval();
   const { epoch, version } = update('host', 'observe', 0);
-  const target = { epoch, version, claim: true, position: 0 };
+  const target = { epoch, version, claim: true, position: 0, nativeEnd: true };
   update('host', 'ready', 0, target);
   const { startsAt } = update('visitor', 'ready', 0, target);
   function progress(role, now) {
@@ -1155,7 +1281,8 @@ function firstStartAfterPreview() {
   update('host', 'ready', 1400, realTarget);
   const first = update('visitor', 'ready', 1400, realTarget);
   const agree = (role, now, deadline, confirms) => update(role, 'observe', now, {
-    ...realTarget, startAcknowledgment: deadline, startConfirmation: confirms ? deadline : undefined,
+    ...realTarget, ended: false, playing: false,
+    startAcknowledgment: deadline, startConfirmation: confirms ? deadline : undefined,
   });
   return { update, realTarget, first, agree };
 }
@@ -1221,7 +1348,7 @@ function shortFirstStartFixture() {
     room.update({ role, playerId: ids[role], action, ...fields }, now).state;
   room.startOnApproval();
   const { epoch, version } = update('host', 'observe', 0);
-  const target = { epoch, version, claim: true, position: 0 };
+  const target = { epoch, version, claim: true, position: 0, nativeEnd: true };
   update('host', 'ready', 0, target);
   const { startsAt } = update('visitor', 'ready', 0, target);
   const plan = { ...target, startAcknowledgment: startsAt, startConfirmation: startsAt };
@@ -1280,7 +1407,7 @@ test('projected duration cannot end a first start with a media clock stuck at ze
   const update = (role, action, now, fields) =>
     room.update({ role, playerId: ids[role], action, ...fields }, now).state;
   const { epoch, version } = update('host', 'observe', 0);
-  const target = { epoch, version, claim: true, position: 0 };
+  const target = { epoch, version, claim: true, position: 0, nativeEnd: true };
   update('host', 'ready', 0, target);
   const { startsAt } = update('visitor', 'ready', 0, target);
   const waiting = update('visitor', 'observe', startsAt + 2000, { ...target, playing: true });

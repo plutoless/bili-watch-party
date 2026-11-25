@@ -778,6 +778,79 @@ test('only the host directs playback and both players must acknowledge the curre
   assert.equal(seekBack.wantsPlay, false);
 });
 
+test('backend-first release accepts published and upgraded Observe requests at the end', async t => {
+  let now = 1_000_000;
+  const webOrigin = 'https://web.fixture.test';
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 3;
+  }, { now: () => now, webOrigin, publicOrigin: 'https://api.fixture.test' });
+  const postFromWeb = (path, body, cookie) =>
+    app.request(path, { method: 'POST', body, cookie, headers: { Origin: webOrigin } });
+  const loggedIn = await postFromWeb('/api/session', { password: fixturePassword });
+  assert.equal(loggedIn.status, 204);
+  const host = loggedIn.headers.get('set-cookie').split(';')[0];
+  const pairs = [[], ['host'], ['visitor'], ['host', 'visitor']];
+  for (const [index, upgraded] of pairs.entries()) {
+    await t.test(upgraded.join(' + ') || 'published pages', async () => {
+      const room = await postFromWeb('/api/rooms', { url: source + '?p=' + (index + 1) }, host)
+        .then(response => response.json());
+      await app.status(host, room.id, 'ready');
+      const path = '/api/rooms/' + room.id + '/';
+      const post = (route, body, cookie = host) => postFromWeb(path + route, body, cookie);
+      const { invitation } = await post('invitation', { action: 'generate' }).then(response => response.json());
+      const joined = await post('join', { token: invitation.token }, '');
+      assert.equal(joined.status, 200);
+      const { requestId } = await joined.json();
+      const visitor = joined.headers.get('set-cookie').split(';')[0];
+      const autoStart = upgraded.length === 1 && upgraded.includes('host');
+      assert.equal((await post('approve', { requestId, ...(autoStart && { startPlayback: true }) })).status, 200);
+      const ids = { host: randomUUID(), visitor: randomUUID() };
+      const send = async (role, action, fields) => {
+        const response = await post('playback', { role, playerId: ids[role], action, ...fields },
+          role === 'host' ? host : visitor);
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      const { epoch, version } = await send('host', 'observe');
+      let aligned;
+      for (const role of ['host', 'visitor']) {
+        aligned = await send(role, 'ready', { epoch, version, claim: true, position: 0,
+          ...(upgraded.includes(role) ? { nativeEnd: true } : {}) });
+      }
+      const plan = autoStart ? aligned : await send('host', 'play', { epoch, version });
+      assert.ok(plan.startsAt > now);
+      assert.equal(plan.firstStartPending, false);
+      const target = { epoch, version: plan.version };
+      now = plan.startsAt + 1500;
+      for (const role of ['host', 'visitor']) {
+        await send(role, 'observe', { ...target, position: 1.5,
+          ...(upgraded.includes(role) ? { ended: false, playing: true, sampledAt: 1500, observedAt: now } : {}) });
+      }
+      now = plan.startsAt + 3100;
+      // The published page sends only role, playerId, action, epoch, version and position.
+      for (const role of ['host', 'visitor']) {
+        if (!upgraded.length && role === 'visitor') break;
+        assert.equal((await send(role, 'observe', { ...target, position: 3 })).ended, false);
+      }
+      let result;
+      if (!upgraded.length) result = await send('visitor', 'observe', { ...target, position: 3 });
+      else for (const role of upgraded) {
+        for (const bad of [{ position: 3000, playing: false }, { position: 3, playing: true }]) {
+          assert.equal((await send(role, 'observe', { ...target, ended: true, ...bad })).ended, false);
+          assert.equal((await send(role, 'observe', { ...target, position: 3 })).ended, false);
+        }
+        result = await send(role, 'observe', { ...target, position: 2.99, ended: true, playing: false,
+          sampledAt: 3100, observedAt: now });
+        if (!result.ended) await send(role, 'observe', { ...target, position: 3 });
+      }
+      assert.equal(result.ended, true);
+      assert.equal(result.position, 3);
+      assert.equal(result.wantsPlay, false);
+    });
+  }
+});
+
 test('a host pause can follow its committed seek without admitting obsolete or unrelated commands', async t => {
   const app = await setup(t, async ({ output }) => {
     await writeFile(output, 'synthetic media');
