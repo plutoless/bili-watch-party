@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { access, mkdtemp, rm, truncate, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { access, mkdtemp, readFile, rm, truncate, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
@@ -220,7 +221,14 @@ test('supported links normalize to one room per part; unsupported links fail bef
   ]);
   assert.deepEqual(submissions.map(([status]) => status).sort(), [200, 200, 201]);
   const id = submissions[0][1].id;
-  for (const [, room] of submissions) assert.equal(room.id, id);
+  const firstInvitation = submissions.find(([status]) => status === 201)[1].invitation;
+  assert.ok(/^[a-f0-9]{64}$/.test(firstInvitation.token));
+  assert.ok(firstInvitation.expiresAt > Date.now());
+  for (const [, room] of submissions) {
+    assert.equal(room.id, id);
+    assert.ok(room.invitation?.token === firstInvitation.token, 'Deduplication must keep the original invitation');
+    assert.equal(room.invitation.expiresAt, firstInvitation.expiresAt);
+  }
   assert.equal((await app.status(cookie, id, 'ready')).part, 1);
   assert.deepEqual(jobs, [{ bvid: 'BV1TDyazeEuY', part: 1 }]);
 
@@ -258,9 +266,20 @@ test('a transient first failure can be retried once in the same room and publish
   assert.equal(duplicate.status, 'failed');
   const roomUrl = '/api/rooms/' + submitted.id;
   const mediaUrl = '/media/' + submitted.id + '.mp4';
+  const application = await app.request(roomUrl + '/join', {
+    method: 'POST', body: { token: submitted.invitation.token },
+  });
+  const { state, requestId } = await application.json();
+  assert.equal(state, 'pending');
   const retries = await Promise.all(Array.from({ length: 3 }, () =>
     app.request(roomUrl + '/retry', { cookie, method: 'POST', body: { attempt: failed.attempt } })));
-  for (const response of retries) assert.equal((await response.json()).id, submitted.id);
+  for (const response of retries) {
+    const room = await response.json();
+    assert.equal(room.id, submitted.id);
+    assert.ok(room.invitation?.token === submitted.invitation.token, 'Retry must keep the original invitation');
+    assert.equal(room.invitation.expiresAt, submitted.invitation.expiresAt);
+    assert.ok(room.requests.length === 1 && room.requests[0].id === requestId, 'Retry must keep the pending request');
+  }
   const pending = await app.status(cookie, submitted.id, 'downloading');
   assert.equal(pending.title, '验收影片');
   assert.equal(pending.partTitle, '第一部分');
@@ -373,6 +392,51 @@ test('media download tries backup URLs and distinguishes a refusal from a transi
   }
 });
 
+test('media import requests full byte ranges and skips incomplete tracks', async t => {
+  const workDir = await mkdtemp(join(tmpdir(), 'watch-media-range-'));
+  t.after(() => rm(workDir, { recursive: true, force: true }));
+  const attempted = [];
+  const response = (body, range) => new Response(body, {
+    status: 206, headers: { 'Content-Range': range },
+  });
+  const importer = createImporter({ ffmpeg: 'false', fetch: async (url, options) => {
+    if (url.pathname.endsWith('/view')) {
+      return Response.json({ code: 0, data: {
+        title: '验收影片', pages: [{ page: 1, cid: 123, duration: 4 }],
+      } });
+    }
+    if (url.pathname.endsWith('/playurl')) {
+      return Response.json({ code: 0, data: { dash: {
+        video: [{
+          id: 32, codecs: 'avc1.64001f',
+          baseUrl: 'https://cdn.bilivideo.com/partial',
+          backupUrl: [
+            'https://other.akamaized.net/unrelated',
+            'https://upos-hz-mirrorakam.akamaized.net/truncated',
+            'https://cdn.bilivideo.com/video',
+          ],
+        }],
+        audio: [{ codecs: 'mp4a.40.2', baseUrl: 'https://upos-hz-mirrorakam.akamaized.net/audio' }],
+      } } });
+    }
+    attempted.push(url.pathname);
+    if (options.headers.Range !== 'bytes=0-') return new Response(null, { status: 567 });
+    if (url.pathname === '/partial') return response('ab', 'bytes 0-1/4');
+    if (url.pathname === '/truncated') return response('abc', 'bytes 0-3/4');
+    if (url.pathname === '/video') return response('abcd', 'bytes 0-3/4');
+    if (url.pathname === '/audio') return response('xyz', 'bytes 0-2/3');
+    assert.fail('Untrusted CDN requested');
+  } });
+  // Stop at FFmpeg so the fixture can assert exactly which bytes reached it.
+  await assert.rejects(importer({
+    source: { bvid: 'BV1TDyazeEuY', part: 1 }, workDir, output: join(workDir, 'ready.mp4'),
+    update() {}, signal: new AbortController().signal,
+  }), { code: 'processing' });
+  assert.deepEqual(attempted, ['/partial', '/truncated', '/video', '/audio']);
+  assert.equal(await readFile(join(workDir, 'video.m4s'), 'utf8'), 'abcd');
+  assert.equal(await readFile(join(workDir, 'audio.m4s'), 'utf8'), 'xyz');
+});
+
 test('only the explicitly approved visitor can watch, including during competing approvals', async t => {
   const download = Promise.withResolvers();
   const app = await setup(t, async ({ output, signal }) => {
@@ -386,9 +450,7 @@ test('only the explicitly approved visitor can watch, including during competing
   const media = '/media/' + room.id + '.mp4';
   const post = (action, body = {}, cookie = host) =>
     app.request(path + '/' + action, { method: 'POST', body, cookie });
-  const invitation = await post('invitation', { action: 'generate' });
-  assert.equal(invitation.status, 200);
-  const { token } = (await invitation.json()).invitation;
+  const { token } = room.invitation;
   const visitors = await Promise.all([1, 2].map(async () => {
     const response = await post('join', { token }, '');
     assert.equal(response.status, 200);
@@ -451,7 +513,8 @@ test('invitation rotation, revocation and expiry invalidate pending requests', a
     assert.equal((await post('approve', { requestId }, host)).status, 409);
   };
 
-  const first = await generate();
+  const first = room.invitation;
+  assert.equal(first.expiresAt - now, 30 * 60_000);
   const firstRequest = await join(first.token);
   assert.equal(firstRequest.state, 'pending');
   const replacement = await generate();
@@ -461,12 +524,18 @@ test('invitation rotation, revocation and expiry invalidate pending requests', a
   assert.equal(replacementRequest.state, 'pending');
   assert.equal((await post('invitation', { action: 'revoke' }, host)).status, 200);
   await verifyRevoked(replacement.token, replacementRequest);
+  const [, revokedRoom] = await app.submit(host);
+  assert.equal(revokedRoom.id, room.id);
+  assert.equal(revokedRoom.invitation, null);
 
   const expiring = await generate();
   const expiringRequest = await join(expiring.token);
   assert.equal(expiringRequest.state, 'pending');
   now = expiring.expiresAt;
   await verifyRevoked(expiring.token, expiringRequest);
+  const [, expiredRoom] = await app.submit(host);
+  assert.equal(expiredRoom.id, room.id);
+  assert.equal(expiredRoom.invitation, null);
 });
 
 test('approved session persists across restart, then room end revokes access and cleanup removes media', async t => {
@@ -641,10 +710,203 @@ test('only the host directs playback and both players must acknowledge the curre
   assert.ok(rearmed.startsAt > now);
   assert.deepEqual(rearmed.blocked, []);
 
-  now += 4_000;
+  now = rearmed.startsAt + 250;
+  const playingVersion = { epoch: rearmed.epoch, version: rearmed.version };
+  const buffering = await send('visitor', 'unavailable', {
+    ...playingVersion, reason: 'buffering', position: 25.9,
+  }).then(r => r.json());
+  assert.equal(buffering.position, 25.9);
+  assert.equal(buffering.startsAt, null);
+  assert.equal(buffering.wantsPlay, true);
+  assert.deepEqual(buffering.ready, { host: false, visitor: false });
+  assert.equal(buffering.waiting.visitor, 'buffering');
+
+  // The host can cancel a start even when an interruption beat the pause to the server.
+  const cancel = await send('host', 'pause', playingVersion);
+  assert.equal(cancel.status, 200);
+  const cancelled = await cancel.json();
+  const firstSeek = await send('host', 'seek', { epoch: cancelled.epoch, version: cancelled.version, position: 55 })
+    .then(r => r.json());
+  const firstTarget = { epoch: firstSeek.epoch, version: firstSeek.version, position: 55 };
+  const backgrounded = await send('visitor', 'unavailable', { ...firstTarget, reason: 'background' }).then(r => r.json());
+  assert.equal(backgrounded.waiting.visitor, 'background');
+  assert.equal((await send('visitor', 'ready', firstTarget)).status, 409);
+  const latestSeek = await send('host', 'seek', { epoch: backgrounded.epoch, version: backgrounded.version, position: 70 })
+    .then(r => r.json());
+  assert.equal((await send('host', 'pause', playingVersion)).status, 409);
+  assert.equal((await send('visitor', 'unavailable', { ...playingVersion, reason: 'buffering' })).status, 409);
+  assert.equal((await send('visitor', 'ready', firstTarget)).status, 409);
+  const latest = { epoch: latestSeek.epoch, version: latestSeek.version };
+  await send('host', 'ready', { ...latest, position: 70 });
+  await send('visitor', 'ready', { ...latest, position: 70 });
+  const beforeDisconnect = await send('host', 'play', latest).then(r => r.json());
+  now = beforeDisconnect.startsAt + 500;
+  await send('visitor', 'observe', { ...latest, version: beforeDisconnect.version, position: 70.35 });
+  await send('host', 'observe');
+  now += 3_100;
+  await send('host', 'observe');
+  now += 900;
   const expired = await send('host', 'observe').then(r => r.json());
   assert.equal(expired.startsAt, null);
-  assert.equal(expired.wantsPlay, false);
-  assert.equal(expired.ownsSeat, false);
+  assert.equal(expired.wantsPlay, true);
+  assert.equal(expired.ownsSeat, true);
   assert.deepEqual(expired.ready, { host: false, visitor: false });
+  assert.equal(expired.waiting.visitor, 'connection');
+  assert.equal(expired.position, 70.35);
+  const reconnect = { epoch: expired.epoch, version: expired.version, position: expired.position };
+  await send('host', 'ready', reconnect);
+  const afterDisconnect = await send('visitor', 'ready', reconnect).then(r => r.json());
+  assert.ok(afterDisconnect.startsAt > now);
+
+  const oldVisitorId = playerIds.visitor;
+  playerIds.visitor = '00000000-0000-4000-8000-000000000003';
+  const recovered = await send('visitor', 'recover', { previousPlayerId: oldVisitorId }).then(r => r.json());
+  assert.equal(recovered.ownsSeat, true);
+  assert.equal(recovered.startsAt, null);
+  assert.equal(recovered.position, expired.position);
+  assert.equal(recovered.wantsPlay, true);
+  assert.deepEqual(recovered.ready, { host: false, visitor: false });
+  assert.equal((await post('playback', {
+    ...reconnect, role: 'visitor', playerId: oldVisitorId, action: 'ready',
+  }, visitor)).status, 409);
+  const refreshed = { epoch: recovered.epoch, version: recovered.version, position: recovered.position };
+  await send('host', 'ready', refreshed);
+  const afterRefresh = await send('visitor', 'ready', refreshed).then(r => r.json());
+  assert.ok(afterRefresh.startsAt > now);
+
+  now = afterRefresh.startsAt + 3_000;
+  await send('host', 'observe');
+  await send('visitor', 'observe');
+  now += 3_000;
+  const refreshedVersion = { epoch: afterRefresh.epoch, version: afterRefresh.version };
+  const current = await send('host', 'observe').then(r => r.json());
+  const interrupted = await send('visitor', 'unavailable', {
+    ...refreshedVersion, reason: 'buffering', position: 0,
+  }).then(r => r.json());
+  assert.equal(interrupted.startsAt, null);
+  assert.equal(interrupted.waiting.visitor, 'buffering');
+  assert.ok(interrupted.position >= current.position,
+    'An outlying visitor report must not rewind to the start of the room');
+  assert.ok(Math.abs(interrupted.position - (current.position + 4)) < 0.00001,
+    'A visitor report may only rewind within the recovery window');
+
+  const interruptedVersion = { epoch: interrupted.epoch, version: interrupted.version };
+  await send('host', 'ready', { ...interruptedVersion, position: interrupted.position });
+  const restart = await send('visitor', 'ready', {
+    ...interruptedVersion, position: interrupted.position,
+  }).then(r => r.json());
+  const restartVersion = { epoch: restart.epoch, version: restart.version };
+  now = restart.startsAt + 350;
+  await send('visitor', 'observe', { ...restartVersion, position: interrupted.position + 0.3 });
+  await send('host', 'observe');
+  now += 3_500;
+  const earlyReconnect = await send('visitor', 'unavailable', {
+    ...restartVersion, reason: 'connection', position: interrupted.position + 0.35,
+  }).then(r => r.json());
+  assert.equal(earlyReconnect.position, interrupted.position + 0.35,
+    'A short disconnect must not advance past the frame last seen by the interrupted side');
+});
+
+test('a host pause can follow its committed seek without admitting obsolete or unrelated commands', async t => {
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 120;
+  }, { now: () => 1_000_000 });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  await app.status(host, room.id, 'ready');
+  const post = (route, body, cookie = host) =>
+    app.request('/api/rooms/' + room.id + '/' + route, { method: 'POST', body, cookie });
+  const { invitation } = await post('invitation', { action: 'generate' }).then(r => r.json());
+  const joined = await post('join', { token: invitation.token }, '');
+  const { requestId } = await joined.json();
+  const visitor = joined.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('approve', { requestId })).status, 200);
+
+  const originalHost = '00000000-0000-4000-8000-000000000001';
+  const guest = '00000000-0000-4000-8000-000000000002';
+  const reloadedHost = '00000000-0000-4000-8000-000000000003';
+  const seekId = '00000000-0000-4000-8000-000000000004';
+  const nextSeekId = '00000000-0000-4000-8000-000000000005';
+  const send = (action, fields = {}, playerId = originalHost, role = 'host', cookie = host) =>
+    post('playback', { role, action, playerId, ...fields }, cookie);
+  const { epoch, version } = await send('observe').then(r => r.json());
+  const initial = { epoch, version };
+  assert.equal((await send('ready', { ...initial, position: 0, claim: true })).status, 200);
+  assert.equal((await send('ready', { ...initial, position: 0, claim: true }, guest, 'visitor', visitor)).status, 200);
+  const start = await send('play', initial).then(r => r.json());
+
+  const seek = { epoch, version: start.version, position: 30, seekId };
+  const applied = await send('seek', seek).then(r => r.json());
+  assert.equal(applied.position, 30);
+  assert.equal(applied.wantsPlay, true);
+  const previous = { epoch, version: start.version };
+  const followUp = { ...previous, afterSeekId: seekId };
+  assert.equal((await send('pause', previous)).status, 409);
+  assert.equal((await send('pause', { ...previous, afterSeekId: nextSeekId })).status, 409);
+  assert.equal((await send('pause', { ...followUp, epoch: 'old-room' })).status, 409);
+  assert.equal((await send('pause', followUp, reloadedHost)).status, 409);
+  assert.equal((await send('pause', followUp, originalHost, 'host', visitor)).status, 401);
+  assert.equal((await send('pause', followUp, guest, 'visitor', visitor)).status, 403);
+
+  const afterFirst = { epoch, version: applied.version };
+  const second = await send('seek', { ...afterFirst, position: 45, seekId: nextSeekId }).then(r => r.json());
+  assert.equal(second.position, 45);
+  assert.equal((await send('pause', followUp)).status, 409);
+
+  const recovery = { previousPlayerId: seekId, fallbackPlayerIds: [originalHost] };
+  assert.equal((await send('recover', { ...recovery, fallbackPlayerIds: ['not-a-player'] }, reloadedHost)).status, 400);
+  assert.equal((await send('recover', { ...recovery, fallbackPlayerIds: originalHost }, reloadedHost)).status, 400);
+  assert.equal((await send('recover', recovery, reloadedHost, 'host', visitor)).status, 401);
+  assert.equal((await send('recover', recovery, reloadedHost, 'visitor', visitor)).status, 409);
+  const recovered = await send('recover', recovery, reloadedHost).then(r => r.json());
+  assert.equal(recovered.ownsSeat, true);
+  assert.equal((await send('recover', recovery, reloadedHost)).status, 200);
+  assert.equal((await send('recover', recovery, seekId)).status, 409);
+  assert.equal((await send('pause', { ...afterFirst, afterSeekId: nextSeekId })).status, 409);
+  const target = { epoch, version: recovered.version, position: 45 };
+  assert.equal((await send('ready', target, reloadedHost)).status, 200);
+  const scheduled = await send('ready', target, guest, 'visitor', visitor).then(r => r.json());
+  assert.ok(scheduled.startsAt > 1_000_000);
+
+  const latest = { ...afterFirst, afterSeekId: nextSeekId };
+  const response = await send('pause', latest, reloadedHost);
+  assert.equal(response.status, 200);
+  const paused = await response.json();
+  assert.equal(paused.wantsPlay, false);
+  assert.equal(paused.startsAt, null);
+  assert.equal(paused.position, 45);
+  assert.equal((await send('pause', latest, reloadedHost)).status, 409);
+  assert.equal((await send('ready', target, guest, 'visitor', visitor)).status, 409);
+});
+
+
+test('only a later generation in the authorized recovery lineage can take the seat', async t => {
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 120;
+  });
+  const cookie = await app.login();
+  const [, room] = await app.submit(cookie);
+  await app.status(cookie, room.id, 'ready');
+  const post = (body, hostCookie = cookie) =>
+    app.request('/api/rooms/' + room.id + '/playback', { method: 'POST', body: { role: 'host', ...body }, cookie: hostCookie });
+  const first = randomUUID();
+  const second = randomUUID();
+  const third = randomUUID();
+  const { epoch, version } = await post({ action: 'observe', playerId: first }).then(r => r.json());
+  assert.equal((await post({ action: 'ready', playerId: first, epoch, version, position: 0, claim: true })).status, 200);
+  const recover = { action: 'recover', playerId: second, recoveryId: first, recoveryGeneration: 10 };
+  assert.equal((await post(recover, '')).status, 401);
+  assert.equal((await post({ ...recover, recoveryId: randomUUID() })).status, 409);
+  assert.equal((await post({ ...recover, recoveryGeneration: 0 })).status, 400);
+  assert.equal((await post({ ...recover, recoveryGeneration: 1.5 })).status, 400);
+  assert.equal((await post(recover)).status, 200);
+  assert.equal((await post(recover)).status, 200);
+  assert.equal((await post({ ...recover, recoveryGeneration: 9 })).status, 409);
+  assert.equal((await post({ ...recover, playerId: third })).status, 409);
+  assert.equal((await post({ ...recover, playerId: third, recoveryGeneration: 11 })).status, 200);
+  assert.equal((await post(recover)).status, 409);
+  const reply = await post({ action: 'observe', playerId: third });
+  assert.equal((await reply.json()).ownsSeat, true);
 });

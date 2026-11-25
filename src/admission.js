@@ -47,7 +47,12 @@ export function openAdmission(db, now) {
     return { state: 'pending', requestId: request.id };
   }
 
+  function createInvitation(roomId) {
+    insertInvitation.run(roomId, newToken(), now() + invitationLifetime);
+  }
+
   return {
+    createInvitation,
     hostView(roomId) {
       const current = invitation.get(roomId, now());
       const occupied = Boolean(seat.get(roomId));
@@ -62,7 +67,7 @@ export function openAdmission(db, now) {
       try {
         removeInvitation.run(roomId);
         removePending.run(roomId);
-        if (action === 'generate') insertInvitation.run(roomId, newToken(), now() + invitationLifetime);
+        if (action === 'generate') createInvitation(roomId);
         db.exec('COMMIT');
       } catch (error) {
         db.exec('ROLLBACK');

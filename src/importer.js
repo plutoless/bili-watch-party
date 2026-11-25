@@ -10,6 +10,7 @@ const run = promisify(execFile);
 const bilibiliApi = 'https://api.bilibili.com';
 const sourceHosts = new Set(['www.bilibili.com', 'm.bilibili.com', 'bilibili.com']);
 const cdnDomain = /(?:^|\.)(?:bilivideo\.com|bilivideo\.cn)$/;
+const akamaiCdnHost = 'upos-hz-mirrorakam.akamaized.net';
 const trackLimit = 512 * 1024 * 1024;
 const accessStatuses = new Set([401, 403, 404, 410, 451]);
 
@@ -67,8 +68,15 @@ function cdnUrl(input) {
   if (typeof input !== 'string' || !URL.canParse(input)) return null;
   const url = new URL(input);
   if (url.protocol !== 'https:' || url.port || url.username || url.password ||
-      !cdnDomain.test(url.hostname)) return null;
+      !(cdnDomain.test(url.hostname) || url.hostname === akamaiCdnHost)) return null;
   return url;
+}
+
+function completeRangeSize(range) {
+  const fields = /^bytes 0-(\d+)\/([1-9]\d*)$/.exec(range ?? '');
+  if (!fields) return null;
+  const size = Number(fields[2]);
+  return Number.isSafeInteger(size) && Number(fields[1]) === size - 1 ? size : null;
 }
 
 export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffprobe = 'ffprobe' } = {}) {
@@ -117,7 +125,7 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
         if (signal.aborted) throw new ImportError('network');
         let response;
         try {
-          response = await upstream(url, { headers: { Referer: referer } }, signal, 180_000);
+          response = await upstream(url, { headers: { Referer: referer, Range: 'bytes=0-' } }, signal, 180_000);
         } catch {
           break;
         }
@@ -127,12 +135,14 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
           url = location && URL.canParse(location, url) ? cdnUrl(new URL(location, url).href) : null;
           continue;
         }
-        if (response.status !== 200 || !response.body) {
+        const rangeSize = response.status === 206
+          ? completeRangeSize(response.headers.get('content-range')) : null;
+        if ((response.status !== 200 && rangeSize === null) || !response.body) {
           await response.body?.cancel();
           if (accessStatuses.has(response.status)) failure = 'access';
           break;
         }
-        if (Number(response.headers.get('content-length')) > trackLimit) {
+        if (Number(response.headers.get('content-length')) > trackLimit || rangeSize > trackLimit) {
           await response.body.cancel();
           throw new ImportError('limit');
         }
@@ -146,7 +156,7 @@ export function createImporter({ fetch: request = fetch, ffmpeg = 'ffmpeg', ffpr
         });
         try {
           await pipeline(response.body, limit, createWriteStream(destination, { mode: 0o600 }), { signal });
-          if (size > 0) return;
+          if (size > 0 && (rangeSize === null || size === rangeSize)) return;
         } catch (error) {
           if (error instanceof ImportError) throw error;
           if (['ENOSPC', 'EACCES', 'EROFS'].includes(error.code)) throw new ImportError('processing');

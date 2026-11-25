@@ -79,20 +79,7 @@ switch (command) {
       save();
       console.log('https://staged-fixture.vercel.app');
     } else {
-      assert.ok(has('promote'));
-      const target = value('promote');
-      if (target === 'https://staged-fixture.vercel.app') {
-        if (stage('promote')) fail();
-        assert.equal(state.backend, process.env.RELEASE_SHA);
-        assert.ok(state.stages.includes('backend-https'));
-        state.liveId = 'dpl_' + process.env.RELEASE_SHA;
-        state.pages[state.liveId] = state.candidate;
-      } else {
-        assert.ok(Object.hasOwn(state.pages, target));
-        state.liveId = target;
-        stage('restore-web');
-      }
-      save();
+      fail();
     }
     break;
   }
@@ -101,11 +88,40 @@ switch (command) {
     let body = '';
     let status = 200;
     if (url.hostname === 'api.vercel.com') {
-      if (url.pathname.startsWith('/v9/projects/')) body = JSON.stringify({ verified: true });
-      else {
+      const org = process.env.VERCEL_ORG_ID;
+      const project = process.env.VERCEL_PROJECT_ID;
+      const candidateId = 'dpl_' + process.env.RELEASE_SHA;
+      const promotePath = '/v10/projects/' + project + '/promote/';
+      assert.equal(url.searchParams.get('teamId'), org.startsWith('team_') ? org : null);
+      if (url.pathname.startsWith('/v9/projects/')) {
+        body = JSON.stringify({ verified: true });
+      } else if (url.pathname === '/v13/deployments/staged-fixture.vercel.app') {
+        const projectId = stage('candidate-project') ? 'prj_other' : project;
+        body = JSON.stringify({ id: candidateId, projectId, readyState: 'READY', target: 'production' });
+      } else if (url.pathname.startsWith(promotePath)) {
+        assert.equal(value('--data'), '{}');
+        const target = url.pathname.slice(promotePath.length);
+        if (target === candidateId) {
+          if (stage('promote')) {
+            status = 403;
+            body = JSON.stringify({ error: { code: 'forbidden' } });
+          } else {
+            assert.equal(state.backend, process.env.RELEASE_SHA);
+            assert.ok(state.stages.includes('backend-https'));
+            state.liveId = target;
+            state.pages[target] = state.candidate;
+            status = 202;
+          }
+        } else {
+          assert.ok(Object.hasOwn(state.pages, target));
+          state.liveId = target;
+          stage('restore-web');
+        }
+        save();
+      } else {
         assert.equal(url.pathname, '/v4/aliases/' + new URL(process.env.WEB_ORIGIN).hostname);
         if (!state.liveId) status = 404;
-        else body = JSON.stringify({ projectId: process.env.VERCEL_PROJECT_ID, deploymentId: state.liveId });
+        else body = JSON.stringify({ projectId: project, deploymentId: state.liveId });
       }
     } else if (url.origin === process.env.API_ORIGIN) {
       if (url.pathname === '/api/session') status = 401;
