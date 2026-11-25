@@ -128,7 +128,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   let claim = false;
   let gestureFailed = false;
   let reportBlocked;
-  let reportBuffering;
+  let unavailableReport;
   let outage;
   let reloadAfterReconnect = false;
   let mediaReloaded = false;
@@ -148,7 +148,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   let initialReloadClosed = false;
   let admitted = false;
   let audio;
-  let audioSetupFailed = false;
+  let audioFailed = false;
+  let audioLoss;
   let approvalAudioRetry;
   let authorizationRetryAt = 0;
   let firstStartCancellation;
@@ -189,6 +190,10 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     byId('buffered').value = Math.min(100, Math.round(seconds / video.duration * 100));
   }
 
+  function awaitingLocalAudio() {
+    return Boolean(priming?.waitingForAudio || priming?.waitingForPlay);
+  }
+
   function render() {
     const ownsControls = host && state?.ownsSeat;
     const canControl = ownsControls && !networkError;
@@ -196,12 +201,13 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const waiting = Object.values(state?.waiting ?? {});
     const canPlay = admitted && state && !state.otherPlayer && !networkError;
     const canToggle = state?.wantsPlay ? ownsControls : canPlay || (canControl && bothReady && primed);
-    const waitingForAudio = Boolean(priming?.waitingForAudio);
-    const retryAudio = audioSetupFailed || waitingForAudio;
+    const waitingForAudio = awaitingLocalAudio();
+    const retryAudio = audioFailed || waitingForAudio;
+    const reloadAudio = retryAudio && audio?.context.state === 'closed';
     prepare.hidden = !admitted || !state?.wantsPlay || (!gestureFailed && !retryAudio) ||
       Boolean(state?.otherPlayer || firstStartCancellation || queuedCommand?.action === 'pause');
     prepare.disabled = Boolean(priming && !waitingForAudio) || networkError || video.readyState < video.HAVE_METADATA;
-    setText('prepare', retryAudio && !gestureFailed ? '重试音频' : '允许播放');
+    setText('prepare', reloadAudio ? '刷新页面' : retryAudio && !gestureFailed ? '重试音频' : '允许播放');
     play.hidden = !host;
     setText('play', state?.firstStartPending ? '取消开播' : state?.wantsPlay ? '暂停' : state?.ended ? '重播' : '播放');
     byId('end-after-playback').hidden = !host || !state?.ended;
@@ -227,11 +233,16 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       status = '等待重新连接并对齐进度。';
     } else if (document.hidden || waiting.includes('background')) {
       status = '等待双方回到观影页面。';
-    } else if (reportBuffering || waiting.includes('buffering')) {
-      const buffering = seats.filter(seat => state?.waiting[seat] === 'buffering' || (seat === role && reportBuffering));
+    } else if (waiting.includes('audio') || unavailableReport?.reason === 'audio') {
+      const interrupted = seats.filter(seat => state?.waiting[seat] === 'audio' ||
+        (seat === role && unavailableReport?.reason === 'audio'));
+      status = '等待' + describeSeats(interrupted) + '恢复音频输出。';
+    } else if (unavailableReport?.reason === 'buffering' || waiting.includes('buffering')) {
+      const buffering = seats.filter(seat => state?.waiting[seat] === 'buffering' ||
+        (seat === role && unavailableReport?.reason === 'buffering'));
       status = '等待' + describeSeats(buffering) + '缓冲并对齐进度。';
     } else if (state?.wantsPlay && waitingForAudio) {
-      status = '正在等待本机音频输出就绪。';
+      status = priming.waitingForAudio ? '正在等待本机音频输出就绪。' : '正在等待本机播放器就绪。';
     } else if (state?.startsAt != null) {
       status = mediaPlaying() && state.synchronized ? '正在同步播放'
         : state.awaitingStart ? '已对齐，等待同时开播。'
@@ -245,7 +256,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     setText('playback-status', status);
     setText('playback-message', video.error ? '无法读取视频，请刷新页面后重试。'
       : !prepare.hidden && gestureFailed ? '浏览器阻止了有声播放，请点「允许播放」。'
-      : !prepare.hidden && audioSetupFailed ? '无法准备本机的静音音频输出，请点「重试音频」。'
+      : !prepare.hidden && reloadAudio ? '本机音频输出已关闭，请刷新页面。'
+      : !prepare.hidden && audioFailed ? '无法准备本机播放，请点「重试音频」。'
       : state?.otherPlayer ? '这个席位已由另一个页面使用。'
       : commandMessage);
     renderTime();
@@ -293,11 +305,14 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       if (!audio.connected) {
         audio.source.connect(audio.gain);
         audio.connected = true;
-        audio.context.addEventListener?.('statechange', wake);
+        audio.context.addEventListener?.('statechange', () => {
+          if (audio.context.state === 'running') audioLoss = undefined;
+          wake();
+        });
       }
-      audioSetupFailed = false;
+      audioFailed = false;
     } catch {
-      audioSetupFailed = true;
+      audioFailed = true;
       if (!audio && context) context.close().catch(() => {});
     }
   }
@@ -381,13 +396,35 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     }
   }
 
-  function checkBuffering() {
-    if (reportBuffering || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData()) return;
+  function reportUnavailable(reason) {
     const { epoch, version } = state;
-    reportBuffering = { action: 'unavailable', reason: 'buffering', epoch, version, position: mediaPosition() };
+    unavailableReport = { action: 'unavailable', reason, epoch, version, position: mediaPosition() };
     pendingStart = undefined;
     pauseVideo();
     wake();
+  }
+
+  function checkBuffering() {
+    if (unavailableReport || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData()) return;
+    reportUnavailable('buffering');
+  }
+
+  function waitForSharedAudio() {
+    if (!audio || audio.context.state === 'running' || video.ended) {
+      audioLoss = undefined;
+      return false;
+    }
+    audio.gain.gain.value = 0;
+    const now = performance.now();
+    if (!audioLoss || audioLoss.timeline !== currentTimeline || audioLoss.startsAt !== state.startsAt) {
+      audioLoss = { timeline: currentTimeline, startsAt: state.startsAt, since: now };
+    } else if (now - audioLoss.since >= stallConfirmMs) {
+      // Use the room's existing pause/re-align path before probing audio again.
+      audioFailed = true;
+      primed = claim = false;
+      reportUnavailable('audio');
+    }
+    return true;
   }
 
   function confirmStall(retry) {
@@ -422,14 +459,20 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const attempt = { action: 'blocked', epoch, version };
     pendingStart = attempt;
     mediaReloaded = false;
-    Promise.all([video.play(), resumeAudio()]).then(() => {
+    video.play().then(() => {
       if (pendingStart !== attempt) return;
       hasStartedScheduledPlayback = true;
     }).catch(error => {
-      if (pendingStart === attempt && error.name === 'NotAllowedError') {
+      if (pendingStart !== attempt || error.name === 'AbortError') return;
+      if (error.name === 'NotAllowedError') {
         pauseVideo();
         reportBlocked = attempt;
         wake();
+      } else {
+        audioFailed = true;
+        primed = claim = false;
+        authorizationRetryAt = performance.now() + 1000;
+        reportUnavailable('audio');
       }
     }).finally(() => {
       if (pendingStart === attempt) {
@@ -445,7 +488,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
 
   function correctDrift() {
     if (state?.startsAt == null || !state.ownsSeat || !primed || priming ||
-        networkError || outage || reportBlocked || reportBuffering || document.hidden ||
+        networkError || outage || reportBlocked || unavailableReport || document.hidden ||
         video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
     const now = performance.now() + offset;
     const target = positionAt(now);
@@ -484,15 +527,18 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   function followTimeline() {
     clearTimeout(startTimer);
     if (!state || priming) return;
-    if (firstStartCancellation || queuedCommand?.action === 'pause' || reportBlocked || reportBuffering || outage ||
+    if (firstStartCancellation || queuedCommand?.action === 'pause' || reportBlocked || unavailableReport || outage ||
         networkError || document.hidden) {
+      audioLoss = undefined;
       pauseVideo();
       return;
     }
     if (state.startsAt === null || !state.ownsSeat || !primed || state.startConfirmed === false) {
+      audioLoss = undefined;
       pauseAndAlign(state.position);
       return;
     }
+    if (state.wantsPlay && state.ready[role] && waitForSharedAudio()) return;
     const now = performance.now() + offset;
     // The first start after a media reload can be quicker than the original gesture calibration.
     const firstAudibleStart = state.firstStartPending && !state.preview;
@@ -543,7 +589,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       const position = outage.epoch === epoch && outage.version === version ? outage.position : undefined;
       return { action: 'unavailable', reason: outage.reason, epoch, version, position };
     }
-    if (reportBuffering) return reportBuffering;
+    if (unavailableReport) return unavailableReport;
     if (state.wantsPlay && admitted && gestureFailed && !priming && !state.otherPlayer && !state.blocked.includes(role)) {
       return { action: 'blocked', epoch, version, claim: !state.ownsSeat };
     }
@@ -670,7 +716,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
         reloadAfterReconnect = false;
         outage = undefined;
       }
-      if (operation === reportBuffering) reportBuffering = undefined;
+      if (operation === unavailableReport) unavailableReport = undefined;
       if (operation === queuedCommand) {
         if (ok) unacknowledgedSeekId = undefined;
         commandMessage = ok ? '' : '播放状态已更新，请重试操作。';
@@ -713,7 +759,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
         if (networkError && operation === queuedCommand && operation.action !== 'pause') queuedCommand = undefined;
         inFlight = undefined;
         render();
-        const pendingReport = needsRecovery || queuedCommand || reportBlocked || outage || reportBuffering;
+        const pendingReport = needsRecovery || queuedCommand || reportBlocked || outage || unavailableReport;
         poll = setTimeout(synchronize, pendingReport && !networkError ? 0 : pollMs);
       }
     }
@@ -780,7 +826,11 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   async function probePlayback(attempt) {
     const startPosition = video.currentTime;
     const started = performance.now();
+    attempt.waitingForPlay = true;
     await video.play();
+    if (priming !== attempt) return;
+    attempt.waitingForPlay = false;
+    render();
     const startLeadMs = await measurePlaybackStart(attempt, startPosition, started);
     if (priming !== attempt) return;
     pauseVideo();
@@ -818,8 +868,11 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       }
       if (audio) audio.gain.gain.value = 0;
       // Give native playback the gesture before resuming the audio context.
-      const [startLeadMs] = await Promise.all([probePlayback(attempt), resumeAuthorization(attempt)]);
+      const result = Promise.all([probePlayback(attempt), resumeAuthorization(attempt)]);
+      render();
+      const [startLeadMs] = await result;
       if (priming !== attempt) return;
+      audioFailed = false;
       playbackStartLeadMs = startLeadMs;
       mediaReloaded = false;
       primed = true;
@@ -829,6 +882,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       pauseVideo();
       authorizationRetryAt = performance.now() + 1000;
       if (error.name === 'NotAllowedError') markGestureFailed();
+      else if (error.name !== 'AbortError') audioFailed = true;
     } finally {
       if (priming === attempt) {
         priming = undefined;
@@ -838,7 +892,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     }
   }
   prepare.addEventListener('click', () => {
-    if (priming?.waitingForAudio) {
+    if (!prepare.hidden && audio?.context.state === 'closed') return window.location.reload();
+    if (awaitingLocalAudio()) {
       priming = undefined;
       pauseVideo();
     }
@@ -923,8 +978,9 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
         }
       }
       if (video.getAttribute('src') === url) return;
-      if (priming) pauseVideo();
+      if (priming || pendingStart) pauseVideo();
       priming = undefined;
+      audioLoss = undefined;
       mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = pendingStart = undefined;
       hasStartedScheduledPlayback = initialReloadClosed = false;
       video.src = url;
@@ -945,12 +1001,13 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       approvalAudioRetry = undefined;
       state = undefined;
       queuedCommand = unacknowledgedSeekId = undefined;
-      reportBlocked = reportBuffering = outage = pendingStart = undefined;
+      reportBlocked = unavailableReport = outage = pendingStart = undefined;
       reloadAfterReconnect = false;
       mediaReloaded = false;
       inFlight = pendingClaimId = undefined;
       priming = undefined;
-      primed = claim = gestureFailed = networkError = audioSetupFailed = false;
+      audioLoss = undefined;
+      primed = claim = gestureFailed = networkError = audioFailed = false;
       admitted = false;
       firstStartCancellation = undefined;
       seekPreview = false;

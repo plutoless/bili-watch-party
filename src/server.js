@@ -220,7 +220,7 @@ export async function startServer({
         (['ready', 'blocked', 'play'].includes(action) && recoveryId !== undefined &&
           (body.claim !== true || !isUuid(recoveryId))) ||
         [seekId, afterSeekId].some(value => value !== undefined && !isUuid(value)) ||
-        (action === 'unavailable' && !['buffering', 'connection', 'background'].includes(reason)) ||
+        (action === 'unavailable' && !['buffering', 'connection', 'background', 'audio'].includes(reason)) ||
         (['ready', 'seek'].includes(action) && !Number.isFinite(position))) {
       throw new HttpError(400, '播放操作无效。');
     }

@@ -711,10 +711,11 @@ test('only the host directs playback and both players must acknowledge the curre
   const refreshedVersion = { epoch: afterRefresh.epoch, version: afterRefresh.version };
   const current = await send('host', 'observe').then(r => r.json());
   const interrupted = await send('visitor', 'unavailable', {
-    ...refreshedVersion, reason: 'buffering', position: 0,
+    ...refreshedVersion, reason: 'audio', position: 0,
   }).then(r => r.json());
   assert.equal(interrupted.startsAt, null);
-  assert.equal(interrupted.waiting.visitor, 'buffering');
+  assert.equal(interrupted.waiting.visitor, 'audio');
+  assert.deepEqual(interrupted.blocked, []);
   assert.ok(interrupted.position >= current.position,
     'An outlying visitor report must not rewind to the start of the room');
   assert.ok(Math.abs(interrupted.position - (current.position + 4)) < 0.00001,
