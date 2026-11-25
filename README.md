@@ -88,4 +88,4 @@ HTTP 测试用合成样本覆盖导入和重试、邀请轮换和过期、并发
 
 恢复验收在独立会话中暂扣实际 MP4 响应以验证缓冲，用浏览器离线模式并中止播放状态请求来触发掉线。覆盖连续跳转时旧就绪迟到、缓冲时暂停、房主离线时请求暂停、访客刷新和前后台切换。输出记录恢复后共同前进 0.25 秒的耗时和两端进度差，并在刷新恢复后再做一次稳定采样。若浏览器模拟无法产生原生标签页可见性变化，测试会注入 `visibilitychange` 并在输出中注明。
 
-在专用部署上，把 `BROWSER_ORIGIN` 设为部署后的 HTTPS 源地址，并向测试进程提供该环境的 `HOST_PASSWORD`，运行 `npm run test:browser`。测试会提交真实导入并结束相应房间。独立的 Compose 回环实例可设置 `WATCH_BIND_IP=127.0.0.1`、`WATCH_HTTPS_PORT=8443` 和 `PUBLIC_ORIGIN=https://localhost:8443`。如果该实例使用本地 CA，可为测试进程设 `BROWSER_LOCAL_TLS=1`，并用该 CA 单独校验 TLS。可选的 `BROWSER_DATA_DIR` 指向该部署的本地运行数据目录，供 FFprobe 和 FFmpeg 检查成品。请在仓库之外保存临时运行数据和任何测试日志。
+在专用部署上，把 `BROWSER_ORIGIN` 设为部署后的 HTTPS 源地址，并向测试进程提供该环境的 `HOST_PASSWORD`，运行 `npm run test:browser`。测试会提交真实导入并结束相应房间。 拆分部署时设置 `BROWSER_API_ORIGIN` 指向后台。测试按房间返回的媒体来源断言访问方式。受保护模式验证已批准的会话从后台取得 `Range/206`，其他会话被拒绝。R2 模式可设置 `BROWSER_MEDIA_ORIGIN` 明确要求指定的 HTTPS 媒体域，验证播放器直接使用公开地址、匿名片段返回 `206`，房间与播放控制仍需后台授权。生产生命周期、受控删除和重导入另行验收。独立的 Compose 回环实例可设置 `WATCH_BIND_IP=127.0.0.1`、`WATCH_HTTPS_PORT=8443` 和 `PUBLIC_ORIGIN=https://localhost:8443`。如果该实例使用本地 CA，可为测试进程设 `BROWSER_LOCAL_TLS=1`，并用该 CA 单独校验 TLS。受保护模式可设置 `BROWSER_DATA_DIR` 指向部署的本地运行数据目录，供 FFprobe 和 FFmpeg 检查成品。请在仓库之外保存临时运行数据和任何测试日志。

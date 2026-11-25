@@ -19,6 +19,7 @@ const ffprobe = process.env.FFPROBE_PATH ?? 'ffprobe';
 const source = 'https://www.bilibili.com/video/BV1TDyazeEuY';
 const deployedOrigin = process.env.BROWSER_ORIGIN;
 const deployedApiOrigin = process.env.BROWSER_API_ORIGIN;
+const deployedMediaOrigin = process.env.BROWSER_MEDIA_ORIGIN;
 const r2Fixture = process.env.BROWSER_R2_FIXTURE === '1';
 const fixtureTlsDir = process.env.BROWSER_R2_TLS_DIR;
 
@@ -111,8 +112,6 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const host = await hostBrowser.newContext(hostOptions);
   const visitor = await visitorBrowser.newContext(visitorOptions);
   const stranger = await visitorBrowser.newContext(visitorOptions);
-  const publicContext = storage && await hostBrowser.newContext(hostOptions);
-  const publicReader = publicContext?.request;
   if (synthetic) {
     await host.addInitScript(() => {
       const matchesInvitation = url => url === document.querySelector('#invite-url').value;
@@ -290,9 +289,30 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
       assert.equal(cookie.domain, new URL(apiOrigin).hostname);
     }
   }
-  const mediaUrl = storage
-    ? await hostPage.locator('video').evaluate(video => video.src)
-    : apiOrigin + media;
+  const roomResponse = await host.request.get(apiOrigin + '/api' + hostPath);
+  assert.equal(roomResponse.status(), 200);
+  const room = await roomResponse.json();
+  const publicMedia = room.mediaPublic === true;
+  const expectedMediaOrigin = storage?.options.publicOrigin ?? deployedMediaOrigin;
+  assert.ok(!expectedMediaOrigin || publicMedia, 'The room must publish to the expected media origin');
+  const mediaUrl = new URL(room.mediaUrl, apiOrigin).href;
+  if (publicMedia) {
+    const address = new URL(mediaUrl);
+    assert.equal(address.protocol, 'https:');
+    assert.ok(address.origin !== origin && address.origin !== apiOrigin, 'Public media must use a separate HTTPS origin');
+    if (expectedMediaOrigin) assert.equal(address.origin, expectedMediaOrigin);
+    if (ignoreHTTPSErrors) assert.ok(['localhost', '127.0.0.1'].includes(address.hostname),
+      'Test trust bypass is for isolated loopback HTTPS only');
+    assert.equal((await host.request.get(apiOrigin + media, { headers: range })).status(), 404);
+  } else {
+    assert.equal(mediaUrl, apiOrigin + media, 'Protected media must be served by the room API origin');
+  }
+  for (const page of [hostPage, visitorPage]) {
+    assert.ok(await page.locator('video').evaluate((video, url) => video.src === url, mediaUrl));
+    if (publicMedia) assert.equal(await page.locator('video').getAttribute('crossorigin'), 'anonymous');
+  }
+  const publicContext = publicMedia && await hostBrowser.newContext(hostOptions);
+  const publicReader = publicContext?.request;
   if (apiOrigin !== origin) {
     const denied = await host.request.get(apiOrigin + '/api/session', {
       headers: { Origin: 'https://other.example.org' },
@@ -300,7 +320,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     assert.equal(denied.status(), 403);
     assert.equal(denied.headers()['access-control-allow-origin'], undefined);
   }
-  if (apiOrigin !== origin && !storage) {
+  if (apiOrigin !== origin && !publicMedia) {
     for (const page of [hostPage, visitorPage]) {
       const { status, contentRange, cacheControl, size } = await page.evaluate(async url => {
         const response = await fetch(url, { credentials: 'include', headers: { Range: 'bytes=0-1023' } });
@@ -318,17 +338,20 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     }
     console.log('Split HTTPS: allowlisted browser sessions received private 206 media; foreign Origin denied.');
   }
-  for (const reader of storage ? [publicReader] : [host.request, visitor.request]) {
-    const head = await reader.head(mediaUrl);
+  const mediaHeaders = publicMedia ? { Origin: origin } : {};
+  for (const reader of publicMedia ? [publicReader] : [host.request, visitor.request]) {
+    const head = await reader.head(mediaUrl, { headers: mediaHeaders, maxRedirects: 0 });
     assert.equal(head.status(), 200);
     assert.equal(head.headers()['accept-ranges'], 'bytes');
-    const first = await reader.get(mediaUrl, { headers: range });
+    const first = await reader.get(mediaUrl, { headers: { ...mediaHeaders, ...range }, maxRedirects: 0 });
     assert.equal(first.status(), 206);
+    if (publicMedia) assert.ok([origin, '*'].includes(first.headers()['access-control-allow-origin']),
+      'Anonymous Range must allow the web origin');
     assert.equal(first.headers()['content-type'], 'video/mp4');
     assert.equal(first.headers()['accept-ranges'], 'bytes');
     assert.match(first.headers()['content-range'], /^bytes 0-1023\/\d+$/);
     assert.equal((await first.body()).length, 1024);
-    const last = await reader.get(mediaUrl, { headers: { Range: 'bytes=-128' } });
+    const last = await reader.get(mediaUrl, { headers: { ...mediaHeaders, Range: 'bytes=-128' }, maxRedirects: 0 });
     assert.equal(last.status(), 206);
     assert.equal((await last.body()).length, 128);
   }
@@ -341,25 +364,27 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   assert.equal(await strangerPage.locator('video').getAttribute('src'), null);
 
   await checkSharedPlayback({
-    hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia: Boolean(storage),
+    hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia,
   });
-  if (checkFile && mediaDir) {
+  if (checkFile && mediaDir && (!publicMedia || storage)) {
     const path = storage ? join(mediaDir, 'public-object.mp4') : join(mediaDir, 'media', media.split('/').at(-1));
     if (storage) await writeFile(path, storage.objects.get(new URL(mediaUrl).pathname).body);
     await checkMediaFile(path);
   }
 
   let finalMedia = mediaUrl;
+  if (publicMedia) {
+    for (const page of [hostPage, visitorPage]) {
+      assert.ok(await page.locator('video').evaluate((video, url) => video.currentSrc === url, mediaUrl));
+    }
+    await checkPlaybackReconnect(hostPage, visitorPage);
+    console.log('Direct public media: both players loaded the media origin, anonymous Range returned 206, and room controls remained protected.');
+  }
   if (storage) {
-    assert.equal(new URL(mediaUrl).origin, storage.options.publicOrigin);
-    assert.equal(await visitorPage.locator('video').evaluate(video => video.currentSrc), mediaUrl);
-    assert.equal(await visitorPage.locator('video').getAttribute('crossorigin'), 'anonymous');
     assert.ok(storage.ranges.some(read => read.path === new URL(mediaUrl).pathname &&
       read.origin === origin && /Mozilla/.test(read.userAgent) && read.end > read.start),
     'The mobile video element must receive a 206 from the public media origin');
     assert.equal(storage.writes, writesBefore + 1);
-    assert.equal((await host.request.get(apiOrigin + media, { headers: range })).status(), 404);
-    await checkPlaybackReconnect(hostPage, visitorPage);
     storage.remove(mediaUrl);
     assert.equal((await publicReader.get(mediaUrl, { headers: range })).status(), 404);
     for (const page of [hostPage, visitorPage]) {
@@ -400,9 +425,9 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   assert.equal(await visitorPage.locator('video').getAttribute('src'), null);
   assert.equal((await host.request.get(apiOrigin + media, { headers: range })).status(), 410);
   assert.equal((await visitor.request.get(apiOrigin + media, { headers: range })).status(), 401);
-  if (storage) {
+  if (publicMedia) {
     assert.equal((await publicReader.get(finalMedia, { headers: range })).status(), 206);
-    storage.remove(finalMedia);
+    storage?.remove(finalMedia);
   }
   await strangerPage.goto(invitation);
   await watchStatus(strangerPage, 'ended').waitFor();
@@ -430,9 +455,12 @@ try {
   assert.ok(!synthetic || !deployedOrigin, 'Synthetic video requires the standalone test server');
   assert.ok(!splitFixture || (!deployedOrigin && (synthetic || r2Fixture)),
     'The isolated split fixture requires a local app and SYNTHETIC_VIDEO=1 or BROWSER_R2_FIXTURE=1');
-  assert.ok(!deployedApiOrigin || deployedOrigin, 'BROWSER_API_ORIGIN requires BROWSER_ORIGIN');
+  assert.ok(!(deployedApiOrigin || deployedMediaOrigin) || deployedOrigin,
+    'BROWSER_API_ORIGIN and BROWSER_MEDIA_ORIGIN require BROWSER_ORIGIN');
   if (deployedOrigin) {
-    for (const origin of [deployedOrigin, deployedApiOrigin ?? deployedOrigin]) {
+    const origins = [deployedOrigin, deployedApiOrigin ?? deployedOrigin];
+    if (deployedMediaOrigin) origins.push(deployedMediaOrigin);
+    for (const origin of origins) {
       assert.equal(new URL(origin).protocol, 'https:', 'Deployed browser run requires HTTPS');
       assert.equal(new URL(origin).origin, origin, 'Use an origin without a trailing slash');
       if (ignoreHTTPSErrors) {
