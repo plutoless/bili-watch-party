@@ -2,7 +2,7 @@
   "name": "bili-watch-party",
   "version": "1.0.0",
   "scripts": {
-    "test": "node --test test/host.test.js test/player.test.js test/browser-failure.test.js",
+    "test": "node --test test/host.test.js test/player.test.js test/browser-failure.test.js test/native-range-observer.test.js",
     "start": "node src/server.js",
     "build:web": "node scripts/build-web.js",
     "test:browser": "node test/live-browser.js",

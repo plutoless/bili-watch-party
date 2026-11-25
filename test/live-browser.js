@@ -10,6 +10,7 @@ import { createImporter, ImportError } from '../src/importer.js';
 import { createR2Media } from '../src/r2-media.js';
 import { startServer } from '../src/server.js';
 import { formatBrowserFailure } from './browser-failure.js';
+import { observeNativeRanges } from './native-range-observer.js';
 import { checkPlaybackReconnect, checkSharedPlayback } from './playback-browser.js';
 import { startR2Fixture } from './r2-fixture.js';
 import { createLoopbackTls, readLoopbackTls, startSplitFixture } from './split-browser-fixture.js';
@@ -136,15 +137,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const hostPage = await host.newPage();
   const visitorPage = await visitor.newPage();
   const strangerPage = await stranger.newPage();
-  const mediaRanges = new Map([hostPage, visitorPage].map(page => [page, new Set()]));
-  for (const [page, requested] of mediaRanges) {
-    page.on('response', async response => {
-      if (response.status() === 206 && response.request().resourceType() === 'media' &&
-          new URL(response.url()).origin === apiOrigin) {
-        requested.add(await response.headerValue('content-range'));
-      }
-    });
-  }
+  const mediaRanges = [hostPage, visitorPage].map(page => observeNativeRanges(page, apiOrigin));
   const inviteLink = hostPage.getByLabel('邀请链接');
   const generate = hostPage.getByRole('button', { name: '生成邀请', exact: true });
   const manage = hostPage.getByText('管理房间', { exact: true });
@@ -386,8 +379,8 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia,
   });
   if (synthetic && !publicMedia) {
-    for (const ranges of mediaRanges.values()) {
-      assert.ok([...ranges].some(range => /^bytes \d+-\d+\/\d+$/.test(range)),
+    for (const hasNativeRange of mediaRanges) {
+      assert.ok(await hasNativeRange(mediaUrl),
         'Each native video must receive an authorized byte-range response');
     }
     console.log('Both native media elements received authorized 206 responses.');
