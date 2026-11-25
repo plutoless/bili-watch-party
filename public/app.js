@@ -154,7 +154,7 @@ function render(room) {
   if (visitor || room.occupied) player.admit();
   if (room.mediaUrl) {
     fullscreen ??= createPageFullscreen();
-    player.load(room.mediaUrl);
+    player.load(room.mediaUrl, { prepareApproval: !visitor && !room.occupied && room.requests.length > 0 });
   }
   if (!visitor) {
     if (rememberRoom) {

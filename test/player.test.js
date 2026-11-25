@@ -8,9 +8,10 @@ import { createPlayback } from '../src/playback.js';
 
 const playerSource = readFileSync(new URL('../public/player.js', import.meta.url), 'utf8')
   .replaceAll('export function ', 'function ')
-  .replace('    load(url) {', '    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(url) {');
+  .replace('    authorizeApproval() {', '    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    authorizeApproval() {');
 
-function roomFixture({ automatic = false, blocked = [], duration = 120 } = {}) {
+function roomFixture({ automatic = false, blocked = [], duration = 120,
+  audioStage = () => {}, suspendHostAudio = false } = {}) {
   const room = createPlayback(duration);
   const timers = new Set();
   const saved = { host: new Map(), visitor: new Map() };
@@ -124,10 +125,21 @@ function roomFixture({ automatic = false, blocked = [], duration = 120 } = {}) {
       performance: { now: () => now },
       AbortController, AbortSignal, DOMException,
       AudioContext: class {
-        state = 'running';
-        createGain() { return { gain, connect() {} }; }
-        createMediaElementSource() { return { connect: node => node }; }
-        resume() { return Promise.resolve(); }
+        state = role === 'host' && suspendHostAudio ? 'suspended' : 'running';
+        constructor() { audioStage(role, 'context'); }
+        createGain() {
+          audioStage(role, 'gain');
+          return { gain, connect() { audioStage(role, 'gain connection'); } };
+        }
+        createMediaElementSource() {
+          audioStage(role, 'media source');
+          return { connect: node => { audioStage(role, 'media connection'); return node; } };
+        }
+        resume() {
+          audioStage(role, 'resume');
+          this.state = 'running';
+          return Promise.resolve();
+        }
       },
       setTimeout: schedule,
       setInterval: (fn, delay) => schedule(fn, delay, true),
@@ -250,6 +262,51 @@ function roomFixture({ automatic = false, blocked = [], duration = 120 } = {}) {
     snapshot() { return room.update({ role: 'host', action: 'observe', playerId: randomUUID() }, now).state; },
   };
 }
+
+test('approval reuses the native click even when audio setup consumes 5095 ms', async t => {
+  for (const slow of ['context', 'gain', 'media source', 'media connection', 'gain connection', 'resume']) {
+    await t.test(slow, () => {
+      let clock = 0;
+      let activationExpires = 0;
+      const events = [];
+      const app = roomFixture({
+        suspendHostAudio: true,
+        audioStage(role, stage) {
+          if (role !== 'host') return;
+          events.push({ stage, at: clock });
+          if (stage === slow) clock += 5095;
+        },
+      });
+      const { player, video, gain, gainWrites } = app.host;
+      const nativePlay = video.play;
+      video.play = function () {
+        events.push({ stage: 'play', at: clock, active: clock < activationExpires,
+          originalElement: this === video, muted: Boolean(video.muted), gain: gain.value });
+        return nativePlay.call(this);
+      };
+
+      // The room has displayed the ready media snapshot before delivering the click.
+      player.load('/media/synthetic.mp4', { prepareApproval: true });
+      player.load('/media/synthetic.mp4', { prepareApproval: true });
+      assert.equal(video.paused, true);
+      assert.ok(events.every(({ stage }) => stage !== 'play' && stage !== 'resume'));
+      const started = clock;
+      activationExpires = started + 5000;
+      player.authorizeApproval();
+      events.push({ stage: 'approval request', at: clock });
+      app.approve();
+
+      const play = events.find(({ stage }) => stage === 'play');
+      assert.deepEqual(play, { stage: 'play', at: started, active: true,
+        originalElement: true, muted: false, gain: 0 }, JSON.stringify(events));
+      assert.deepEqual(events.filter(({ at, stage }) => at >= started && ['play', 'resume', 'approval request'].includes(stage))
+        .map(({ stage }) => stage), ['play', 'resume', 'approval request']);
+      assert.equal(events.find(({ stage }) => stage === 'resume').at, started);
+      assert.equal(events.filter(({ stage }) => stage === 'context').length, 1);
+      assert.ok(gainWrites.length > 0 && gainWrites.every(value => value === 0));
+    });
+  }
+});
 
 for (const blocked of [[], ['host'], ['visitor'], ['host', 'visitor']]) {
   test('first start keeps probes silent and prompts only blocked seats (' + (blocked.join(', ') || 'none') + ')', async () => {

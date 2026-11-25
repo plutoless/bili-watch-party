@@ -270,16 +270,17 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     pauseVideo();
   }
 
-  function prepareAudio() {
-    if (!audio) {
-      const context = new AudioContext();
-      const gain = context.createGain();
-      gain.gain.value = 0;
-      context.createMediaElementSource(video).connect(gain).connect(context.destination);
-      audio = { context, gain };
-      context.addEventListener?.('statechange', wake);
-    }
-    if (audio.context.state !== 'running') audio.context.resume().catch(() => {});
+  function createAudioGraph() {
+    const context = new AudioContext();
+    const gain = context.createGain();
+    gain.gain.value = 0;
+    context.createMediaElementSource(video).connect(gain).connect(context.destination);
+    audio = { context, gain };
+    context.addEventListener?.('statechange', wake);
+  }
+
+  function resumeAudio() {
+    if (audio && audio.context.state !== 'running') audio.context.resume().catch(() => {});
   }
 
   async function measurePlaybackStart(generation, startPosition, started) {
@@ -395,7 +396,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const attempt = { action: 'blocked', epoch, version };
     pendingStart = attempt;
     mediaReloaded = false;
-    if (audio) prepareAudio();
+    resumeAudio();
     video.play().then(() => {
       if (pendingStart !== attempt) return;
       if (audio?.context.state === 'suspended') {
@@ -760,10 +761,17 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     render();
     try {
       // Keep the unmuted element subject to the browser's policy while the gain silences the probe.
-      if (admitted || withGesture) prepareAudio();
+      if (!audio && (admitted || withGesture)) createAudioGraph();
+      if (audio) audio.gain.gain.value = 0;
       const startPosition = video.currentTime;
       const started = performance.now();
-      await video.play();
+      // Give native playback the gesture before resuming the audio context.
+      const playing = video.play();
+      try {
+        resumeAudio();
+      } finally {
+        await playing;
+      }
       const startLeadMs = await measurePlaybackStart(generation, startPosition, started);
       if (generation !== loadGeneration || intent !== prepareIntent) return;
       if (audio?.context.state === 'suspended') throw new DOMException('Audio output suspended', 'NotAllowedError');
@@ -852,10 +860,18 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       admitted = true;
     },
     authorizeApproval() {
-      authorize(true);
+      if (audio) authorize(true);
     },
     cancelPendingStart,
-    load(url) {
+    load(url, { prepareApproval = false } = {}) {
+      if (prepareApproval && !audio) {
+        // Connect the silent graph when applying the room snapshot, before the approval gesture.
+        try {
+          createAudioGraph();
+        } catch {
+          // If setup is unavailable, use the normal authorization path after approval.
+        }
+      }
       url = apiOrigin + url;
       if (video.getAttribute('src') === url) return;
       mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = pendingStart = undefined;
