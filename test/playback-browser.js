@@ -97,31 +97,72 @@ async function waitForPlaying(page, after) {
 
 async function checkDriftCorrection(visitorPage, getTimeline, publicMedia) {
   const video = visitorPage.locator('video');
-  async function waitFor(predicate, expected) {
-    await visitorPage.waitForFunction(predicate, undefined, { timeout: 10_000 }).catch(async () => {
+  async function waitFor(predicate, expected, value) {
+    await visitorPage.waitForFunction(predicate, value, { timeout: 10_000 }).catch(async () => {
       const observed = await video.evaluate(video => ({
         rate: video.playbackRate, seeks: Number(video.dataset.seeks), paused: video.paused,
-        seeking: video.seeking, readyState: video.readyState,
+        seeking: video.seeking, readyState: video.readyState, publicDrift: video.dataset.publicDrift,
       }));
       assert.fail(expected + ', observed ' + JSON.stringify(observed));
     });
   }
-  const sent = performance.now();
-  const { startsAt, position, serverTime } = await getTimeline();
-  const received = performance.now();
-  assert.ok(startsAt !== null, 'An active timeline is required for the drift probe');
-  const projected = position + (serverTime - startsAt + (received - sent) / 2) / 1000;
+  async function projectTimeline() {
+    const sent = performance.now();
+    const { startsAt, position, serverTime } = await getTimeline();
+    const received = performance.now();
+    assert.ok(startsAt !== null, 'An active timeline is required for the drift probe');
+    return position + (serverTime - startsAt + (received - sent) / 2) / 1000;
+  }
+  const projected = await projectTimeline();
   await video.evaluate((video, { projected, publicMedia }) => {
     video.dataset.seeks = '0';
     video.addEventListener('seeking', () => { video.dataset.seeks = Number(video.dataset.seeks) + 1; });
-    video.currentTime = projected + (publicMedia ? 1.4 : 0.70);
+    if (publicMedia) {
+      video.dataset.nonNeutralRate = 'false';
+      video.addEventListener('ratechange', () => {
+        if (video.playbackRate !== 1) video.dataset.nonNeutralRate = 'true';
+      });
+      // The room keeps moving during the native seek, leaving about 0.70 s of lag.
+      const started = performance.now();
+      const samples = [];
+      const timer = setInterval(() => {
+        const elapsed = performance.now() - started;
+        if (!video.seeking && !video.paused && Number(video.dataset.seeks) === 1) {
+          samples.push(Number((projected + elapsed / 1000 - video.currentTime).toFixed(3)));
+        }
+        if (elapsed >= 1000 || Number(video.dataset.seeks) > 1) {
+          clearInterval(timer);
+          video.dataset.publicDrift = JSON.stringify(samples);
+        }
+      }, 50);
+      video.currentTime = projected - 0.60;
+    } else {
+      video.currentTime = projected + 0.70;
+    }
   }, { projected, publicMedia });
   if (publicMedia) {
-    await waitFor(() => Number(document.querySelector('video').dataset.seeks) === 2,
-      'Expected one corrective seek for public media');
+    const seekCount = () => Number(document.querySelector('video').dataset.seeks);
+    await waitFor(expected => Number(document.querySelector('video').dataset.seeks) === expected,
+      'Expected one corrective seek for sustained moderate public drift', 2);
+    await visitorPage.waitForFunction(() => {
+      const video = document.querySelector('video');
+      return !video.seeking && !video.paused;
+    });
+    const target = await projectTimeline();
+    const position = await video.evaluate(video => video.currentTime);
+    const delta = Math.abs(target - position);
+    assert.ok(delta < 0.5, 'Moderate public correction must converge below 0.5 s, observed ' + delta.toFixed(3) + ' s');
+    await delay(1650);
+    assert.equal(await visitorPage.evaluate(seekCount), 2, 'Settled public drift must not repeat the seek');
+    const hardTarget = await projectTimeline();
+    await video.evaluate((video, target) => { video.currentTime = target + 1.4; }, hardTarget);
+    await waitFor(expected => Number(document.querySelector('video').dataset.seeks) === expected,
+      'Expected one corrective seek for large public drift', 4);
     await visitorPage.waitForFunction(() => !document.querySelector('video').seeking);
     assert.equal(await video.evaluate(video => video.playbackRate), 1);
-    console.log('Public media drift: a 1.4 s offset recovered with one corrective seek at normal playback rate.');
+    assert.equal(await video.getAttribute('data-non-neutral-rate'), 'false');
+    console.log('Public media drift: moderate probe ' + await video.getAttribute('data-public-drift') +
+      ' s, residual ' + delta.toFixed(3) + ' s. Moderate and large offsets recovered at 1x.');
     return;
   }
   await waitFor(() => document.querySelector('video').playbackRate !== 1, 'Expected rate correction for moderate drift');

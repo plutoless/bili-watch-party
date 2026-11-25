@@ -74,7 +74,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let offset = 0;
   let clockRtt = 0;
   let hardDriftSamples = 0;
-  let rateDriftSamples = 0;
+  let sustainedDriftSamples = 0;
   let nextHardSeek = 0;
   let driftSeekStarted;
   let driftSeekLeadMs = initialDriftSeekLeadMs;
@@ -296,7 +296,10 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   function correctDrift() {
     if (state?.startsAt == null || !state.ownsSeat || !primed || priming ||
         networkError || outage || reportBlocked || reportBuffering || document.hidden ||
-        video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
+        video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) {
+      if (!useRateCorrection) sustainedDriftSamples = 0;
+      return;
+    }
     const now = performance.now() + offset;
     const target = positionAt(now);
     if (now < state.startsAt || !Number.isFinite(target) || target >= video.duration) return;
@@ -310,20 +313,22 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     const correctionStart = Math.max(0.04, Math.min(rateDriftLimit, driftBudgetSeconds - clockRtt / 2000));
     const correctionStop = Math.min(rateDriftSettled, correctionStart * 0.6);
     const direction = Math.sign(drift);
-    rateDriftSamples = distance <= correctionStart ? 0
-      : (Math.sign(rateDriftSamples) === direction ? rateDriftSamples : 0) + direction;
-    if ((distance > 1.25 || hardDriftSamples >= 2) && now >= nextHardSeek) {
+    const threshold = useRateCorrection ? correctionStart : 0.5;
+    sustainedDriftSamples = distance <= threshold ? 0
+      : (Math.sign(sustainedDriftSamples) === direction ? sustainedDriftSamples : 0) + direction;
+    const sustainedPublicDrift = !useRateCorrection && Math.abs(sustainedDriftSamples) >= 4;
+    if ((distance > 1.25 || hardDriftSamples >= 2 || sustainedPublicDrift) && now >= nextHardSeek) {
       // Allow for the time spent decoding the destination while the room keeps playing.
       driftSeekStarted = performance.now();
       video.currentTime = positionAt(now + driftSeekLeadMs);
       setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
-      rateDriftSamples = 0;
-    } else if (useRateCorrection && video.playbackRate === 1 && Math.abs(rateDriftSamples) >= 4) {
+      sustainedDriftSamples = 0;
+    } else if (useRateCorrection && video.playbackRate === 1 && Math.abs(sustainedDriftSamples) >= 4) {
       setRate(1 + direction * 0.10);
     } else if (video.playbackRate !== 1 && (distance <= correctionStop || drift * (video.playbackRate - 1) < 0)) {
-      rateDriftSamples = 0;
+      sustainedDriftSamples = 0;
       setRate(1);
     }
   }
@@ -530,7 +535,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
           ? timeline : undefined;
         pendingStart = undefined;
         hardDriftSamples = 0;
-        rateDriftSamples = 0;
+        sustainedDriftSamples = 0;
         nextHardSeek = 0;
         driftSeekStarted = undefined;
       }
