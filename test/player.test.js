@@ -1020,6 +1020,37 @@ test('v3 buffering recovery waits for an in-flight Ready acknowledgment', async 
   assert.equal(app.snapshot().ready.host, true);
 });
 
+for (const direction of [-1, 1]) {
+  test('public media corrects opposing 0.31 second errors at 1x with the host ' +
+      (direction > 0 ? 'ahead' : 'behind'), async t => {
+    const app = roomFixture({ publicMedia: true });
+    await app.start();
+    const { host, visitor } = app;
+    const gap = () => Math.abs(host.video.currentTime - visitor.video.currentTime);
+    host.video.currentTime += direction * 0.31;
+    visitor.video.currentTime -= direction * 0.31;
+    assert.ok(Math.abs(gap() - 0.62) < 0.001);
+    const initialSeeks = [host.seeks.length, visitor.seeks.length];
+
+    await app.advance(1500);
+    const samples = [];
+    for (let i = 0; i < 100; i++) {
+      samples.push(gap());
+      for (const player of [host, visitor]) {
+        assert.equal(player.video.playbackRate, 1);
+        assert.equal(player.video.paused, false);
+      }
+      await app.advance(100);
+    }
+    const clear = samples.filter(value => value < 0.5).length;
+    const result = clear + '/100 below 0.5 s, max ' + Math.max(...samples).toFixed(3) + ' s';
+    t.diagnostic(result);
+    assert.ok(clear >= 95, result);
+    assert.deepEqual([host.seeks.length, visitor.seeks.length],
+      initialSeeks.map(seeks => seeks + 1), 'Neither player repeats a settled correction');
+  });
+}
+
 test('public media corrects sustained moderate drift in either direction at 1x', async () => {
   const app = roomFixture({ publicMedia: true });
   await app.start();

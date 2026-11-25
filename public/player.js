@@ -313,7 +313,8 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     const correctionStart = Math.max(0.04, Math.min(rateDriftLimit, driftBudgetSeconds - clockRtt / 2000));
     const correctionStop = Math.min(rateDriftSettled, correctionStart * 0.6);
     const direction = Math.sign(drift);
-    const threshold = useRateCorrection ? correctionStart : 0.5;
+    // Two public players each need room within the shared 0.5 s alignment budget.
+    const threshold = useRateCorrection ? correctionStart : 0.24;
     sustainedDriftSamples = distance <= threshold ? 0
       : (Math.sign(sustainedDriftSamples) === direction ? sustainedDriftSamples : 0) + direction;
     const sustainedPublicDrift = !useRateCorrection && Math.abs(sustainedDriftSamples) >= 4;
