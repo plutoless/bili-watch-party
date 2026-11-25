@@ -5,7 +5,7 @@ const initialFirstStartLeadMs = 5600;
 const maximumFirstStartLeadMs = 12000;
 const playerLeaseMs = 4_000;
 const progressLeaseMs = 650;
-const previewProgressLeaseMs = 2200;
+const firstStartProgressLeaseMs = 2200;
 // A client may still be waiting on its pre-release reply. Allow two request timeouts plus a poll.
 const releaseDeliveryMs = 4400;
 const minimumPreviewDuration = 1;
@@ -238,7 +238,7 @@ export function createPlayback(duration = Infinity) {
       }
       const advancing = Object.fromEntries(roles.map(seat => {
         const progress = players[seat]?.progress;
-        const lease = firstStart === 'preview' ? previewProgressLeaseMs : progressLeaseMs;
+        const lease = firstStartPending() ? firstStartProgressLeaseMs : progressLeaseMs;
         return [seat, startsAt !== null && progress?.version === version && now - progress.advancedAt <= lease];
       }));
       const playbackGap = advancing.host && advancing.visitor

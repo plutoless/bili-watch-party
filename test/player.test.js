@@ -10,8 +10,8 @@ const playerSource = readFileSync(new URL('../public/player.js', import.meta.url
   .replaceAll('export function ', 'function ')
   .replace('    load(url) {', '    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(url) {');
 
-function roomFixture({ automatic = false, blocked = [] } = {}) {
-  const room = createPlayback(120);
+function roomFixture({ automatic = false, blocked = [], duration = 120 } = {}) {
+  const room = createPlayback(duration);
   const timers = new Set();
   const saved = { host: new Map(), visitor: new Map() };
   let now = 1000;
@@ -70,7 +70,7 @@ function roomFixture({ automatic = false, blocked = [] } = {}) {
     let updatedAt = now;
     let rate = 1;
     Object.assign(video, {
-      duration: 120, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
+      duration, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
       readyState: 4, seeking: false, paused: true, src: '',
       hasAttribute() { return Boolean(this.src); },
       getAttribute() { return this.src; },
@@ -88,9 +88,10 @@ function roomFixture({ automatic = false, blocked = [] } = {}) {
     });
     Object.defineProperties(video, {
       currentTime: {
-        get: () => position + (video.paused || video.stuck ? 0 : (now - updatedAt) * rate / 1000),
+        get: () => Math.min(duration, position + (video.paused || video.stuck ? 0 : (now - updatedAt) * rate / 1000)),
         set: seconds => { if (!video.stuck) { position = seconds; updatedAt = now; } },
       },
+      ended: { get: () => video.currentTime >= duration },
       playbackRate: {
         get: () => rate,
         set: next => { video.currentTime = video.currentTime; rate = next; },
@@ -103,9 +104,15 @@ function roomFixture({ automatic = false, blocked = [] } = {}) {
       return elements.get(id);
     };
     const gainWrites = [];
+    const audibleStarts = [];
     const gain = {
       get value() { return gainWrites.at(-1) ?? 0; },
-      set value(value) { gainWrites.push(value); },
+      set value(value) {
+        if (value > 0 && !this.value && !video.paused && !video.ended && !video.stuck) {
+          audibleStarts.push({ at: now, position: video.currentTime });
+        }
+        gainWrites.push(value);
+      },
     };
     const context = {
       document: Object.assign(new EventTarget(), { getElementById: element, hidden: false }),
@@ -197,7 +204,7 @@ function roomFixture({ automatic = false, blocked = [] } = {}) {
     });
     player.load('/media/synthetic.mp4');
     if (automatic) player.admit();
-    return { player, video, element, gain, gainWrites, allowPlayback() {
+    return { player, video, element, gain, gainWrites, audibleStarts, allowPlayback() {
       grants.add(role);
       element('prepare').dispatchEvent(new Event('click'));
     } };
@@ -291,22 +298,43 @@ test('a visitor stuck at the opening keeps both outputs silent and exposes the w
 test('both outputs remain silent when the visitor stalls only after each rewind', async () => {
   const app = roomFixture({ automatic: true });
   app.approve();
-  let attempts = 0;
-  let lastDeadline;
-  for (let step = 0; step < 450 && attempts < 3; step++) {
+  const deadlines = [];
+  for (let step = 0; step < 450 && deadlines.length < 3; step++) {
     await app.advance(100);
     const state = app.snapshot();
     if (state.preview) app.visitor.video.stuck = false;
-    if (state.awaitingStart && state.startConfirmed && state.startsAt !== lastDeadline) {
-      lastDeadline = state.startsAt;
+    if (state.awaitingStart && state.startConfirmed && state.startsAt !== deadlines.at(-1)) {
+      deadlines.push(state.startsAt);
       app.visitor.video.stuck = true;
-      attempts++;
     }
   }
-  assert.equal(attempts, 3, 'Both previews must succeed before each stalled audible attempt');
-  await app.advance(800);
-  assert.equal(app.host.gainWrites.includes(1), false);
-  assert.equal(app.visitor.gainWrites.includes(1), false);
+  assert.equal(deadlines.length, 3, 'Both previews must succeed before each stalled audible attempt');
+  await app.advance(deadlines.at(-1) - app.now() + 900);
+  const observation = JSON.stringify({
+    deadlines, checkedAt: app.now(), host: app.host.audibleStarts, visitor: app.visitor.audibleStarts,
+  });
+  assert.equal(app.host.gainWrites.includes(1), false, observation);
+  assert.equal(app.visitor.gainWrites.includes(1), false, observation);
+});
+
+const openingAudioPending = { todo: process.env.BWP_REQUIRE_OPENING_AUDIO !== '1'
+  && 'The live gain gate cannot replay samples consumed before paired movement proof' };
+
+test('both peers hear the opening from the shared start position', openingAudioPending, async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  const openings = [app.host.audibleStarts[0], app.visitor.audibleStarts[0]];
+  assert.ok(openings.every(opening => opening && opening.position <= 0.01), JSON.stringify(openings));
+});
+
+test('a healthy 150 ms clip produces audio before both peers finish', openingAudioPending, async () => {
+  const app = roomFixture({ automatic: true, duration: 0.15 });
+  app.approve();
+  await app.advance(11500);
+  assert.equal(app.snapshot().ended, true);
+  const openings = [app.host.audibleStarts[0], app.visitor.audibleStarts[0]];
+  assert.ok(openings.every(Boolean), JSON.stringify(openings));
 });
 
 test('a healthy silent preview survives staggered progress responses 800 ms apart', () => {
@@ -396,13 +424,14 @@ test('first start waits for both acknowledgments before releasing audio', () => 
   const started = agree('host', deadline, deadline);
   assert.equal(started.firstStartPending, true);
   assert.equal(started.position, 0);
-  for (const role of ['host', 'visitor']) {
-    update(role, 'observe', deadline + 100, { ...realTarget, position: 0.1, playing: true });
-  }
-  const delayed = update('host', 'observe', deadline + 1100, { ...realTarget, position: 1.1, playing: true });
-  assert.equal(delayed.startsAt, deadline, 'A late report does not prove that the visitor stalled');
-  const active = update('visitor', 'observe', deadline + 1400, { ...realTarget, position: 1.4, playing: true });
-  assert.equal(active.firstStartPending, false);
+  const progressAt = (role, elapsed) => update(role, 'observe', deadline + elapsed,
+    { ...realTarget, position: elapsed / 1000, playing: true });
+  const host = progressAt('host', 100);
+  assert.equal(host.firstStartPending, true);
+  const visitor = progressAt('visitor', 900);
+  assert.equal(visitor.startsAt, deadline, 'A late report does not prove that the host stalled');
+  assert.equal(visitor.firstStartPending, false, 'Healthy peers with reports 800 ms apart can release audio');
+  assert.equal(visitor.synchronized, true);
 });
 
 function shortFirstStartFixture() {
