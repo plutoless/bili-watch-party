@@ -4,6 +4,7 @@ import { chmodSync, copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 test('production release on isolated Git, SSH, Compose and Vercel command boundaries', t => {
   const dir = mkdtempSync(join(tmpdir(), 'watch-release-test-'));
@@ -45,13 +46,14 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   const sshHost = 'ssh.fixture.test';
   const env = {
     ...process.env, PATH: bin + ':' + process.env.PATH, FIXTURE_STATE: stateFile, FIXTURE_REMOTE_HOME: home,
+    FIXTURE_NODE_MODULES: fileURLToPath(new URL('../node_modules', import.meta.url)),
     DEPLOY_SSH_HOST: sshHost, DEPLOY_SSH_USER: 'fixture', DEPLOY_SSH_KEY: 'synthetic-ssh-key',
     DEPLOY_SSH_KNOWN_HOSTS: sshHost + ' ' + hostKey, DEPLOY_SSH_PORT: '',
     API_ORIGIN: 'https://api.fixture.test', WEB_ORIGIN: 'https://web.fixture.test',
     VERCEL_ORG_ID: 'team_fixture', VERCEL_PROJECT_ID: 'prj_fixture', VERCEL_TOKEN: 'synthetic-vercel-token',
     VERCEL_AUTOMATION_BYPASS_SECRET: '',
   };
-  writeFileSync(stateFile, JSON.stringify({ pages: {} }));
+  writeFileSync(stateFile, JSON.stringify({ pages: {}, players: {} }));
   const readState = () => JSON.parse(readFileSync(stateFile, 'utf8'));
   function release(sha, failure, expected, variables = {}) {
     writeFileSync(stateFile, JSON.stringify({ ...readState(), stages: [], failure }));
@@ -69,8 +71,10 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   assert.deepEqual(release(first, 'host-key', /主机密钥校验失败/).stages, ['ssh-offline']);
   assert.deepEqual(release(first, 'ssh-offline', /SSH 不可达/).stages, ['ssh-offline']);
   assert.deepEqual(release(first, 'web-build', /网页构建失败/).stages, ['ssh-offline', 'web-build']);
+  assert.equal(release(first, 'missing-player-build', /产物缺少播放器脚本/).backend, undefined);
   assert.equal(release(first, 'stage-web', /候选网页部署失败/).backend, undefined);
   assert.equal(release(first, 'stage-https', /候选网页 HTTPS/).backend, undefined);
+  assert.equal(release(first, 'stage-player', /候选网页 HTTPS/).backend, undefined);
   assert.equal(release(first, 'candidate-project', /候选网页不属于配置的项目/).backend, undefined);
   assert.equal(release(first, 'backend-build', /镜像构建或拉取失败/).backend, undefined);
   assert.equal(release(first, 'compose-up', /Compose 启动或健康检查失败/).liveId, undefined);

@@ -24,3 +24,4 @@ await writeFile(new URL('index.html', output), page);
 for (const file of ['app.js', 'player.js', 'style.css']) {
   await copyFile(new URL(file, source), new URL(file, output));
 }
+await copyFile(new URL(import.meta.resolve('xgplayer')), new URL('xgplayer.js', output));

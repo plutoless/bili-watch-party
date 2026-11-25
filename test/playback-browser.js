@@ -95,6 +95,122 @@ async function waitForPlaying(page, after) {
   });
 }
 
+async function checkFullscreen(page, visitorPage) {
+  const host = Boolean(visitorPage);
+  const portrait = page.viewportSize();
+  const screen = page.locator('#player-screen');
+  const enter = page.getByRole('button', { name: '网页全屏', exact: true });
+  const exit = page.getByRole('button', { name: '退出全屏', exact: true });
+  const actions = page.locator('#playback-actions');
+  const tapVideo = () => screen.tap({ position: { x: 50, y: 30 } });
+  await enter.tap({ timeout: 5000 });
+  for (const viewport of [portrait, { width: portrait.height, height: portrait.width }]) {
+    await page.setViewportSize(viewport);
+    await tapVideo();
+    await exit.waitFor();
+    const frame = await page.locator('#player').boundingBox();
+    assert.ok(Math.abs(frame.width - viewport.width) < 2 && Math.abs(frame.height - viewport.height) < 2);
+    const play = page.locator('#play');
+    const seek = page.locator('#seek');
+    assert.equal(await play.isVisible(), host);
+    assert.equal(await seek.isVisible(), host);
+    assert.equal(await page.getByRole('progressbar', { name: '播放进度' }).isVisible(), !host);
+    assert.match(await page.locator('#playback-time').textContent(), /\d+:\d\d\s*\/\s*\d+:\d\d/);
+    assert.ok(Number(await page.locator('#buffered').getAttribute('value')) > 0);
+    await page.locator('#playback-status').waitFor();
+    await exit.tap({ trial: true });
+  }
+  await actions.waitFor({ state: 'hidden', timeout: 8000 }).catch(async () => {
+    const focus = await page.evaluate(() => document.activeElement?.id);
+    assert.fail('Fullscreen controls did not hide during playback: ' +
+      JSON.stringify({ host, focus, player: await playbackDetails(page) }));
+  });
+  await tapVideo();
+  await actions.waitFor({ timeout: 2500 });
+  if (host) {
+    await page.getByRole('button', { name: '暂停', exact: true }).tap();
+    await Promise.all([page, visitorPage].map(side => side.getByText('已暂停，等待房主播放。').waitFor()));
+    const pausedAt = (await playhead(page)).position;
+    await page.getByRole('button', { name: '播放', exact: true }).tap();
+    await Promise.all([waitForPlaying(page, pausedAt + 0.25), waitForPlaying(visitorPage, pausedAt + 0.25)]);
+  } else await tryVisitorControls(page);
+  await exit.tap();
+  await enter.waitFor();
+  await page.setViewportSize(portrait);
+}
+
+async function tryVisitorControls(page) {
+  const screen = page.locator('#player-screen');
+  await screen.scrollIntoViewIfNeeded();
+  const started = performance.now();
+  const before = (await playhead(page)).position;
+  await screen.tap({ position: { x: 60, y: 45 } });
+  await screen.dblclick({ position: { x: 60, y: 45 } });
+  const box = await screen.boundingBox();
+  await page.mouse.move(box.x + 30, box.y + 55);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width - 30, box.y + 55, { steps: 5 });
+  await page.mouse.up();
+  const reveal = page.getByRole('button', { name: '显示播放控件' });
+  if (await reveal.isVisible()) {
+    await reveal.press('Space');
+  } else {
+    await screen.focus();
+  }
+  for (const key of ['ArrowRight', 'k']) await page.keyboard.press(key);
+  const after = await playhead(page);
+  const elapsed = (performance.now() - started) / 1000;
+  assert.ok(!after.paused && after.position >= before - 0.5 && after.position <= before + elapsed + 0.75,
+    'Visitor gestures and shortcuts must leave the media following the room: ' +
+    JSON.stringify({ before, after, elapsed, player: await playbackDetails(page) }));
+  for (const selector of ['#play', '#seek', '#end-after-playback']) {
+    assert.equal(await page.locator(selector).isVisible(), false);
+  }
+}
+
+function hostCommands(page, callback) {
+  function record(request) {
+    if (!request.url().endsWith('/playback') || request.method() !== 'POST') return;
+    const operation = request.postDataJSON();
+    if (['play', 'pause', 'seek'].includes(operation.action)) callback(operation);
+  }
+  page.on('request', record);
+  return () => page.off('request', record);
+}
+
+async function checkPlaybackEnd(hostPage, visitorPage, getTimeline) {
+  const play = hostPage.locator('#play');
+  const replay = hostPage.getByRole('button', { name: '重播', exact: true });
+  const duration = await hostPage.locator('video').evaluate(video => video.duration);
+  const nearEnd = 1 - Math.max(2.4, duration * 0.006) / duration;
+  const end = () => Promise.all([
+    replay.waitFor({ timeout: 12_000 }),
+    visitorPage.getByText('播放结束，等待房主决定。').waitFor({ timeout: 12_000 }),
+  ]);
+  await Promise.all([hostPage, visitorPage].map(page => page.getByRole('button', { name: '网页全屏' }).tap()));
+  await dragSeek(hostPage, nearEnd);
+  await play.tap();
+  await end();
+  for (const page of [hostPage, visitorPage]) {
+    assert.equal(await page.locator('video').getAttribute('loop'), null);
+  }
+  const ended = await getTimeline();
+  assert.equal(ended.ended, true);
+  assert.equal(ended.wantsPlay, false);
+  assert.equal(ended.startsAt, null);
+  await delay(1100);
+  assert.equal((await getTimeline()).version, ended.version);
+  assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
+  assert.equal(await visitorPage.getByRole('button', { name: '重播', exact: true }).count(), 0);
+  assert.equal(await visitorPage.locator('#end-after-playback').isVisible(), false);
+  await replay.tap();
+  await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
+  assert.equal((await getTimeline()).position, 0);
+  await dragSeek(hostPage, nearEnd);
+  await end();
+  console.log('Playback ended without looping; the host replayed both from zero and can end the room in fullscreen.');
+}
+
 async function checkDriftCorrection(visitorPage, getTimeline) {
   const video = visitorPage.locator('video');
   async function waitFor(predicate, expected) {
@@ -106,16 +222,18 @@ async function checkDriftCorrection(visitorPage, getTimeline) {
       assert.fail(expected + ', observed ' + JSON.stringify(observed));
     });
   }
+  const clock = await pageClock(visitorPage);
   const sent = performance.now();
   const { startsAt, position, serverTime } = await getTimeline();
   const received = performance.now();
   assert.ok(startsAt !== null, 'An active timeline is required for the drift probe');
-  const projected = position + (serverTime - startsAt + (received - sent) / 2) / 1000;
-  await video.evaluate((video, projected) => {
+  const projected = position + (serverTime - startsAt) / 1000;
+  const snapshotAt = (sent + received) / 2 - clock.offset;
+  await video.evaluate((video, { projected, snapshotAt }) => {
     video.dataset.seeks = '0';
     video.addEventListener('seeking', () => { video.dataset.seeks = Number(video.dataset.seeks) + 1; });
-    video.currentTime = projected + 0.70;
-  }, projected);
+    video.currentTime = projected + (performance.now() - snapshotAt) / 1000 + 0.70;
+  }, { projected, snapshotAt });
   await waitFor(() => document.querySelector('video').playbackRate !== 1, 'Expected rate correction for moderate drift');
   await waitFor(() => document.querySelector('video').playbackRate === 1, 'Expected rate to return to normal');
   assert.equal(await video.getAttribute('data-seeks'), '1', 'Moderate drift must recover through rate changes');
@@ -222,6 +340,7 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   const post = (context, data) => context.request.post(endpoint, { data, headers: { Origin: origin } });
   const playerId = randomUUID();
   const play = hostPage.locator('#play');
+  const hasFullscreen = await hostPage.locator('#fullscreen').count() > 0;
   const prepareHost = hostPage.getByRole('button', { name: '准备好了', exact: true });
   const prepareVisitor = visitorPage.getByRole('button', { name: '准备好了', exact: true });
   assert.equal(await visitorPage.locator('#play').isVisible(), false);
@@ -232,9 +351,10 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   const seekAcknowledgment = Promise.withResolvers();
   const releaseAcknowledgment = Promise.withResolvers();
   let holdSeek = false;
+  let seekTarget;
   await visitorPage.route(playbackRoute, async route => {
     const body = route.request().postDataJSON();
-    if (holdSeek && body.action === 'ready') {
+    if (holdSeek && body.action === 'ready' && Math.abs(body.position - seekTarget) <= 0.12) {
       seekAcknowledgment.resolve(body.position);
       await releaseAcknowledgment.promise;
     }
@@ -264,19 +384,46 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   assert.equal((await post(visitor, { ...command, role: 'host' })).status(), 401);
   assert.equal((await post(visitor, { ...command, role: 'visitor' })).status(), 403);
 
+  const commands = [];
+  const stopRecording = [hostPage, visitorPage].map(page => hostCommands(page, operation => {
+    commands.push(operation.action);
+    if (page === hostPage && holdSeek && operation.action === 'seek') seekTarget = operation.position;
+  }));
   let started = performance.now();
   await play.tap();
   await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
   console.log('Initial start: both past 0.25 s after ' + Math.round(performance.now() - started) + ' ms.');
   await checkStability(hostPage, visitorPage);
   await checkDriftCorrection(visitorPage, getTimeline);
+  if (hasFullscreen) {
+    await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
+    await checkFullscreen(hostPage, visitorPage);
+    const before = await getTimeline();
+    await tryVisitorControls(visitorPage);
+    await checkFullscreen(visitorPage);
+    assert.equal((await getTimeline()).version, before.version);
+    console.log('Both roles entered and exited page fullscreen in portrait and landscape. One tap restored controls.');
+  }
+  const expected = hasFullscreen ? ['play', 'pause', 'play'] : ['play'];
+  assert.deepEqual(commands, expected, 'Gestures and drift corrections must not generate host commands');
 
   holdSeek = true;
   started = performance.now();
+  const hostPortrait = hostPage.viewportSize();
   try {
+    if (hasFullscreen) {
+      await Promise.all([hostPage, visitorPage].map(page => page.getByRole('button', { name: '网页全屏' }).tap()));
+      await hostPage.setViewportSize({ width: hostPortrait.height, height: hostPortrait.width });
+    }
     await dragSeek(hostPage, 0.72);
     const target = await waitForSignal(seekAcknowledgment.promise, 'Visitor seek was not acknowledged');
-    assert.ok(target > 30);
+    assert.ok(target > 35);
+    const waiting = await getTimeline();
+    assert.equal(waiting.startsAt, null);
+    assert.equal(waiting.wantsPlay, true);
+    assert.equal(waiting.ready.visitor, false);
+    await Promise.all([hostPage, visitorPage].map(page =>
+      page.locator('#playback-status').filter({ hasText: /等待|缓冲/ }).waitFor({ timeout: 3500 })));
     await hostPage.getByText('访客 · 未就绪').waitFor();
     await hostPage.waitForFunction(target => {
       const video = document.querySelector('video');
@@ -298,9 +445,15 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
 
   await play.tap();
   await Promise.all([hostPage, visitorPage].map(page => page.getByText('已暂停，等待房主播放。').waitFor()));
+  if (hasFullscreen) {
+    await Promise.all([hostPage, visitorPage].map(page => page.getByRole('button', { name: '退出全屏' }).tap()));
+    await hostPage.setViewportSize(hostPortrait);
+  }
   const positions = await Promise.all([playhead(hostPage), playhead(visitorPage)]);
   assert.ok(positions.every(player => player.paused && !player.seeking));
   assert.ok(Math.abs(positions[0].position - positions[1].position) < 0.12);
+  stopRecording.forEach(stop => stop());
+  assert.deepEqual(commands, [...expected, 'seek', 'pause'], 'Only the intentional host controls may send timeline commands');
   console.log('Pause: both players paused and aligned within 0.12 s.');
 
   await dragSeek(hostPage, 0.32);
@@ -366,6 +519,7 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   }
 
   await checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause });
+  if (hasFullscreen) await checkPlaybackEnd(hostPage, visitorPage, getTimeline);
 }
 
 async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause }) {

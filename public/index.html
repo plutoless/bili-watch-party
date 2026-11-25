@@ -2,9 +2,10 @@
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>B 站一起看</title>
   <link rel="stylesheet" href="/style.css">
+  <script defer src="/xgplayer.js"></script>
   <script type="module" src="/app.js"></script>
 </head>
 <body>
@@ -74,27 +75,43 @@
           </div>
         </details>
       </section>
-      <div id="player" hidden>
-        <div class="player">
+      <div id="player" role="region" aria-label="房间播放器" hidden>
+        <div id="player-screen" tabindex="-1">
           <video id="video" playsinline disablepictureinpicture disableremoteplayback preload="auto"
             aria-label="房间视频"></video>
+          <button id="reveal-playback-controls" type="button" aria-label="显示播放控件" hidden></button>
         </div>
         <div class="playback-controls">
+          <div class="playback-toolbar">
+            <p id="playback-time" class="hint" role="timer" aria-label="播放时间">--:-- / --:--</p>
+            <button id="fullscreen" type="button" class="secondary" aria-pressed="false">网页全屏</button>
+          </div>
           <p id="playback-status" role="status"></p>
-          <ul class="readiness" aria-label="两端就绪状态">
-            <li id="host-ready"></li>
-            <li id="visitor-ready"></li>
-          </ul>
-          <div class="actions">
-            <button id="prepare" type="button">准备好了</button>
-            <button id="play" type="button" hidden>播放</button>
+          <div class="playback-meter" id="playback-progress" hidden>
+            <label for="playhead">播放进度</label>
+            <progress id="playhead" value="0" max="1"></progress>
           </div>
-          <div id="seek-controls" hidden>
-            <label for="seek">跳转进度</label>
-            <input id="seek" type="range" min="0" max="0" step="any" value="0" disabled>
+          <div class="playback-meter" id="playback-buffer" hidden>
+            <label for="buffered">已缓冲</label>
+            <meter id="buffered" min="0" max="100" value="0"></meter>
           </div>
-          <p id="playback-time" class="hint"></p>
+          <div id="playback-actions">
+            <ul class="readiness" aria-label="两端就绪状态">
+              <li id="host-ready"></li>
+              <li id="visitor-ready"></li>
+            </ul>
+            <div class="actions">
+              <button id="prepare" type="button">准备好了</button>
+              <button id="play" type="button" hidden>播放</button>
+              <button id="end-after-playback" class="secondary" type="button" hidden>结束房间</button>
+            </div>
+            <div id="seek-controls" hidden>
+              <label for="seek">跳转进度</label>
+              <input id="seek" type="range" min="0" max="0" step="any" value="0" disabled>
+            </div>
+          </div>
           <p id="playback-message" class="error" role="status"></p>
+          <p id="end-room-message" class="error" role="status"></p>
         </div>
       </div>
       <a id="back" class="back" href="/">返回首页</a>
