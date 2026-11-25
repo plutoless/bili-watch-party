@@ -545,14 +545,18 @@ try {
 } catch (error) {
   reportFailure(error);
 } finally {
-  try {
-    importGate?.resolve();
-    await Promise.all(browsers.map(browser => browser.close()));
-    await fixture?.close();
-    await app?.close();
-    await storage?.close();
-    if (dataDir) await rm(dataDir, { recursive: true, force: true });
-  } catch (error) {
-    reportFailure(error, 'cleanup');
+  async function attemptCleanup(action) {
+    try {
+      await action();
+    } catch (error) {
+      reportFailure(error, 'cleanup');
+    }
   }
+
+  importGate?.resolve();
+  await Promise.all(browsers.map(browser => attemptCleanup(() => browser.close())));
+  await attemptCleanup(() => fixture?.close());
+  await attemptCleanup(() => app?.close());
+  await attemptCleanup(() => storage?.close());
+  if (dataDir) await attemptCleanup(() => rm(dataDir, { recursive: true, force: true }));
 }
