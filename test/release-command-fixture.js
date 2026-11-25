@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 const [command, ...args] = [basename(process.argv[1]), ...process.argv.slice(2)];
@@ -68,14 +68,19 @@ switch (command) {
     if (has('build')) {
       assert.equal(process.env.VERCEL_TOKEN, undefined);
       if (stage('web-build')) fail();
+      const { settings } = JSON.parse(readFileSync(join(cwd, '.vercel/project.json'), 'utf8'));
+      assert.match(settings.installCommand, /^npm ci --omit=dev\b/);
+      symlinkSync(process.env.FIXTURE_NODE_MODULES, join(cwd, 'node_modules'));
       const result = spawnSync(process.execPath, ['scripts/build-web.js'], { cwd, stdio: 'inherit' });
       if (result.status !== 0) fail();
       mkdirSync(output, { recursive: true });
       copyFileSync(join(cwd, 'dist/index.html'), join(output, 'index.html'));
+      if (state.failure !== 'missing-player-build') copyFileSync(join(cwd, 'dist/xgplayer.js'), join(output, 'xgplayer.js'));
     } else if (has('deploy')) {
       assert.ok(has('--prod') && has('--prebuilt') && has('--skip-domain'));
       if (stage('stage-web')) fail();
       state.candidate = readFileSync(join(output, 'index.html'), 'utf8');
+      state.candidatePlayer = readFileSync(join(output, 'xgplayer.js'), 'utf8');
       save();
       console.log('https://staged-fixture.vercel.app');
     } else {
@@ -110,6 +115,7 @@ switch (command) {
             assert.ok(state.stages.includes('backend-https'));
             state.liveId = target;
             state.pages[target] = state.candidate;
+            state.players[target] = state.candidatePlayer;
             status = 202;
           }
         } else {
@@ -132,13 +138,23 @@ switch (command) {
           '\r\nAccess-Control-Allow-Credentials: true\r\n');
       }
     } else if (url.origin === 'https://staged-fixture.vercel.app') {
-      if (stage('stage-https')) status = 404;
-      body = state.candidate;
+      if (url.pathname === '/xgplayer.js') {
+        if (stage('stage-player')) status = 404;
+        body = state.candidatePlayer;
+      } else {
+        if (stage('stage-https')) status = 404;
+        body = state.candidate;
+      }
     } else {
       assert.equal(url.origin, process.env.WEB_ORIGIN);
       const isNew = state.liveId === 'dpl_' + process.env.RELEASE_SHA;
       if (!state.liveId || (isNew && state.failure === 'live-https')) status = 502;
-      body = state.pages[state.liveId] ?? '';
+      if (url.pathname === '/xgplayer.js') {
+        if (isNew && state.failure === 'live-player') status = 404;
+        body = state.players[state.liveId] ?? '';
+      } else {
+        body = state.pages[state.liveId] ?? '';
+      }
     }
     writeFileSync(value('-o'), body);
     process.stdout.write(String(status));

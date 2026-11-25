@@ -1,4 +1,4 @@
-import { createPlayer } from './player.js';
+import { createPageFullscreen, createPlayer } from './player.js';
 
 const byId = id => document.getElementById(id);
 const loginForm = byId('login-form');
@@ -11,6 +11,7 @@ const visitor = location.pathname.startsWith('/invite/');
 const path = visitor ? location.pathname.replace('/invite/', '/rooms/') : location.pathname;
 const roomPath = path.startsWith('/rooms/') ? '/api' + path : null;
 const player = createPlayer({ apiOrigin, roomPath, role: visitor ? 'visitor' : 'host' });
+let fullscreen;
 const recentRoomKey = 'watch-party-recent-room';
 const recentRoomPath = /^\/rooms\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const canShare = typeof navigator.share === 'function';
@@ -45,7 +46,7 @@ function show(section) {
   if (section === 'signin') {
     pollVersion++;
     clearTimeout(pollTimer);
-    player.stop();
+    stopPlayer();
     byId('invite-url').value = '';
   }
 }
@@ -118,10 +119,15 @@ async function validateRecentRoom() {
   }
 }
 
+function stopPlayer() {
+  fullscreen?.exit();
+  player.stop();
+}
+
 function showTerminal(state) {
   if (!visitor && readRecentRoom() === path) writeRecentRoom(null);
   setStatus(state);
-  player.stop();
+  stopPlayer();
   byId('title').textContent = '观影房间';
   byId('source-detail').hidden = true;
   byId('host-tools').hidden = true;
@@ -144,8 +150,10 @@ function render(room) {
   retry.hidden = visitor || !room.error?.retryable;
   setText(retry, room.status === 'media-expired' ? '重新导入' : '重试导入');
   publicMedia = room.mediaPublic;
-  if (room.mediaUrl) player.load(room.mediaUrl, publicMedia);
-  else player.stop();
+  if (room.mediaUrl) {
+    fullscreen ??= createPageFullscreen();
+    player.load(room.mediaUrl, publicMedia);
+  } else stopPlayer();
   if (!visitor) {
     if (rememberRoom) {
       writeRecentRoom(path);
@@ -245,13 +253,13 @@ async function refreshRoom() {
   }
 }
 
-async function hostAction(action, body, button) {
+async function hostAction(action, body, button, message = actionMessage) {
   if (actionPending) return;
   actionPending = true;
   pollVersion++;
   clearTimeout(pollTimer);
   button.disabled = true;
-  actionMessage.textContent = '';
+  message.textContent = '';
   let resume = true;
   try {
     const room = await request(roomPath + '/' + action, body);
@@ -262,7 +270,7 @@ async function hostAction(action, body, button) {
       resume = false;
       show('signin');
     } else {
-      actionMessage.textContent = error.message;
+      message.textContent = error.message;
     }
   } finally {
     button.disabled = false;
@@ -341,14 +349,16 @@ byId('share-invite').addEventListener('click', async () => {
     if (error.name !== 'AbortError' && byId('invite-url').value === link) await copyInvitation();
   }
 });
-byId('end-room').addEventListener('click', event => {
-  const message = publicMedia
-    ? '结束后邀请和房间内的播放会停止。公开视频链接在对象删除前仍可访问。确定结束？'
-    : '结束房间后，邀请和视频访问将立即失效。确定结束？';
-  if (confirm(message)) {
-    hostAction('end', {}, event.currentTarget);
-  }
-});
+for (const id of ['end-room', 'end-after-playback']) {
+  byId(id).addEventListener('click', event => {
+    const message = publicMedia
+      ? '结束后邀请和房间内的播放会停止。公开视频链接在对象删除前仍可访问。确定结束？'
+      : '结束房间后，邀请和视频访问将立即失效。确定结束？';
+    if (confirm(message)) {
+      hostAction('end', {}, event.currentTarget, id === 'end-after-playback' ? byId('end-room-message') : actionMessage);
+    }
+  });
+}
 
 async function connect() {
   try {

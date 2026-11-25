@@ -12,6 +12,7 @@ export function createPlayback(duration) {
   let position = 0;
   let startsAt = null;
   let wantsPlay = false;
+  let ended = false;
   let version = 0;
   let hostCommandVersion = 0;
   let lastHostSeek;
@@ -23,6 +24,7 @@ export function createPlayback(duration) {
 
   function align(target, resume) {
     position = target;
+    if (target < duration) ended = false;
     wantsPlay = resume;
     startsAt = null;
     for (const player of Object.values(players)) {
@@ -62,7 +64,10 @@ export function createPlayback(duration) {
   return {
     update({ role, action, playerId, ...command }, now) {
       expirePlayers(now);
-      if (startsAt !== null && currentPosition(now) >= duration) align(duration, false);
+      if (startsAt !== null && currentPosition(now) >= duration) {
+        align(duration, false);
+        ended = true;
+      }
 
       const player = players[role];
       const ownsSeat = player?.id === playerId;
@@ -121,6 +126,7 @@ export function createPlayback(duration) {
           hostCommandVersion = version;
         } else if (action === 'seek') {
           const target = Math.min(duration, Math.max(0, command.position));
+          ended = false;
           align(target, wantsPlay && target < duration);
           hostCommandVersion = version;
           lastHostSeek = command.seekId ? { id: command.seekId, playerId, previousVersion: command.version } : undefined;
@@ -151,7 +157,7 @@ export function createPlayback(duration) {
       return {
         conflict,
         state: {
-          epoch, version, position, startsAt, wantsPlay, serverTime: now,
+          epoch, version, position, startsAt, wantsPlay, ended, serverTime: now,
           ready: Object.fromEntries(roles.map(seat => [seat, Boolean(players[seat]?.ready)])),
           waiting: Object.fromEntries(roles.map(seat => [seat, players[seat]?.waiting ?? null])),
           blocked: roles.filter(seat => players[seat]?.blocked),

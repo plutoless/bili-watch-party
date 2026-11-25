@@ -664,6 +664,7 @@ test('only the host directs playback and both players must acknowledge the curre
   assert.equal((await send('host', 'play', version)).status, 409);
   assert.equal((await send('host', 'seek', { ...version, position: 12 }, visitor)).status, 401);
   assert.equal((await send('visitor', 'seek', { ...version, position: 12 })).status, 403);
+  for (const action of ['play', 'pause']) assert.equal((await send('visitor', action, version)).status, 403);
 
   assert.equal((await send('host', 'ready', { ...version, position: 0, claim: true })).status, 200);
   assert.equal((await send('visitor', 'ready', { ...version, position: 0, claim: true })).status, 200);
@@ -805,6 +806,38 @@ test('only the host directs playback and both players must acknowledge the curre
   }).then(r => r.json());
   assert.equal(earlyReconnect.position, interrupted.position + 0.35,
     'A short disconnect must not advance past the frame last seen by the interrupted side');
+
+  const nearEnd = await send('host', 'seek', {
+    epoch: earlyReconnect.epoch, version: earlyReconnect.version, position: 119,
+  }).then(r => r.json());
+  const nearEndTarget = { epoch: nearEnd.epoch, version: nearEnd.version, position: 119 };
+  await send('host', 'ready', nearEndTarget);
+  const finishing = await send('visitor', 'ready', nearEndTarget).then(r => r.json());
+  now = finishing.startsAt + 1_100;
+  const ended = await send('visitor', 'observe').then(r => r.json());
+  assert.equal(ended.ended, true);
+  assert.equal(ended.position, 120);
+  assert.equal(ended.wantsPlay, false);
+  assert.equal(ended.startsAt, null);
+  const endTarget = { epoch: ended.epoch, version: ended.version, position: ended.position };
+  await send('host', 'ready', endTarget);
+  const readyAtEnd = await send('visitor', 'ready', endTarget).then(r => r.json());
+  assert.equal(readyAtEnd.startsAt, null);
+  assert.equal(readyAtEnd.ended, true);
+  const replay = await send('host', 'play', endTarget).then(r => r.json());
+  assert.equal(replay.ended, false);
+  assert.equal(replay.position, 0);
+  assert.equal(replay.wantsPlay, true);
+  assert.equal(replay.startsAt, null, 'Both players must align at zero before starting again');
+  const endpointSeek = await send('host', 'seek', {
+    epoch: replay.epoch, version: replay.version, position: 120,
+  }).then(r => r.json());
+  assert.equal(endpointSeek.ended, false, 'Dragging to the endpoint is not natural completion');
+  const seekBack = await send('host', 'seek', {
+    epoch: endpointSeek.epoch, version: endpointSeek.version, position: 119,
+  }).then(r => r.json());
+  assert.equal(seekBack.position, 119);
+  assert.equal(seekBack.wantsPlay, false);
 });
 
 test('a host pause can follow its committed seek without admitting obsolete or unrelated commands', async t => {

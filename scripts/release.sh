@@ -74,15 +74,17 @@ git archive --format=tar --output="$work/backend.tar" "$RELEASE_SHA" \
 mkdir -p "$work/web/.vercel"
 git archive "$RELEASE_SHA" vercel.json package.json package-lock.json public scripts/build-web.js |
   tar -x -C "$work/web"
-printf '{"orgId":"%s","projectId":"%s","settings":{"framework":null,"nodeVersion":"24.x","installCommand":""}}\n' \
+printf '{"orgId":"%s","projectId":"%s","settings":{"framework":null,"nodeVersion":"24.x","installCommand":"npm ci --omit=dev --no-audit --no-fund"}}\n' \
   "$VERCEL_ORG_ID" "$VERCEL_PROJECT_ID" >"$work/web/.vercel/project.json"
 vercel_cli=(vercel --cwd "$work/web")
 printf '网页构建 %s\n' "$RELEASE_SHA"
 env -u VERCEL_TOKEN -u VERCEL_AUTOMATION_BYPASS_SECRET \
   "${vercel_cli[@]}" build --prod >/dev/null 2>&1 || fail 'Vercel 网页构建失败。'
 index="$work/web/.vercel/output/static/index.html"
+player_asset="$work/web/.vercel/output/static/xgplayer.js"
 grep -Fq "name=\"watch-release\" content=\"$RELEASE_SHA\"" "$index" 2>/dev/null ||
   fail 'Vercel 产物缺少通过验证的提交标识。'
+[[ -s $player_asset ]] || fail 'Vercel 产物缺少播放器脚本。'
 
 curl_request() {
   curl --disable --silent --show-error --connect-timeout 10 --max-time 20 "$@" 2>/dev/null
@@ -117,6 +119,8 @@ check_web() {
     status=$(curl_request "$@" -o "$work/page" -w '%{http_code}' "$origin$path?release=$RELEASE_SHA") &&
       [[ $status == 200 ]] && cmp -s "$index" "$work/page" || return 1
   done
+  status=$(curl_request "$@" -o "$work/page" -w '%{http_code}' "$origin/xgplayer.js?release=$RELEASE_SHA") &&
+    [[ $status == 200 ]] && cmp -s "$player_asset" "$work/page"
 }
 
 printf '%s\n' 'Vercel 正式域名配置检查与候选网页部署'

@@ -136,6 +136,15 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const hostPage = await host.newPage();
   const visitorPage = await visitor.newPage();
   const strangerPage = await stranger.newPage();
+  const mediaRanges = new Map([hostPage, visitorPage].map(page => [page, new Set()]));
+  for (const [page, requested] of mediaRanges) {
+    page.on('response', async response => {
+      if (response.status() === 206 && response.request().resourceType() === 'media' &&
+          new URL(response.url()).origin === apiOrigin) {
+        requested.add(await response.headerValue('content-range'));
+      }
+    });
+  }
   const inviteLink = hostPage.getByLabel('邀请链接');
   const generate = hostPage.getByRole('button', { name: '生成邀请', exact: true });
   const manage = hostPage.getByText('管理房间', { exact: true });
@@ -332,7 +341,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   if (apiOrigin !== origin && !publicMedia) {
     for (const page of [hostPage, visitorPage]) {
       const { status, contentRange, cacheControl, size } = await page.evaluate(async url => {
-        const response = await fetch(url, { credentials: 'include', headers: { Range: 'bytes=0-1023' } });
+        const response = await fetch(url, { credentials: 'include', headers: { Range: 'bytes=1024-2047' } });
         return {
           status: response.status,
           contentRange: response.headers.get('content-range'),
@@ -341,7 +350,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
         };
       }, apiOrigin + media);
       assert.equal(status, 206);
-      assert.match(contentRange, /^bytes 0-1023\/\d+$/);
+      assert.match(contentRange, /^bytes 1024-2047\/\d+$/);
       assert.equal(cacheControl, 'private, no-store');
       assert.equal(size, 1024);
     }
@@ -376,6 +385,13 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   await checkSharedPlayback({
     hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia,
   });
+  if (synthetic && !publicMedia) {
+    for (const ranges of mediaRanges.values()) {
+      assert.ok([...ranges].some(range => /^bytes \d+-\d+\/\d+$/.test(range)),
+        'Each native video must receive an authorized byte-range response');
+    }
+    console.log('Both native media elements received authorized 206 responses.');
+  }
   if (checkFile && mediaDir && (!publicMedia || storage)) {
     const path = storage ? join(mediaDir, 'public-object.mp4') : join(mediaDir, 'media', media.split('/').at(-1));
     if (storage) await writeFile(path, storage.objects.get(new URL(mediaUrl).pathname).body);
@@ -428,12 +444,18 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     console.log('Direct public 206, ambiguous-upload retry, expired-link rejection and reimport passed.');
   }
 
-  await openManagement();
+  const endAfterPlayback = hostPage.locator('#end-after-playback');
+  const endedInPlayer = await endAfterPlayback.isVisible();
+  if (!endedInPlayer) await openManagement();
   failurePhase = 'room revocation';
   hostPage.once('dialog', dialog => dialog.accept());
-  await hostPage.getByRole('button', { name: '结束房间' }).tap();
+  await (endedInPlayer ? endAfterPlayback : hostPage.locator('#end-room')).tap();
   await watchStatus(hostPage, 'ended').waitFor();
   await watchStatus(visitorPage, 'ended').waitFor();
+  for (const page of [hostPage, visitorPage]) {
+    assert.equal(await page.locator('#player').isVisible(), false);
+    assert.equal(await page.locator('html').evaluate(html => html.classList.contains('room-fullscreen')), false);
+  }
   assert.equal(await visitorPage.locator('video').getAttribute('src'), null);
   assert.equal((await host.request.get(apiOrigin + media, { headers: range })).status(), 410);
   assert.equal((await visitor.request.get(apiOrigin + media, { headers: range })).status(), 401);

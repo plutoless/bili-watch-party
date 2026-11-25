@@ -7,7 +7,7 @@ import { runInNewContext } from 'node:vm';
 import { createPlayback } from '../src/playback.js';
 
 const playerSource = readFileSync(new URL('../public/player.js', import.meta.url), 'utf8')
-  .replace('export function createPlayer', 'function createPlayer')
+  .replaceAll('export function ', 'function ')
   .replace('  return {\n    load(', '  return {\n    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(');
 
 function roomFixture({ publicMedia = false } = {}) {

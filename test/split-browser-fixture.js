@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { cp, mkdir, readFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, symlink } from 'node:fs/promises';
 import { request } from 'node:http';
 import { createServer } from 'node:https';
 import { join } from 'node:path';
@@ -26,12 +26,14 @@ export async function startSplitFixture(directory, { mediaOrigin = '', tls } = {
   const webSource = process.env.BROWSER_WEB_SOURCE ?? fileURLToPath(new URL('../', import.meta.url));
   await cp(join(webSource, 'public'), join(webOutput, 'public'), { recursive: true });
   await cp(join(webSource, 'scripts/build-web.js'), join(webOutput, 'scripts/build-web.js'), { recursive: true });
+  await symlink(join(webSource, 'node_modules'), join(webOutput, 'node_modules'));
   tls ??= await createLoopbackTls(directory);
   const assets = {
     '/index.html': 'text/html; charset=utf-8',
     '/app.js': 'text/javascript',
     '/player.js': 'text/javascript',
     '/style.css': 'text/css',
+    '/xgplayer.js': 'text/javascript',
   };
   const web = createServer(tls, async (req, res) => {
     const path = new URL(req.url, 'https://localhost').pathname;
