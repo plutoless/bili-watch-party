@@ -76,9 +76,10 @@ export function createPlayback(duration = Infinity) {
     const unfinished = roles.map(seat => players[seat]).filter(player => !finishedPlan(player));
     if (!unfinished.length || (unfinished.length > 1 && projected < duration)) return;
     const hasPlayableReport = Number.isFinite(observedPosition) && observedPosition >= position && observedPosition < duration;
+    // Every unfinished seat caps the resume point, even when it has not sent a usable sample.
     const checkpoints = unfinished.map(player => player === interrupted && hasPlayableReport
-      ? observedPosition : planProgress(player)?.resumePosition).filter(Number.isFinite);
-    return Math.max(position, Math.min(projected, ...(checkpoints.length ? checkpoints : [position])));
+      ? observedPosition : planProgress(player)?.resumePosition ?? position);
+    return Math.max(position, Math.min(projected, ...checkpoints));
   }
 
   function newSeat(playerId, recoveryId, now) {

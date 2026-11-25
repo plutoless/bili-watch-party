@@ -30,6 +30,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
   const pauses = [];
   const visitorWire = [];
   const grants = new Set();
+  const missingPositions = new Set();
 
   const wait = ms => ms ? new Promise(resolve => schedule(resolve, ms)) : undefined;
 
@@ -159,6 +160,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
       clearInterval: timer => timers.delete(timer),
       async fetch(_url, options) {
         const command = JSON.parse(options.body);
+        if (command.action === 'observe' && missingPositions.has(role)) delete command.position;
         if (role === 'host' && hostOffline) throw new TypeError('offline');
         const sent = now;
         const wire = delay;
@@ -231,6 +233,11 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
     player.load('/media/synthetic.mp4');
     if (automatic) player.admit();
     return { player, video, element, gain, gainWrites, audibleStarts, get reloads() { return reloads; },
+      leavePage() {
+        context.document.hidden = true;
+        context.document.dispatchEvent(new Event('visibilitychange'));
+        context.window.dispatchEvent(new Event('pagehide'));
+      },
       get audioContext() { return audioContext; }, allowPlayback() {
       grants.add(role);
       element('prepare').dispatchEvent(new Event('click'));
@@ -238,7 +245,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
   }
 
   let host = open('host');
-  const visitor = open('visitor');
+  let visitor = open('visitor');
   async function start() {
     await advance(250);
     host.element('prepare').dispatchEvent(new Event('click'));
@@ -250,7 +257,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
     assert.ok(!host.video.paused && !visitor.video.paused);
   }
   return {
-    advance, start, visitor, recovery, pauses, visitorWire, now: () => now,
+    advance, start, recovery, pauses, visitorWire, now: () => now,
     approve() { room.startOnApproval(); },
     setDelay(request, reply) { delay = { request, reply }; },
     loseNextRecovery(kind) { recoveryLoss = kind; },
@@ -259,6 +266,9 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
     saveHost(value) { saved.host.set([...saved.host.keys()][0], JSON.stringify(value)); },
     send(command) { return room.update({ role: 'host', ...command }, now); },
     get host() { return host; },
+    get visitor() { return visitor; },
+    omitPosition(role) { missingPositions.add(role); },
+    restorePosition(role) { missingPositions.delete(role); },
     savedVisitor() { return JSON.parse(saved.visitor.values().next().value ?? 'null'); },
     get committedSeek() { return committedSeek; },
     get committedReady() { return committedReady; },
@@ -272,6 +282,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
       return seekReply.resolve;
     },
     reloadHost() { host.player.stop(); host = open('host'); },
+    reloadVisitor() { visitor.leavePage(); visitor.player.stop(); visitor = open('visitor'); },
     restoreHost() { hostOffline = false; },
     disconnectHost() { hostOffline = true; },
     snapshot() { return room.update({ role: 'host', action: 'observe', playerId: randomUUID() }, now).state; },
@@ -819,7 +830,9 @@ test('losing the completed seat preserves the unfinished frame and play intent',
     } else {
       paused = send('host', 'unavailable', at(3200), { ...target, reason: 'connection', position: 3 }).state;
     }
-    assert.equal(paused.position, 2.8);
+    // Without either a terminal report or an in-range host sample, the host still caps recovery at the plan start.
+    const resumePosition = loss === 'connection before terminal report' ? plan.position : 2.8;
+    assert.equal(paused.position, resumePosition);
     assert.equal(paused.startsAt, null);
     assert.equal(paused.ended, false);
     assert.equal(paused.wantsPlay, loss !== 'pause');
@@ -832,7 +845,7 @@ test('losing the completed seat preserves the unfinished frame and play intent',
     if (loss !== 'recover') {
       assert.equal(send('host', 'recover', restoredAt, recovery).state.ownsSeat, true);
     }
-    const aligned = { epoch, version: paused.version + Number(loss !== 'recover'), position: 2.8, nativeEnd: true };
+    const aligned = { epoch, version: paused.version + Number(loss !== 'recover'), position: resumePosition, nativeEnd: true };
     send('host', 'ready', restoredAt, { ...aligned, playerId: replacement });
     const retry = send('visitor', 'ready', restoredAt, aligned).state;
     assert.ok(retry.startsAt > restoredAt);
@@ -908,14 +921,18 @@ test('tail stall uses consecutive in-order capture times, not a delayed reply', 
   assert.equal(stopped.waiting.visitor, 'stalled');
 });
 
-function observedPlayback({ duration = 10, legacy } = {}) {
+function observedPlayback({ duration = 10, legacy, position = 0 } = {}) {
   const room = createPlayback(duration);
   const players = { host: randomUUID(), visitor: randomUUID() };
   const update = (role, action, at, fields = {}) =>
     room.update({ role, action, playerId: players[role], ...fields }, at).state;
-  const { epoch, version } = update('host', 'observe', 0);
+  let { epoch, version } = update('host', 'observe', 0);
+  if (position) {
+    update('host', 'ready', 0, { epoch, version, position: 0, claim: true });
+    ({ version } = update('host', 'seek', 0, { epoch, version, position }));
+  }
   for (const role of ['host', 'visitor']) {
-    update(role, 'ready', 0, { epoch, version, position: 0, claim: true,
+    update(role, 'ready', 0, { epoch, version, position, claim: true,
       ...(role !== legacy ? { nativeEnd: true } : {}) });
   }
   const plan = update('host', 'play', 0, { epoch, version });
@@ -927,6 +944,141 @@ function observedPlayback({ duration = 10, legacy } = {}) {
   });
   return { plan, players, send, observe };
 }
+
+test('tail stall keeps the seek target when the other player’s position is missing', async t => {
+  for (const missing of ['visitor', 'host']) await t.test(missing, async () => {
+    const app = roomFixture({ automatic: true });
+    app.approve();
+    await app.advance(11500);
+    assert.equal(app.snapshot().synchronized, true);
+    app.omitPosition(missing);
+    const seek = app.host.element('seek');
+    seek.value = 118.1;
+    seek.dispatchEvent(new Event('change'));
+    const stalled = missing === 'visitor' ? 'host' : 'visitor';
+    for (const [role, position] of [[missing, 118.425], [stalled, 119.8]]) {
+      const { video } = app[role];
+      for (let i = 0; i < 120 && video.currentTime < position; i++) await app.advance(25);
+      assert.ok(video.currentTime >= position);
+      const active = app.snapshot();
+      assert.equal(active.position, 118.1);
+      assert.notEqual(active.startsAt, null);
+      assert.deepEqual(active.ready, { host: true, visitor: true });
+      assert.equal(video.paused, false);
+      video.currentTime = position;
+      video.stuck = true;
+    }
+    await app.advance(1150);
+    const held = app.snapshot();
+    assert.equal(app[missing].video.currentTime, 118.425);
+    assert.equal(app[stalled].video.currentTime, 119.8);
+    assert.equal(held.startsAt, null);
+    assert.equal(held.waiting[stalled], 'stalled');
+    assert.equal(held.waiting[missing], null);
+    assert.equal(held.wantsPlay, true);
+    assert.equal(held.position, 118.1);
+    await app.advance(200);
+    const retry = app[stalled].element('prepare');
+    assert.equal(retry.hidden, false);
+    assert.equal(retry.disabled, false);
+    assert.equal(retry.textContent, '重试播放');
+    assert.equal(app[missing].element('prepare').hidden, true);
+    assert.equal(app.host.gain.value, 0);
+    assert.equal(app.visitor.gain.value, 0);
+    app.restorePosition(missing);
+    for (const role of ['host', 'visitor']) {
+      app[role].video.stuck = false;
+      app[role].video.dispatchEvent(new Event('canplay'));
+    }
+    await app.advance(350);
+    assert.equal(app.visitor.video.currentTime, 118.1);
+    assert.equal(app.host.video.currentTime, 118.1);
+    app[stalled].allowPlayback();
+    await app.advance(4200);
+    assert.equal(app.snapshot().ended, true);
+  });
+});
+
+test('the shared tail checkpoint holds for connection loss and explicit pause', async t => {
+  for (const [name, reports, target, action, role] of [
+    ['missing visitor', { host: 119.8 }, 118.1, 'unavailable', 'host'],
+    ['missing host', { visitor: 118.425 }, 118.1, 'unavailable', 'visitor'],
+    ['both missing', {}, 118.1, 'unavailable', 'host'],
+    ['stale visitor plan', { host: 119.8 }, 118.1, 'unavailable', 'host'],
+    ['two usable positions', { host: 119.8, visitor: 118.425 }, 118.425, 'unavailable', 'host'],
+    ['completed host', { host: 120, visitor: 118.425 }, 118.425, 'unavailable', 'host'],
+    ['completed visitor', { host: 118.425, visitor: 120 }, 118.425, 'unavailable', 'visitor'],
+    ['pause before late interruption', { host: 119.8 }, 118.1, 'pause', 'host'],
+  ]) await t.test(name, () => {
+    const { plan, observe, send } = observedPlayback({ duration: 120, position: 118.1 });
+    for (const [seat, value] of Object.entries(reports)) {
+      observe(seat, 1950, value, { ended: value === 120, playing: value !== 120 });
+    }
+    if (name === 'stale visitor plan') observe('visitor', 1980, 119.5, { version: plan.version - 1 });
+    if (reports.visitor === 118.425) observe('visitor', 1990, 119.9, { sampledAt: 1900 });
+    const result = send(role, action, 2100, { reason: 'connection', position: reports[role] });
+    assert.equal(result.startsAt, null);
+    assert.equal(result.position, target);
+    assert.equal(result.ended, false);
+    assert.equal(result.wantsPlay, action !== 'pause');
+    if (action === 'pause') {
+      const late = send('host', 'unavailable', 2200, { reason: 'connection', position: 119.8 });
+      assert.equal(late.position, 118.1);
+      assert.equal(late.wantsPlay, false);
+    } else {
+      assert.equal(result.waiting[role], 'connection');
+    }
+  });
+});
+
+test('an explicitly paused room with an observed automatic start stays paused across visitor refresh', async t => {
+  for (const scenario of ['same host', 'pause reply not yet observed', 'unknown replacement host']) await t.test(scenario, async () => {
+    const replaced = scenario === 'unknown replacement host';
+    const awaitingPause = scenario === 'pause reply not yet observed';
+    const app = roomFixture({ automatic: true });
+    app.approve();
+    await app.advance(11500);
+    assert.equal(app.snapshot().synchronized, true);
+    const play = app.host.element('play');
+    assert.equal(play.textContent, '暂停');
+    assert.equal(play.hidden, false);
+    assert.equal(play.disabled, false);
+    if (awaitingPause) app.setDelay(0, 900);
+    play.dispatchEvent(new Event('click'));
+    await app.advance(450);
+    assert.equal(app.snapshot().wantsPlay, false);
+    if (awaitingPause) {
+      assert.notEqual(app.visitor.element('playback-status').textContent, '已暂停，等待房主播放。');
+      app.setDelay(0, 0);
+    } else {
+      assert.equal(app.visitor.element('playback-status').textContent, '已暂停，等待房主播放。');
+    }
+    if (replaced) {
+      const seat = app.savedHost();
+      const recovered = app.send({ action: 'recover', playerId: randomUUID(),
+        recoveryId: seat.recoveryId, recoveryGeneration: seat.recoveryGeneration + 1 }).state;
+      assert.equal(recovered.ownsSeat, true);
+      assert.equal(recovered.wantsPlay, false);
+    }
+    app.reloadVisitor();
+    await app.advance(600);
+    assert.equal(app.visitor.element('playback-status').textContent, '已暂停，等待房主播放。');
+    assert.equal(app.visitor.video.paused, true);
+    const prepare = app.visitor.element('prepare');
+    assert.equal(prepare.hidden, !replaced);
+    if (replaced) {
+      assert.equal(prepare.disabled, false);
+      assert.equal(prepare.textContent, '准备好了');
+    } else {
+      assert.equal(play.textContent, '播放');
+      assert.equal(play.disabled, false);
+      play.dispatchEvent(new Event('click'));
+      await app.advance(2900);
+      assert.equal(app.snapshot().synchronized, true);
+      assert.equal(prepare.hidden, true);
+    }
+  });
+});
 
 test('an admitted visitor can prepare from a visible control before a manual host play', async () => {
   const app = roomFixture({ automatic: true });

@@ -100,6 +100,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   let queuedCommand;
   let unacknowledgedSeekId;
   let playbackStartLeadMs = 0;
+  let automaticStart;
   try {
     const remembered = JSON.parse(sessionStorage.getItem(storageKey));
     if (remembered?.playerId) {
@@ -109,6 +110,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       legacySeats = remembered.recoveryId ? remembered.legacySeats ?? []
         : [remembered.playerId, ...(remembered.recoveryCandidates ?? [])];
       playbackStartLeadMs = remembered.startLeadMs ?? 0;
+      automaticStart = remembered.automaticStart;
       if (host && remembered.pause?.action === 'pause') queuedCommand = remembered.pause;
     }
   } catch {
@@ -206,7 +208,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const waitingForAudio = awaitingLocalAudio();
     const retryAudio = audioFailed || waitingForAudio;
     const retryPlayback = state?.ownsSeat && state.waiting[role] === 'stalled' && !primed;
-    const prepareForManualStart = !host && state?.wantsPlay === false &&
+    const prepareForManualStart = !host && !automaticStart && state?.wantsPlay === false &&
       !state.ended && !state.ready[role] && !primed;
     const reloadAudio = (retryAudio || retryPlayback) && audio?.context.state === 'closed';
     prepare.hidden = !admitted || (!state?.wantsPlay && !prepareForManualStart) ||
@@ -399,12 +401,30 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       }
       const pause = queuedCommand?.action === 'pause' ? queuedCommand : undefined;
       sessionStorage.setItem(storageKey, JSON.stringify({
-        playerId, recoveryId, recoveryGeneration, startLeadMs: playbackStartLeadMs, pause,
+        playerId, recoveryId, recoveryGeneration, startLeadMs: playbackStartLeadMs, pause, automaticStart,
         ...(legacySeats.length ? { legacySeats } : {}),
       }));
     } catch {
       // Playback can continue in the current document.
     }
+  }
+
+  function trackAutomaticStart(ownTimelineChange) {
+    if (host) return;
+    const { epoch, version, wantsPlay } = state;
+    const sameEpoch = automaticStart?.epoch === epoch;
+    const sameVersion = sameEpoch && automaticStart.version === version;
+    // Keep witnessed automatic start across an observed Pause/Play or the visitor's own interruption.
+    const continued = sameEpoch && version === automaticStart.version + 1 &&
+      (ownTimelineChange || wantsPlay !== automaticStart.wantsPlay);
+    if (state.firstStartPending || (state.waiting.host !== 'connection' && (sameVersion || continued))) {
+      if (sameVersion && automaticStart.wantsPlay === wantsPlay) return;
+      automaticStart = { epoch, version, wantsPlay };
+    } else {
+      if (!automaticStart) return;
+      automaticStart = undefined;
+    }
+    if (state.ownsSeat) rememberSeat();
   }
 
   function reportUnavailable(reason) {
@@ -658,6 +678,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
 
   function nextOperation() {
     if (needsRecovery) {
+      // Observe the previous document's background acknowledgement before Recover replaces it.
+      if (!state && automaticStart) return { action: 'observe' };
       const recovery = { action: 'recover', recoveryId, recoveryGeneration };
       // Migrate old saved histories in bounded batches. New recoveries use only the seat ID and generation.
       const [previousPlayerId, ...fallbackPlayerIds] = legacySeats.slice(0, legacyRecoveryBatchSize);
@@ -768,7 +790,12 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       }
       if (result.ready[role]) closeInitialReload();
       updateClock(sent, received, result.serverTime);
+      const backgroundBeforeRecovery = !state && needsRecovery && result.otherPlayer &&
+        result.waiting[role] === 'background';
+      const ownTimelineChange = backgroundBeforeRecovery ||
+        (ok && result.ownsSeat && (operation.action === 'recover' || operation.reason === 'background'));
       state = result;
+      trackAutomaticStart(ownTimelineChange);
       if (operation.action === 'recover') {
         primed = result.ownsSeat && (primed || !admitted);
         legacySeats = result.ownsSeat ? [] : legacySeats.slice(legacyRecoveryBatchSize);
@@ -1111,6 +1138,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       clearTimeout(approvalAudioRetry);
       approvalAudioRetry = undefined;
       state = undefined;
+      automaticStart = undefined;
       queuedCommand = unacknowledgedSeekId = undefined;
       reportBlocked = unavailableReport = outage = undefined;
       clearPendingStart();
