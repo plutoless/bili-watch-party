@@ -420,7 +420,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   function activePlan() {
     return state?.startsAt != null && state.wantsPlay && state.ownsSeat && state.ready[role] &&
       primed && !priming && !queuedCommand && !firstStartCancellation && !reportBlocked && !unavailableReport &&
-      !outage && !networkError && !document.hidden && !video.ended;
+      !outage && !networkError && !document.hidden;
   }
 
   function planIdentity() {
@@ -445,26 +445,45 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
 
   function watchAudioOutput() {
     const unavailable = !audioReady();
-    if (unavailable) audio.gain.gain.value = 0;
-    if (!unavailable || !activePlan()) {
+    if (!unavailable) {
+      const interrupted = audioLoss;
+      clearAudioLoss();
+      if (interrupted?.wasAudible && samePlan(interrupted) && state.startConfirmed !== false &&
+          !video.seeking && !video.ended && performance.now() - interrupted.observedAt < stallConfirmMs) updateAudioGain();
+      return;
+    }
+    const wasAudible = audio.gain.gain.value > 0;
+    audio.gain.gain.value = 0;
+    if (!activePlan() || video.ended) {
       clearAudioLoss();
       return;
     }
     if (audioLoss && samePlan(audioLoss)) return;
     clearAudioLoss();
-    const attempt = planIdentity();
+    const attempt = { ...planIdentity(), wasAudible, observedAt: performance.now() };
     audioLoss = attempt;
     // Observe the device even while a playback response is in flight.
     attempt.timer = setTimeout(() => {
       if (audioLoss !== attempt) return;
       audioLoss = undefined;
-      if (samePlan(attempt) && !audioReady()) holdForAudio();
+      if (samePlan(attempt) && !video.ended && !audioReady()) holdForAudio();
     }, stallConfirmMs);
   }
 
   function clearPendingStart() {
     clearTimeout(pendingStart?.timer);
     pendingStart = undefined;
+  }
+
+  function completeScheduledStart(attempt) {
+    if (!attempt?.played || !samePlan(attempt) || video.seeking) return false;
+    const advanced = video.currentTime - attempt.position;
+    const complete = video.ended ? advanced > 0 && video.currentTime >= video.duration - alignmentTolerance
+      : !video.paused && advanced > 0.03;
+    if (!complete) return false;
+    hasStartedScheduledPlayback = true;
+    clearPendingStart();
+    return true;
   }
 
   function confirmStall(retry) {
@@ -493,21 +512,25 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       checkBuffering();
       return;
     }
-    if (pendingStart || video.seeking || !activePlan()) return;
+    if (pendingStart || video.seeking || video.ended || !activePlan()) return;
     // Readiness already aligned the media. Chasing a moving target before starting can seek forever on slow media.
-    const attempt = planIdentity();
+    const attempt = { ...planIdentity(), position: video.currentTime, played: false };
     pendingStart = attempt;
     mediaReloaded = false;
     attempt.timer = setTimeout(() => {
       if (pendingStart !== attempt || !samePlan(attempt)) return;
+      if (completeScheduledStart(attempt)) return;
       audioRetryRequired = true;
       holdForAudio();
     }, playbackProbeMs);
     video.play().then(() => {
       if (pendingStart !== attempt || !samePlan(attempt)) return;
-      hasStartedScheduledPlayback = true;
+      attempt.played = true;
+      completeScheduledStart(attempt);
     }).catch(error => {
-      if (pendingStart !== attempt || !samePlan(attempt) || error.name === 'AbortError') return;
+      if (pendingStart !== attempt || !samePlan(attempt)) return;
+      clearPendingStart();
+      if (error.name === 'AbortError') return;
       if (error.name === 'NotAllowedError') {
         pauseVideo();
         reportBlocked = { action: 'blocked', epoch: attempt.epoch, version: attempt.version };
@@ -515,11 +538,6 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       } else {
         authorizationRetryAt = performance.now() + playbackProbeMs;
         holdForAudio();
-      }
-    }).finally(() => {
-      if (pendingStart === attempt) {
-        clearPendingStart();
-        render();
       }
     });
   }
@@ -529,6 +547,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   }
 
   function correctDrift() {
+    if (pendingStart && !completeScheduledStart(pendingStart)) return;
     if (state?.startsAt == null || !state.ownsSeat || !primed || priming ||
         networkError || outage || reportBlocked || unavailableReport || document.hidden ||
         video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
@@ -569,6 +588,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   function followTimeline() {
     clearTimeout(startTimer);
     if (pendingStart && !samePlan(pendingStart)) clearPendingStart();
+    completeScheduledStart(pendingStart);
     watchAudioOutput();
     if (!state || priming) return;
     if (firstStartCancellation || queuedCommand?.action === 'pause' || reportBlocked || unavailableReport || outage ||
@@ -605,6 +625,10 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       }
       beginPlayback();
     }
+    updateAudioGain();
+  }
+
+  function updateAudioGain() {
     if (audio) audio.gain.gain.value = Number(!state.firstStartPending && !video.paused && audioReady());
   }
 
@@ -1031,6 +1055,15 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
         }
       }
       if (video.getAttribute('src') === url) return;
+      if (video.hasAttribute('src')) {
+        loadGeneration++;
+        inFlight?.controller.abort();
+        inFlight = undefined;
+        if (unavailableReport?.reason === 'audio') {
+          unavailableReport = undefined;
+          audioFailed = audioRetryRequired = false;
+        }
+      }
       if (priming || pendingStart) pauseVideo();
       priming = undefined;
       clearTimeout(startTimer);

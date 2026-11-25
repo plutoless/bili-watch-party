@@ -644,6 +644,82 @@ test('pending scheduled play holds the room for a bounded local retry', async t 
   });
 });
 
+test('a settled scheduled play without media movement holds the room', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  assert.equal(app.snapshot().synchronized, true);
+  const { video, element, gain } = app.host;
+  const play = video.play;
+  let attempts = 0;
+  video.play = function () {
+    if (++attempts === 1) video.stuck = true;
+    return play.call(this);
+  };
+  element('seek').value = 25;
+  element('seek').dispatchEvent(new Event('change'));
+  await app.advance(3400);
+  const held = app.snapshot();
+  assert.equal(held.startsAt, null);
+  assert.equal(held.position, 25);
+  assert.equal(held.waiting.host, 'audio');
+  assert.deepEqual(held.blocked, []);
+  assert.equal(attempts, 1);
+  assert.ok(video.paused && app.visitor.video.paused);
+  assert.equal(gain.value, 0);
+  assert.equal(app.visitor.gain.value, 0);
+  assert.equal(element('prepare').textContent, '重试音频');
+  assert.equal(app.visitor.element('prepare').hidden, true);
+  video.stuck = false;
+  app.host.allowPlayback();
+  await app.advance(2400);
+  assert.equal(app.snapshot().synchronized, true);
+});
+
+test('a scheduled seek through the final frame can end without an audio hold', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  const seek = app.host.element('seek');
+  seek.value = 119.98;
+  seek.dispatchEvent(new Event('change'));
+  await app.advance(2900);
+  const ended = app.snapshot();
+  assert.equal(ended.ended, true);
+  assert.equal(ended.position, 120);
+  assert.deepEqual(ended.waiting, { host: null, visitor: null });
+  assert.equal(app.host.element('prepare').hidden, true);
+  assert.equal(app.visitor.element('prepare').hidden, true);
+});
+
+test('replacing the source retires an unsent audio report and an old Observe reply', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  const current = app.snapshot();
+  assert.equal(current.synchronized, true);
+  app.setDelay(0, 900);
+  await app.advance(200);
+  app.setDelay(0, 0);
+  const { audioContext, player, video } = app.visitor;
+  audioContext.state = 'suspended';
+  audioContext.dispatchEvent(new Event('statechange'));
+  await app.advance(410);
+  assert.equal(video.paused, true);
+  const replacedAt = app.now();
+  player.load('/media/replacement.mp4');
+  audioContext.state = 'running';
+  audioContext.dispatchEvent(new Event('statechange'));
+  await app.advance(1600);
+  assert.equal(app.snapshot().version, current.version);
+  assert.equal(app.snapshot().synchronized, true);
+  assert.ok(!app.visitorWire.some(row => row.action === 'unavailable' && row.sent >= replacedAt));
+  const older = app.visitorWire.find(row => row.action === 'observe' && row.received - row.sent === 900 &&
+    row.sent < replacedAt && row.received > replacedAt);
+  assert.ok(older);
+  assert.ok(app.visitorWire.some(row => row.action === 'observe' && row.sent >= replacedAt && row.received < older.received));
+});
+
 test('cancel, source and seat changes retire a pending scheduled play', async t => {
   for (const changed of ['cancel', 'source', 'seat']) await t.test(changed, async () => {
     const previous = Promise.withResolvers();
@@ -710,6 +786,7 @@ test('audio state changes are observed inside a 900 ms reply gap', async t => {
     const peerPausedBeforeResponse = app.host.video.paused;
     audioContext.state = 'running';
     audioContext.dispatchEvent(new Event('statechange'));
+    const gainOnRecovery = gain.value;
     await app.advance(650);
     const observed = app.snapshot();
     assert.equal(pausedBeforeResponse, duration > 200);
@@ -718,10 +795,14 @@ test('audio state changes are observed inside a 900 ms reply gap', async t => {
     assert.equal(observed.version > current.version, duration > 200);
     assert.deepEqual(observed.blocked, []);
     if (duration < 200) {
+      assert.equal(gainOnRecovery, 1);
       await app.advance(500);
       assert.equal(app.snapshot().version, current.version);
       assert.equal(app.snapshot().synchronized, true);
-    } else assert.notEqual(observed.startsAt, current.startsAt);
+    } else {
+      assert.equal(gainOnRecovery, 0);
+      assert.notEqual(observed.startsAt, current.startsAt);
+    }
     assert.ok(app.visitorWire.some(reply => reply.action === 'observe' && reply.received - reply.sent === 900 &&
       reply.sent <= suspendedAt && reply.received > suspendedAt + duration));
   });
