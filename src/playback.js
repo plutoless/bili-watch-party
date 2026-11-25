@@ -48,7 +48,7 @@ export function createPlayback(duration = Infinity) {
 
   function scheduleStart(now) {
     // The published page can align and play but cannot participate in preview and release.
-    if (firstStart === 'preview' && roles.some(seat => !players[seat].nativeEnd)) firstStart = null;
+    if (firstStartPending() && roles.some(seat => players[seat]?.nativeEnd === false)) firstStart = null;
     if (firstStart === 'preview' && duration - position <= minimumPreviewDuration) firstStart = 'armed';
     startsAt = now + (firstStart === 'armed' ? firstStartLeadMs : startLeadMs);
   }
@@ -207,12 +207,13 @@ export function createPlayback(duration = Infinity) {
           if (!canRecover) conflict = true;
           else {
             interrupt(player, 'connection', now);
+            if (firstStart === 'starting') firstStart = 'armed';
             if (role === 'host' && lastHostSeek?.playerId === player.id) lastHostSeek.playerId = playerId;
             player.id = playerId;
             player.recoveryId = command.recoveryId ?? playerId;
             player.recoveryGeneration = command.recoveryGeneration ?? 0;
             player.blocked = false;
-            player.nativeEnd = false;
+            player.nativeEnd = undefined;
           }
         }
       } else if (action !== 'observe') {
@@ -234,7 +235,7 @@ export function createPlayback(duration = Infinity) {
               id: playerId,
               recoveryId: ownsSeat ? player.recoveryId : command.recoveryId ?? playerId,
               recoveryGeneration: ownsSeat ? player.recoveryGeneration : 0,
-              nativeEnd: command.nativeEnd === true || (ownsSeat && player.nativeEnd),
+              nativeEnd: command.nativeEnd === true || (ownsSeat && player.nativeEnd === true),
               ready: true, blocked: false, waiting: null, lastSeen: now,
             };
             if (wantsPlay && bothReady()) scheduleStart(now);
@@ -337,6 +338,7 @@ export function createPlayback(duration = Infinity) {
         state: {
           epoch, version, position, startsAt, wantsPlay, ended, serverTime: now,
           firstStartPending: firstStartPending(), preview, awaitingStart: firstStart === 'armed',
+          hostSupportsAutomaticStart: players.host?.lastSeen != null ? players.host.nativeEnd : undefined,
           startAcknowledged: firstStart === 'armed' && startAcknowledged(),
           startConfirmed: firstStart !== 'armed' || startConfirmed(), advancing,
           synchronized: startsAt !== null && !firstStartPending() && aligned,

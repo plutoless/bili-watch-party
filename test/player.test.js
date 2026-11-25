@@ -25,10 +25,12 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
   let recoveryLoss;
   let delayedRecovery;
   let pausedReplyLoss = false;
+  let visitorObserveTimeout = false;
   let delay = { request: 0, reply: 0 };
   const recovery = [];
   const pauses = [];
   const visitorWire = [];
+  const visitorRequests = [];
   const grants = new Set();
   const missingPositions = new Set();
 
@@ -164,6 +166,14 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
         if (role === 'host' && hostOffline) throw new TypeError('offline');
         const sent = now;
         const wire = delay;
+        if (role === 'visitor') {
+          visitorRequests.push(command.action);
+          if (visitorObserveTimeout && command.action === 'observe') {
+            visitorObserveTimeout = false;
+            await wait(2000);
+            throw new DOMException('The first observation timed out', 'TimeoutError');
+          }
+        }
         if (role === 'visitor' && wire.request) await wait(wire.request);
         if (role === 'host' && command.action === 'recover' && ['request', 'late'].includes(recoveryLoss)) {
           if (recoveryLoss === 'late') delayedRecovery = command;
@@ -257,11 +267,12 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
     assert.ok(!host.video.paused && !visitor.video.paused);
   }
   return {
-    advance, start, recovery, pauses, visitorWire, now: () => now,
+    advance, start, recovery, pauses, visitorWire, visitorRequests, now: () => now,
     approve() { room.startOnApproval(); },
     setDelay(request, reply) { delay = { request, reply }; },
     loseNextRecovery(kind) { recoveryLoss = kind; },
     loseNextPauseReply() { pausedReplyLoss = true; },
+    timeOutNextVisitorObserve() { visitorObserveTimeout = true; },
     savedHost() { return JSON.parse(saved.host.values().next().value ?? 'null'); },
     saveHost(value) { saved.host.set([...saved.host.keys()][0], JSON.stringify(value)); },
     send(command) { return room.update({ role: 'host', ...command }, now); },
@@ -1080,6 +1091,39 @@ test('an explicitly paused room with an observed automatic start stays paused ac
   });
 });
 
+test('an optional visitor Observe timeout cannot delay seat recovery on refresh', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  assert.equal(app.snapshot().synchronized, true);
+  const play = app.host.element('play');
+  assert.equal(play.textContent, '暂停');
+  assert.equal(play.disabled, false);
+  play.dispatchEvent(new Event('click'));
+  await app.advance(450);
+  const previous = app.savedVisitor();
+  app.timeOutNextVisitorObserve();
+  app.reloadVisitor();
+  const requestIndex = app.visitorRequests.length;
+  const replyIndex = app.visitorWire.length;
+  await app.advance(50);
+  assert.equal(app.visitorRequests[requestIndex], 'recover');
+  assert.ok(app.visitorWire.slice(replyIndex).some(reply => reply.action === 'recover' && reply.status === 200));
+  const restored = app.savedVisitor();
+  assert.equal(restored.recoveryId, previous.recoveryId);
+  assert.equal(restored.recoveryGeneration, previous.recoveryGeneration + 1);
+  await app.advance(2700);
+  assert.equal(app.visitorRequests[requestIndex + 1], 'observe');
+  assert.ok(app.visitorWire.slice(replyIndex).some(reply => reply.action === 'unavailable'));
+  assert.equal(app.visitor.element('playback-status').textContent, '已暂停，等待房主播放。');
+  assert.equal(app.visitor.element('prepare').hidden, true);
+  assert.equal(app.visitor.video.paused, true);
+  assert.equal(play.textContent, '播放');
+  play.dispatchEvent(new Event('click'));
+  await app.advance(2900);
+  assert.equal(app.snapshot().synchronized, true);
+});
+
 test('an admitted visitor can prepare from a visible control before a manual host play', async () => {
   const app = roomFixture({ automatic: true });
   await app.advance(250);
@@ -1529,8 +1573,62 @@ function firstStartAfterPreview() {
     ...realTarget, ended: false, playing: false,
     startAcknowledgment: deadline, startConfirmation: confirms ? deadline : undefined,
   });
-  return { update, realTarget, first, agree };
+  return { update, realTarget, first, agree, ids };
 }
+
+test('an armed first start chooses the current Ready seat capabilities after recovery', async t => {
+  for (const modern of [false, true]) await t.test(modern ? 'new host' : 'legacy host', () => {
+    const { update, realTarget, first, agree, ids } = firstStartAfterPreview();
+    agree('host', 1450, first.startsAt);
+    const playerId = randomUUID();
+    const recovered = update('host', 'recover', 1500, { playerId, previousPlayerId: ids.host });
+    assert.equal(recovered.ownsSeat, true);
+    assert.equal(recovered.startsAt, null);
+    assert.equal(recovered.hostSupportsAutomaticStart, undefined);
+    const target = { epoch: realTarget.epoch, version: recovered.version, position: 0 };
+    const unknown = update('host', 'observe', 1550, { ...target, playerId });
+    assert.equal(unknown.hostSupportsAutomaticStart, undefined);
+    const visitorReady = update('visitor', 'ready', 1600, target);
+    assert.equal(visitorReady.firstStartPending, true);
+    assert.equal(visitorReady.startsAt, null);
+    const newPlan = update('host', 'ready', 1650, { ...target, playerId, ...(modern && { nativeEnd: true }) });
+    assert.equal(newPlan.hostSupportsAutomaticStart, modern);
+    const missing = update('host', 'observe', 1700, { ...target, playerId });
+    assert.equal(missing.hostSupportsAutomaticStart, modern);
+    assert.equal(missing.awaitingStart, modern);
+    assert.equal(missing.startConfirmed, !modern);
+    assert.equal(missing.startAcknowledged, false);
+    assert.ok(missing.startsAt > 1700);
+    const obsolete = update('host', 'observe', 1750, { ...realTarget, ended: false,
+      startAcknowledgment: first.startsAt, startConfirmation: first.startsAt });
+    assert.equal(obsolete.ownsSeat, false);
+    assert.equal(obsolete.hostSupportsAutomaticStart, modern);
+    assert.equal(obsolete.startAcknowledged, false);
+  });
+});
+
+test('replacing a new host also retires a released first start before both players advance', () => {
+  const { update, realTarget, first, agree, ids } = firstStartAfterPreview();
+  const deadline = first.startsAt;
+  agree('host', 1500, deadline);
+  agree('visitor', 1700, deadline, true);
+  assert.equal(agree('host', 1900, deadline, true).startConfirmed, true);
+  for (let now = 2500; now < deadline; now += 1000) {
+    for (const role of ['host', 'visitor']) agree(role, now, deadline, true);
+  }
+  const released = agree('host', deadline, deadline);
+  assert.equal(released.awaitingStart, false);
+  assert.equal(released.firstStartPending, true);
+  const playerId = randomUUID();
+  const recovered = update('host', 'recover', deadline + 100, { playerId, previousPlayerId: ids.host });
+  assert.equal(recovered.startsAt, null);
+  const target = { ...realTarget, version: recovered.version };
+  update('host', 'ready', deadline + 150, { ...target, playerId });
+  const scheduled = update('visitor', 'ready', deadline + 200, target);
+  assert.ok(scheduled.startsAt > deadline);
+  assert.equal(scheduled.awaitingStart, true);
+  assert.equal(scheduled.startConfirmed, false);
+});
 
 test('first start waits for both acknowledgments before releasing audio', () => {
   const { update, realTarget, first, agree } = firstStartAfterPreview();
