@@ -14,6 +14,7 @@ export function createPlayback(duration) {
   let wantsPlay = false;
   let version = 0;
   let hostCommandVersion = 0;
+  let lastHostSeek;
 
   function currentPosition(now) {
     const elapsed = startsAt === null ? 0 : Math.max(0, now - startsAt) / 1000;
@@ -67,11 +68,21 @@ export function createPlayback(duration) {
       const ownsSeat = player?.id === playerId;
       let conflict = false;
       if (action === 'recover') {
-        if (!ownsSeat) {
-          if (player?.id !== command.previousPlayerId) conflict = true;
+        const sameSeat = player && player.recoveryId === command.recoveryId;
+        if (ownsSeat) {
+          conflict = command.recoveryId !== undefined &&
+            (!sameSeat || command.recoveryGeneration !== player.recoveryGeneration);
+        } else {
+          // New documents carry the same seat ID and a strictly increasing generation across lost replies.
+          const canRecover = player && (sameSeat ? command.recoveryGeneration > player.recoveryGeneration
+            : player.id === command.previousPlayerId || command.fallbackPlayerIds?.includes(player.id));
+          if (!canRecover) conflict = true;
           else {
             interrupt(player, 'connection', now);
+            if (role === 'host' && lastHostSeek?.playerId === player.id) lastHostSeek.playerId = playerId;
             player.id = playerId;
+            player.recoveryId = command.recoveryId ?? playerId;
+            player.recoveryGeneration = command.recoveryGeneration ?? 0;
             player.blocked = false;
           }
         }
@@ -79,14 +90,23 @@ export function createPlayback(duration) {
         // Readiness and interruptions may advance the timeline while a host pause is in flight.
         const concurrentPause = action === 'pause' &&
           Number.isInteger(command.version) && command.version >= hostCommandVersion && command.version <= version;
-        if (command.epoch !== epoch || (command.version !== version && !concurrentPause)) conflict = true;
+        // A newer local pause may follow a seek whose acknowledgment never reached this host.
+        const pauseAfterSeek = action === 'pause' && role === 'host' && ownsSeat &&
+          lastHostSeek?.playerId === playerId && command.afterSeekId === lastHostSeek.id &&
+          command.version === lastHostSeek.previousVersion;
+        if (command.epoch !== epoch || (command.version !== version && !concurrentPause && !pauseAfterSeek)) conflict = true;
         else if (action === 'ready') {
           if ((!ownsSeat && (command.claim !== true || player?.lastSeen != null)) ||
               startsAt !== null ||
               Math.abs(command.position - position) > alignmentTolerance) {
             conflict = true;
           } else if (!player?.ready) {
-            players[role] = { id: playerId, ready: true, blocked: false, waiting: null, lastSeen: now };
+            players[role] = {
+              id: playerId,
+              recoveryId: ownsSeat ? player.recoveryId : command.recoveryId ?? playerId,
+              recoveryGeneration: ownsSeat ? player.recoveryGeneration : 0,
+              ready: true, blocked: false, waiting: null, lastSeen: now,
+            };
             if (wantsPlay && bothReady()) scheduleStart(now);
           }
         } else if (!ownsSeat) conflict = true;
@@ -96,22 +116,27 @@ export function createPlayback(duration) {
           interrupt(player, null, now);
           player.blocked = true;
         } else if (action === 'pause') {
+          lastHostSeek = undefined;
           if (wantsPlay) align(currentPosition(now), false);
           hostCommandVersion = version;
         } else if (action === 'seek') {
           const target = Math.min(duration, Math.max(0, command.position));
           align(target, wantsPlay && target < duration);
           hostCommandVersion = version;
+          lastHostSeek = command.seekId ? { id: command.seekId, playerId, previousVersion: command.version } : undefined;
         } else if (action === 'play') {
           if (!bothReady()) conflict = true;
-          else if (!wantsPlay) {
-            wantsPlay = true;
-            if (position === duration) align(0, true);
-            else {
-              scheduleStart(now);
-              version++;
+          else {
+            lastHostSeek = undefined;
+            if (!wantsPlay) {
+              wantsPlay = true;
+              if (position === duration) align(0, true);
+              else {
+                scheduleStart(now);
+                version++;
+              }
+              hostCommandVersion = version;
             }
-            hostCommandVersion = version;
           }
         }
       }
