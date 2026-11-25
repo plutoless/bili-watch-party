@@ -206,13 +206,16 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const waitingForAudio = awaitingLocalAudio();
     const retryAudio = audioFailed || waitingForAudio;
     const retryPlayback = state?.ownsSeat && state.waiting[role] === 'stalled' && !primed;
+    const prepareForManualStart = !host && state?.wantsPlay === false &&
+      !state.ended && !state.ready[role] && !primed;
     const reloadAudio = (retryAudio || retryPlayback) && audio?.context.state === 'closed';
-    prepare.hidden = !admitted || !state?.wantsPlay || (!gestureFailed && !retryAudio && !retryPlayback) ||
+    prepare.hidden = !admitted || (!state?.wantsPlay && !prepareForManualStart) ||
+      (!gestureFailed && !retryAudio && !retryPlayback && !prepareForManualStart) ||
       Boolean(state?.otherPlayer || firstStartCancellation || queuedCommand?.action === 'pause');
     prepare.disabled = Boolean((priming && !waitingForAudio) || unavailableReport || outage) ||
       networkError || video.readyState < video.HAVE_METADATA;
     setText('prepare', reloadAudio ? '刷新页面' : gestureFailed ? '允许播放'
-      : retryPlayback ? '重试播放' : retryAudio ? '重试音频' : '允许播放');
+      : retryPlayback ? '重试播放' : retryAudio ? '重试音频' : prepareForManualStart ? '准备好了' : '允许播放');
     play.hidden = !host;
     setText('play', state?.firstStartPending ? '取消开播' : state?.wantsPlay ? '暂停' : state?.ended ? '重播' : '播放');
     byId('end-after-playback').hidden = !host || !state?.ended;
@@ -254,6 +257,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       status = mediaPlaying() && state.synchronized ? '正在同步播放'
         : state.awaitingStart ? '已对齐，等待同时开播。'
         : stopped.length ? '等待' + describeSeats(stopped) + '的播放进度推进。'
+        : mediaPlaying() && !state.firstStartPending && state.playbackGap === null ? '双方播放进度在推进。'
         : '等待双方对齐播放进度。';
     } else if (state?.wantsPlay) status = '等待' + describeSeats(unready) + '缓冲并对齐进度。';
     else if (state?.ended) status = host ? '播放结束。请选择重播或结束房间。' : '播放结束，等待房主决定。';

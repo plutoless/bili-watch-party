@@ -908,6 +908,99 @@ test('tail stall uses consecutive in-order capture times, not a delayed reply', 
   assert.equal(stopped.waiting.visitor, 'stalled');
 });
 
+function observedPlayback({ duration = 10, legacy } = {}) {
+  const room = createPlayback(duration);
+  const players = { host: randomUUID(), visitor: randomUUID() };
+  const update = (role, action, at, fields = {}) =>
+    room.update({ role, action, playerId: players[role], ...fields }, at).state;
+  const { epoch, version } = update('host', 'observe', 0);
+  for (const role of ['host', 'visitor']) {
+    update(role, 'ready', 0, { epoch, version, position: 0, claim: true,
+      ...(role !== legacy ? { nativeEnd: true } : {}) });
+  }
+  const plan = update('host', 'play', 0, { epoch, version });
+  const target = { epoch, version: plan.version };
+  const send = (role, action, elapsed, fields) => update(role, action, plan.startsAt + elapsed, { ...target, ...fields });
+  const observe = (role, elapsed, position, fields) => send(role, 'observe', elapsed, {
+    position, ...(role !== legacy ? { ended: false, playing: true, sampledAt: elapsed, observedAt: plan.startsAt + elapsed } : {}),
+    ...fields,
+  });
+  return { plan, players, send, observe };
+}
+
+test('an admitted visitor can prepare from a visible control before a manual host play', async () => {
+  const app = roomFixture({ automatic: true });
+  await app.advance(250);
+  const prepare = app.visitor.element('prepare');
+  assert.equal(prepare.hidden, false);
+  assert.equal(prepare.disabled, false);
+  assert.equal(prepare.textContent, '准备好了');
+  assert.equal(app.snapshot().wantsPlay, false);
+  prepare.dispatchEvent(new Event('click'));
+  await app.advance(450);
+  assert.equal(app.snapshot().ready.visitor, true);
+  assert.equal(app.snapshot().wantsPlay, false);
+  assert.equal(app.visitor.video.paused, true);
+  assert.equal(app.visitor.gain.value, 0);
+  assert.equal(prepare.hidden, true);
+});
+
+test('mixed pages show advancement only after consecutive current-plan legacy samples', async t => {
+  for (const legacy of ['host', 'visitor']) await t.test(legacy, () => {
+    const { plan, players, send, observe } = observedPlayback({ legacy });
+    const newer = legacy === 'host' ? 'visitor' : 'host';
+    observe(newer, 100, 0.1);
+    observe(legacy, 100, 0.1);
+    observe(newer, 300, 0.3);
+    assert.equal(observe(legacy, 300, 0.3).advancing[legacy], false);
+    observe(newer, 500, 0.5);
+    const progressing = observe(legacy, 500, 0.5);
+    assert.deepEqual(progressing.advancing, { host: true, visitor: true });
+    assert.equal(progressing.synchronized, false);
+    assert.equal(progressing.playbackGap, null);
+    assert.equal(observe(legacy, 700, 0.5).advancing[legacy], false);
+    assert.equal(observe(legacy, 900, 2.5).advancing[legacy], false);
+    assert.equal(observe(legacy, 1100, 2.7).advancing[legacy], false);
+    assert.equal(observe(legacy, 1200, 2.8, { version: plan.version - 1 }).advancing[legacy], false);
+    assert.equal(observe(legacy, 1250, 2.85, { playerId: randomUUID() }).advancing[legacy], false);
+    assert.equal(observe(legacy, 1300, 2.9).advancing[legacy], true);
+    const taken = send(legacy, 'recover', 1350, { playerId: randomUUID(), previousPlayerId: players[legacy] });
+    assert.equal(taken.startsAt, null);
+    assert.equal(observe(legacy, 1400, 3).advancing[legacy], false);
+  });
+});
+
+test('tail stall resumes at both unfinished seats’ safe point without blocking the advancing seat', () => {
+  const { observe, send } = observedPlayback({ duration: 3 });
+  observe('host', 2600, 2.6);
+  observe('visitor', 2600, 0.9);
+  observe('host', 2800, 2.8);
+  observe('visitor', 3050, 1.35);
+  observe('host', 3050, 2.8);
+  observe('visitor', 3750, 2.05);
+  const held = observe('host', 3750, 2.8);
+  assert.equal(held.position, 2.05);
+  assert.equal(held.startsAt, null);
+  assert.equal(held.wantsPlay, true);
+  assert.deepEqual(held.blocked, []);
+  assert.deepEqual(held.waiting, { host: 'stalled', visitor: null });
+  const paused = send('host', 'pause', 3800);
+  assert.equal(paused.wantsPlay, false);
+  assert.equal(paused.position, 2.05);
+});
+
+test('a clockless observation cannot replace a current timed checkpoint', () => {
+  const { observe, send } = observedPlayback({ duration: 3 });
+  observe('host', 2450, 2.45);
+  observe('visitor', 2600, 2.55);
+  observe('visitor', 2620, 2.6, { sampledAt: undefined });
+  observe('visitor', 2650, 2.3, { sampledAt: 2400 });
+  observe('host', 3100, 3, { ended: true, playing: false });
+  const held = send('host', 'unavailable', 3200, { reason: 'connection', position: 3 });
+  assert.equal(held.position, 2.55);
+  assert.equal(held.wantsPlay, true);
+});
+
 test('replacing the source retires an unsent audio report and an old Observe reply', async () => {
   const app = roomFixture({ automatic: true });
   app.approve();

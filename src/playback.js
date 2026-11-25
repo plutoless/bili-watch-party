@@ -129,6 +129,15 @@ export function createPlayback(duration = Infinity) {
     }
   }
 
+  function legacyAdvanceSteps(previous, reported, now) {
+    if (previous?.legacySteps === undefined || previous.at < startsAt) return 0;
+    const elapsed = now - previous.at;
+    const movement = reported - previous.position;
+    // The old page has no capture clock. Require a series that is plausible at receipt time.
+    return elapsed > 0 && elapsed <= progressLeaseMs && movement > 0 && movement <= elapsed / 1000 + alignmentTolerance
+      ? previous.legacySteps + 1 : 0;
+  }
+
   function observeProgress(player, command, now) {
     const { position: reported, ended: nativeEnded, playing } = command;
     const nearEnd = reported >= duration - alignmentTolerance && reported <= duration + alignmentTolerance;
@@ -142,18 +151,19 @@ export function createPlayback(duration = Infinity) {
     const hasSampleClock = Number.isFinite(command.sampledAt);
     const sampledAt = hasSampleClock ? command.sampledAt : now;
     const comparable = previous?.hasSampleClock === hasSampleClock;
-    if (comparable && sampledAt < previous.sampledAt) return;
+    if ((previous?.hasSampleClock && !hasSampleClock) || (comparable && sampledAt < previous.sampledAt)) return;
     const finished = previous?.finished || (observedAt >= startsAt && nativeEnded === true);
     const legacyEnd = legacy && observedAt >= startsAt && nearEnd;
     const moving = playing === true && observedAt >= startsAt && reported > position + 0.03;
     const advanced = moving && previous && reported > previous.position;
     const advancedAt = advanced ? now : moving ? previous?.advancedAt : undefined;
-    const stoppedSince = observedAt >= startsAt && !advanced && !finished && !legacyEnd
+    const legacySteps = legacy ? (legacyEnd ? 0 : legacyAdvanceSteps(previous, reported, now)) : undefined;
+    const stoppedSince = observedAt >= startsAt && !advanced && !legacySteps && !finished && !legacyEnd
       ? (comparable ? previous.stoppedSince : undefined) ?? sampledAt : undefined;
     // A numeric endpoint without native completion is not a playable resume target.
     const resumePosition = observedAt >= startsAt && reported < duration ? reported : previous?.resumePosition;
     player.progress = { version, startsAt, position: reported, at: observedAt, advancedAt, sampledAt, hasSampleClock, stoppedSince,
-      resumePosition, finished, legacyEnd, hasAdvanced: Boolean(advanced || previous?.hasAdvanced) };
+      resumePosition, finished, legacyEnd, legacySteps, hasAdvanced: Boolean(advanced || previous?.hasAdvanced) };
   }
 
   return {
@@ -276,12 +286,12 @@ export function createPlayback(duration = Infinity) {
         return progress && progress.sampledAt - progress.stoppedSince >= progressLeaseMs;
       });
       const lease = firstStartPending() ? firstStartProgressLeaseMs : progressLeaseMs;
-      const advancing = Object.fromEntries(roles.map(seat => {
+      const nativeAdvancing = Object.fromEntries(roles.map(seat => {
         const progress = planProgress(players[seat]);
         return [seat, progress !== undefined &&
           !stopped.includes(seat) && now - progress.advancedAt <= lease];
       }));
-      const playbackGap = advancing.host && advancing.visitor
+      const playbackGap = nativeAdvancing.host && nativeAdvancing.visitor
         ? Math.abs((players.host.progress.position - players.host.progress.at / 1000) -
           (players.visitor.progress.position - players.visitor.progress.at / 1000)) : null;
       const aligned = playbackGap !== null && playbackGap < 0.5;
@@ -296,8 +306,7 @@ export function createPlayback(duration = Infinity) {
       }
       const tailStalled = atTail && !firstStartPending() ? stopped.filter(seat => planProgress(players[seat])?.hasAdvanced) : [];
       if (tailStalled.length) {
-        const resume = Math.min(...tailStalled.map(seat => players[seat].progress.resumePosition ?? position));
-        align(Math.max(position, resume), true);
+        align(tailResumePosition(now) ?? position, true);
         for (const seat of tailStalled) players[seat].waiting = 'stalled';
       }
       // Use the silent preview as evidence that both players can advance, then start
@@ -307,16 +316,20 @@ export function createPlayback(duration = Infinity) {
         (stopped.length > 0 || currentPosition(now) >= duration);
       const startStalled = firstStart === 'starting' && stopped.length > 0;
       if (previewComplete || previewStalled || startStalled) {
-        const stalled = previewComplete ? [] : stopped.length ? stopped : roles.filter(seat => !advancing[seat]);
+        const stalled = previewComplete ? [] : stopped.length ? stopped : roles.filter(seat => !nativeAdvancing[seat]);
         if (previewComplete) firstStart = 'armed';
         if (startStalled) firstStart = 'preview';
         align(position, true);
         for (const seat of roles) {
-          advancing[seat] = false;
           if (stalled.includes(seat)) players[seat].waiting = 'buffering';
         }
       }
-      if (startsAt === null) for (const seat of roles) advancing[seat] = false;
+      const advancing = Object.fromEntries(roles.map(seat => {
+        const player = players[seat];
+        const progress = planProgress(player);
+        return [seat, startsAt !== null && (nativeAdvancing[seat] ||
+          (!player?.nativeEnd && progress?.legacySteps >= 2 && now - progress.at <= progressLeaseMs))];
+      }));
       const preview = firstStart === 'preview';
       return {
         conflict,
