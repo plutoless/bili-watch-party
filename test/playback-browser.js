@@ -98,11 +98,11 @@ async function waitForPlaying(page, after) {
 async function checkFullscreen(page, visitorPage) {
   const host = Boolean(visitorPage);
   const portrait = page.viewportSize();
-  const video = page.locator('video');
+  const screen = page.locator('#player-screen');
   const enter = page.getByRole('button', { name: '网页全屏', exact: true });
   const exit = page.getByRole('button', { name: '退出全屏', exact: true });
   const actions = page.locator('#playback-actions');
-  const tapVideo = () => video.tap({ position: { x: 50, y: 30 } });
+  const tapVideo = () => screen.tap({ position: { x: 50, y: 30 } });
   await enter.tap({ timeout: 5000 });
   for (const viewport of [portrait, { width: portrait.height, height: portrait.width }]) {
     await page.setViewportSize(viewport);
@@ -140,24 +140,29 @@ async function checkFullscreen(page, visitorPage) {
 }
 
 async function tryVisitorControls(page) {
-  const video = page.locator('video');
-  await video.scrollIntoViewIfNeeded();
+  const screen = page.locator('#player-screen');
+  await screen.scrollIntoViewIfNeeded();
   const started = performance.now();
   const before = (await playhead(page)).position;
-  await video.tap({ position: { x: 60, y: 45 } });
-  await video.dblclick({ position: { x: 60, y: 45 } });
-  const box = await video.boundingBox();
+  await screen.tap({ position: { x: 60, y: 45 } });
+  await screen.dblclick({ position: { x: 60, y: 45 } });
+  const box = await screen.boundingBox();
   await page.mouse.move(box.x + 30, box.y + 55);
   await page.mouse.down();
   await page.mouse.move(box.x + box.width - 30, box.y + 55, { steps: 5 });
   await page.mouse.up();
-  await page.evaluate(() => document.activeElement.blur());
-  for (const key of ['Space', 'ArrowRight', 'k']) await page.keyboard.press(key);
+  const reveal = page.getByRole('button', { name: '显示播放控件' });
+  if (await reveal.isVisible()) {
+    await reveal.press('Space');
+  } else {
+    await screen.focus();
+  }
+  for (const key of ['ArrowRight', 'k']) await page.keyboard.press(key);
   const after = await playhead(page);
   const elapsed = (performance.now() - started) / 1000;
   assert.ok(!after.paused && after.position >= before - 0.5 && after.position <= before + elapsed + 0.75,
     'Visitor gestures and shortcuts must leave the media following the room: ' +
-    JSON.stringify({ before, after, elapsed }));
+    JSON.stringify({ before, after, elapsed, player: await playbackDetails(page) }));
   for (const selector of ['#play', '#seek', '#end-after-playback']) {
     assert.equal(await page.locator(selector).isVisible(), false);
   }
@@ -166,8 +171,8 @@ async function tryVisitorControls(page) {
 function hostCommands(page, callback) {
   function record(request) {
     if (!request.url().endsWith('/playback') || request.method() !== 'POST') return;
-    const { action } = request.postDataJSON();
-    if (['play', 'pause', 'seek'].includes(action)) callback(action);
+    const operation = request.postDataJSON();
+    if (['play', 'pause', 'seek'].includes(operation.action)) callback(operation);
   }
   page.on('request', record);
   return () => page.off('request', record);
@@ -346,9 +351,10 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   const seekAcknowledgment = Promise.withResolvers();
   const releaseAcknowledgment = Promise.withResolvers();
   let holdSeek = false;
+  let seekTarget;
   await visitorPage.route(playbackRoute, async route => {
     const body = route.request().postDataJSON();
-    if (holdSeek && body.action === 'ready' && body.position > 35) {
+    if (holdSeek && body.action === 'ready' && Math.abs(body.position - seekTarget) <= 0.12) {
       seekAcknowledgment.resolve(body.position);
       await releaseAcknowledgment.promise;
     }
@@ -379,7 +385,10 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   assert.equal((await post(visitor, { ...command, role: 'visitor' })).status(), 403);
 
   const commands = [];
-  const stopRecording = [hostPage, visitorPage].map(page => hostCommands(page, action => commands.push(action)));
+  const stopRecording = [hostPage, visitorPage].map(page => hostCommands(page, operation => {
+    commands.push(operation.action);
+    if (page === hostPage && holdSeek && operation.action === 'seek') seekTarget = operation.position;
+  }));
   let started = performance.now();
   await play.tap();
   await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
@@ -409,8 +418,12 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
     await dragSeek(hostPage, 0.72);
     const target = await waitForSignal(seekAcknowledgment.promise, 'Visitor seek was not acknowledged');
     assert.ok(target > 35);
+    const waiting = await getTimeline();
+    assert.equal(waiting.startsAt, null);
+    assert.equal(waiting.wantsPlay, true);
+    assert.equal(waiting.ready.visitor, false);
     await Promise.all([hostPage, visitorPage].map(page =>
-      page.getByText('正在对齐进度，等待双方就绪。').waitFor()));
+      page.locator('#playback-status').filter({ hasText: /等待|缓冲/ }).waitFor({ timeout: 3500 })));
     await hostPage.getByText('访客 · 未就绪').waitFor();
     await hostPage.waitForFunction(target => {
       const video = document.querySelector('video');

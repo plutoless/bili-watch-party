@@ -15,6 +15,7 @@ function formatTime(seconds) {
 export function createPageFullscreen() {
   const page = document.getElementById('player');
   const button = document.getElementById('fullscreen');
+  const reveal = document.getElementById('reveal-playback-controls');
   const actions = document.getElementById('playback-actions');
   const video = document.getElementById('video');
   const outside = [...page.parentElement.children, ...page.closest('main').children]
@@ -43,6 +44,7 @@ export function createPageFullscreen() {
     for (const element of outside) element.inert = active;
     button.textContent = active ? '退出全屏' : '网页全屏';
     button.setAttribute('aria-pressed', String(active));
+    reveal.hidden = !active;
     button.focus({ preventScroll: true });
     showControls();
   });
@@ -59,14 +61,15 @@ export function createPageFullscreen() {
       exit();
     }
   });
-  for (const event of ['click', 'focus', 'pause', 'ended']) {
-    video.addEventListener(event, showControls);
-  }
+  reveal.addEventListener('click', showControls);
+  reveal.addEventListener('focus', showControls);
+  video.addEventListener('pause', showControls);
+  video.addEventListener('ended', showControls);
   video.addEventListener('playing', () => {
     if (!hideTimer && !actions.hidden) showControls();
   });
   actions.addEventListener('focusout', showControls);
-  video.addEventListener('contextmenu', event => event.preventDefault());
+  document.getElementById('player-screen').addEventListener('contextmenu', event => event.preventDefault());
   return { exit };
 }
 

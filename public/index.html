@@ -76,9 +76,10 @@
         </details>
       </section>
       <div id="player" role="region" aria-label="房间播放器" hidden>
-        <div class="player-screen">
-          <video id="video" playsinline disablepictureinpicture disableremoteplayback preload="auto" tabindex="0"
+        <div id="player-screen" tabindex="-1">
+          <video id="video" playsinline disablepictureinpicture disableremoteplayback preload="auto"
             aria-label="房间视频"></video>
+          <button id="reveal-playback-controls" type="button" aria-label="显示播放控件" hidden></button>
         </div>
         <div class="playback-controls">
           <div class="playback-toolbar">
