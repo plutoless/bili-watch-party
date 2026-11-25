@@ -680,16 +680,106 @@ test('a scheduled seek through the final frame can end without an audio hold', a
   const app = roomFixture({ automatic: true });
   app.approve();
   await app.advance(11500);
+  assert.equal(app.snapshot().synchronized, true);
+  const played = [];
+  for (const role of ['host', 'visitor']) {
+    const { video } = app[role];
+    const play = video.play;
+    video.play = function () {
+      played.push([role, video.currentTime]);
+      return play.call(this);
+    };
+  }
   const seek = app.host.element('seek');
   seek.value = 119.98;
   seek.dispatchEvent(new Event('change'));
   await app.advance(2900);
   const ended = app.snapshot();
+  assert.deepEqual(played.sort(), [['host', 119.98], ['visitor', 119.98]]);
+  assert.ok(app.host.video.ended && app.visitor.video.ended);
   assert.equal(ended.ended, true);
   assert.equal(ended.position, 120);
   assert.deepEqual(ended.waiting, { host: null, visitor: null });
   assert.equal(app.host.element('prepare').hidden, true);
   assert.equal(app.visitor.element('prepare').hidden, true);
+});
+
+test('normal playback ends after both media elements finish naturally', async () => {
+  const app = roomFixture({ duration: 3 });
+  await app.start();
+  const plan = app.snapshot();
+  assert.equal(plan.synchronized, true);
+  await app.advance(plan.startsAt + 2500 - app.now());
+  const { video: visitorVideo } = app.visitor;
+  const visitorPosition = visitorVideo.currentTime;
+  visitorVideo.currentTime = visitorPosition;
+  visitorVideo.stuck = true;
+  await app.advance(plan.startsAt + 3000 - app.now());
+  const { video: hostVideo } = app.host;
+  assert.equal(hostVideo.ended, true);
+  hostVideo.readyState = hostVideo.HAVE_CURRENT_DATA;
+  hostVideo.dispatchEvent(new Event('ended'));
+  hostVideo.dispatchEvent(new Event('waiting'));
+  assert.equal(visitorVideo.ended, false);
+  await app.advance(250);
+  const waitingForVisitor = app.snapshot();
+  assert.equal(waitingForVisitor.waiting.host, null);
+  assert.equal(waitingForVisitor.startsAt, plan.startsAt);
+  assert.equal(waitingForVisitor.ended, false);
+  visitorVideo.stuck = false;
+  visitorVideo.currentTime = visitorPosition;
+  await app.advance(800);
+  assert.equal(visitorVideo.ended, true);
+  assert.equal(app.snapshot().ended, true);
+  assert.equal(app.host.element('play').textContent, '重播');
+});
+
+test('a pending tail seek reaches the native start watchdog before it can end the room', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  assert.equal(app.snapshot().synchronized, true);
+  const { video, element, gain } = app.host;
+  const previous = Promise.withResolvers();
+  const play = video.play;
+  let attemptedAt;
+  video.play = function () {
+    if (attemptedAt !== undefined) return play.call(this);
+    attemptedAt = app.now();
+    return previous.promise;
+  };
+  element('seek').value = 119.98;
+  element('seek').dispatchEvent(new Event('change'));
+  for (let i = 0; i < 20 && attemptedAt === undefined; i++) await app.advance(100);
+  assert.ok(attemptedAt !== undefined);
+  const scheduled = app.snapshot();
+  await app.advance(attemptedAt + 600 - app.now());
+  assert.ok(app.now() > scheduled.startsAt + 20);
+  assert.equal(video.currentTime, 119.98);
+  assert.equal(video.ended, false);
+  assert.equal(app.snapshot().ended, false);
+  assert.equal(app.snapshot().startsAt, scheduled.startsAt);
+  assert.equal(app.visitor.video.ended, true);
+  await app.advance(attemptedAt + 1300 - app.now());
+  const held = app.snapshot();
+  assert.equal(held.ended, false);
+  assert.equal(held.position, 119.98);
+  assert.equal(held.startsAt, null);
+  assert.equal(held.wantsPlay, true);
+  assert.equal(held.waiting.host, 'audio');
+  assert.deepEqual(held.blocked, []);
+  assert.ok(video.paused && app.visitor.video.paused);
+  assert.equal(gain.value, 0);
+  assert.equal(app.visitor.gain.value, 0);
+  assert.equal(element('prepare').textContent, '重试音频');
+  assert.equal(element('prepare').hidden, false);
+  assert.equal(app.visitor.element('prepare').hidden, true);
+  app.host.allowPlayback();
+  previous.reject(new DOMException('Obsolete scheduled start', 'NotAllowedError'));
+  await app.advance(2400);
+  assert.ok(video.ended && app.visitor.video.ended);
+  assert.equal(app.snapshot().ended, true);
+  assert.deepEqual(app.snapshot().blocked, []);
 });
 
 test('replacing the source retires an unsent audio report and an old Observe reply', async () => {
@@ -720,6 +810,46 @@ test('replacing the source retires an unsent audio report and an old Observe rep
   assert.ok(app.visitorWire.some(row => row.action === 'observe' && row.sent >= replacedAt && row.received < older.received));
 });
 
+test('changing the source retires an unsent buffering report without retracting a sent report', async t => {
+  for (const timing of ['unsent', 'same source', 'already sent']) await t.test(timing, async () => {
+    const app = roomFixture({ automatic: true });
+    app.approve();
+    await app.advance(11500);
+    const current = app.snapshot();
+    assert.equal(current.synchronized, true);
+    if (timing !== 'already sent') {
+      app.setDelay(0, 900);
+      await app.advance(200);
+      app.setDelay(0, 0);
+    } else app.setDelay(0, 100);
+    const { player, video } = app.visitor;
+    video.readyState = video.HAVE_CURRENT_DATA;
+    video.dispatchEvent(new Event('waiting'));
+    const sent = timing === 'already sent';
+    if (sent) {
+      for (let elapsed = 0; elapsed < 410 && !app.snapshot().waiting.visitor; elapsed += 10) await app.advance(10);
+      await app.advance(1);
+    } else await app.advance(410);
+    assert.equal(video.paused, true);
+    const changedAt = app.now();
+    assert.equal(app.snapshot().waiting.visitor, sent ? 'buffering' : null);
+    player.load(timing === 'same source' ? '/media/synthetic.mp4' : '/media/replacement.mp4');
+    video.readyState = video.HAVE_FUTURE_DATA + 1;
+    await app.advance(1600);
+    const reports = app.visitorWire.filter(row => row.action === 'unavailable' && row.status === 200);
+    if (timing === 'unsent') {
+      assert.deepEqual(reports, []);
+      assert.equal(app.snapshot().version, current.version);
+      assert.equal(app.snapshot().synchronized, true);
+    } else {
+      assert.equal(reports.length, 1);
+      assert.equal(reports[0].sent < changedAt, sent);
+      if (sent) assert.ok(reports[0].received > changedAt);
+      assert.equal(app.snapshot().version, current.version + 1);
+    }
+  });
+});
+
 test('cancel, source and seat changes retire a pending scheduled play', async t => {
   for (const changed of ['cancel', 'source', 'seat']) await t.test(changed, async () => {
     const previous = Promise.withResolvers();
@@ -734,9 +864,10 @@ test('cancel, source and seat changes retire a pending scheduled play', async t 
       element('seek').value = position;
       element('seek').dispatchEvent(new Event('change'));
     };
-    seek(25);
+    seek(119.98);
     for (let i = 0; i < 20 && !attempts; i++) await app.advance(100);
     assert.equal(attempts, 1);
+    assert.equal(app.snapshot().ended, false);
     if (changed === 'cancel') element('play').dispatchEvent(new Event('click'));
     else if (changed === 'source') {
       player.load('/media/replacement.mp4');
@@ -751,6 +882,7 @@ test('cancel, source and seat changes retire a pending scheduled play', async t 
     previous.reject(new DOMException('Obsolete scheduled start', 'NotAllowedError'));
     await app.advance(1800);
     const result = app.snapshot();
+    assert.equal(result.ended, false);
     assert.deepEqual(result.blocked, []);
     assert.notEqual(result.waiting.host, 'audio');
     assert.equal(element('prepare').hidden, true);

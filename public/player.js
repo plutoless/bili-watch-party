@@ -122,7 +122,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   let stallTimer;
   let mediaRecoveryRetry;
   let visitorBufferingTimeline;
-  let hasStartedScheduledPlayback = false;
+  let startedPlan;
   let inFlight;
   let priming;
   let primed = false;
@@ -279,7 +279,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   function pauseAndAlign(target) {
     pauseVideo();
     if (video.readyState >= video.HAVE_METADATA && !video.seeking &&
-        Math.abs(video.currentTime - target) > alignmentTolerance) {
+        ((video.ended && target < video.duration) || Math.abs(video.currentTime - target) > alignmentTolerance)) {
       if (target === 0 && canRetryInitialRewind()) initialRewindRetry = 'rewinding';
       video.currentTime = target;
     }
@@ -409,7 +409,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   }
 
   function checkBuffering() {
-    if (unavailableReport || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData()) return;
+    if (unavailableReport || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData() ||
+        finishedPlan()) return;
     reportUnavailable('buffering');
   }
 
@@ -430,6 +431,10 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   function samePlan(attempt) {
     return activePlan() && state.epoch === attempt.epoch && state.version === attempt.version &&
       state.startsAt === attempt.startsAt && video.getAttribute('src') === attempt.source;
+  }
+
+  function finishedPlan() {
+    return video.ended && Boolean(startedPlan && samePlan(startedPlan));
   }
 
   function holdForAudio() {
@@ -481,7 +486,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const complete = video.ended ? advanced > 0 && video.currentTime >= video.duration - alignmentTolerance
       : !video.paused && advanced > 0.03;
     if (!complete) return false;
-    hasStartedScheduledPlayback = true;
+    startedPlan = attempt;
     clearPendingStart();
     return true;
   }
@@ -571,8 +576,11 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     const needsRateCorrection = !(audio && host && state.playbackGap !== null && state.playbackGap < 0.3);
     if ((distance > 1.25 || hardDriftSamples >= 2) && now >= nextHardSeek) {
       // Allow for the time spent decoding the destination while the room keeps playing.
+      const catchUp = positionAt(now + driftSeekLeadMs);
+      // Let native playback reach the last frame instead of seeking to the duration.
+      if (catchUp >= video.duration) return;
       driftSeekStarted = performance.now();
-      video.currentTime = positionAt(now + driftSeekLeadMs);
+      video.currentTime = catchUp;
       setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
@@ -615,8 +623,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       }, untilStart);
       return;
     }
-    const target = positionAt(now);
-    if (!Number.isFinite(target) || target >= video.duration) return;
+    if (!Number.isFinite(positionAt(now)) || video.ended) return;
     if (video.paused) {
       // An early readiness snapshot can precede a Pause that supersedes the scheduled start.
       if ((!host || state.firstStartPending) && state.serverTime < state.startsAt - lead - startSnapshotLeadMs) {
@@ -668,7 +675,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       video.paused && !video.seeking && hasPlaybackData() ? state.startsAt : undefined;
     const sampledAt = performance.now();
     return { action: 'observe', epoch, version, position: mediaPosition(), sampledAt, observedAt: sampledAt + offset,
-      playing: mediaPlaying(), ended: video.ended, startAcknowledgment,
+      playing: mediaPlaying(), ended: finishedPlan(), startAcknowledgment,
       startConfirmation: state.startAcknowledged ? startAcknowledgment : undefined };
   }
 
@@ -742,7 +749,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
       if (state && (epochChanged || (previouslyOwned && !result.ownsSeat) || result.otherPlayer)) {
         if (priming) pauseVideo();
         priming = undefined;
-        hasStartedScheduledPlayback = primed = claim = false;
+        startedPlan = undefined;
+        primed = claim = false;
         visitorBufferingTimeline = undefined;
         pendingClaimId = undefined;
       }
@@ -807,7 +815,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
           state.wantsPlay && state.startsAt === null && !state.ready[role] && !queuedCommand;
         mediaRecoveryRetry = mayRetry && (recoveringVisitorInterruption || hostInterruptedBufferingStart)
           ? { timeline, source: video.getAttribute('src'), afterVisitorInterruption: recoveringVisitorInterruption } : undefined;
-        visitorBufferingTimeline = mayRetry && hasStartedScheduledPlayback && state.waiting.visitor === 'buffering'
+        visitorBufferingTimeline = mayRetry && startedPlan && state.waiting.visitor === 'buffering'
           ? timeline : undefined;
         clearPendingStart();
         hardDriftSamples = 0;
@@ -1032,6 +1040,10 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   });
   video.addEventListener('timeupdate', renderTime);
   video.addEventListener('playing', render);
+  video.addEventListener('ended', () => {
+    completeScheduledStart(pendingStart);
+    wake();
+  });
   for (const event of ['progress', 'durationchange', 'emptied']) video.addEventListener(event, renderBuffer);
 
   return {
@@ -1059,18 +1071,20 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
         loadGeneration++;
         inFlight?.controller.abort();
         inFlight = undefined;
+        clearTimeout(stallTimer);
+        // A pending buffering or audio report describes the previous source.
         if (unavailableReport?.reason === 'audio') {
-          unavailableReport = undefined;
           audioFailed = audioRetryRequired = false;
         }
+        unavailableReport = undefined;
       }
       if (priming || pendingStart) pauseVideo();
       priming = undefined;
       clearTimeout(startTimer);
       clearPendingStart();
       clearAudioLoss();
-      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = undefined;
-      hasStartedScheduledPlayback = initialReloadClosed = false;
+      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = startedPlan = undefined;
+      initialReloadClosed = false;
       video.src = url;
       clearInterval(driftTimer);
       driftTimer = setInterval(correctDrift, driftCheckMs);
@@ -1079,8 +1093,8 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
     },
     stop() {
       loadGeneration++;
-      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = undefined;
-      hasStartedScheduledPlayback = initialReloadClosed = false;
+      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = startedPlan = undefined;
+      initialReloadClosed = false;
       clearTimeout(poll);
       clearTimeout(startTimer);
       clearInterval(driftTimer);

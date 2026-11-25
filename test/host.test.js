@@ -744,7 +744,15 @@ test('only the host directs playback and both players must acknowledge the curre
   await send('host', 'ready', nearEndTarget);
   const finishing = await send('visitor', 'ready', nearEndTarget).then(r => r.json());
   now = finishing.startsAt + 1_100;
-  const ended = await send('visitor', 'observe').then(r => r.json());
+  const terminalFrame = { ...nearEndTarget, position: 120, ended: true };
+  const projectedEnd = await send('visitor', 'observe', { ...terminalFrame, ended: false }).then(r => r.json());
+  assert.equal(projectedEnd.ended, false);
+  assert.equal(projectedEnd.startsAt, finishing.startsAt);
+  const hostFinished = await send('host', 'observe', terminalFrame).then(r => r.json());
+  assert.equal(hostFinished.ended, false);
+  const obsolete = await send('visitor', 'observe', { ...terminalFrame, version: finishing.version - 1 }).then(r => r.json());
+  assert.equal(obsolete.ended, false);
+  const ended = await send('visitor', 'observe', terminalFrame).then(r => r.json());
   assert.equal(ended.ended, true);
   assert.equal(ended.position, 120);
   assert.equal(ended.wantsPlay, false);

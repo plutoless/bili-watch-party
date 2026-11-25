@@ -131,13 +131,6 @@ export function createPlayback(duration = Infinity) {
       if (firstStart === 'armed' && startsAt !== null && now >= startsAt && startConfirmed()) {
         firstStart = 'starting';
       }
-      const shortFirstStart = firstStart !== null && duration - position <= minimumPreviewDuration;
-      if (startsAt !== null && currentPosition(now) >= duration && !firstStartPending() && !shortFirstStart) {
-        align(duration, false);
-        ended = true;
-        firstStart = null;
-      }
-
       const player = players[role];
       const ownsSeat = player?.id === playerId;
       let conflict = false;
@@ -226,7 +219,7 @@ export function createPlayback(duration = Infinity) {
           const stoppedSince = observedAt >= startsAt && !advanced && command.ended !== true
             ? (sameTimeline ? previous.stoppedSince : undefined) ?? sampledAt : undefined;
           currentPlayer.progress = { version, position: command.position, at: observedAt, advancedAt, sampledAt, stoppedSince,
-            finished: command.ended === true && command.position >= duration - alignmentTolerance };
+            finished: observedAt >= startsAt && command.ended === true && command.position >= duration - alignmentTolerance };
           if (firstStart === 'armed' && command.startAcknowledgment === startsAt &&
               Math.abs(command.position - position) <= alignmentTolerance) {
             currentPlayer.startAcknowledgment = startsAt;
@@ -252,7 +245,9 @@ export function createPlayback(duration = Infinity) {
           (players.visitor.progress.position - players.visitor.progress.at / 1000)) : null;
       const aligned = playbackGap !== null && playbackGap < 0.5;
       if (firstStart === 'starting' && aligned) firstStart = 'confirmed';
-      if (shortFirstStart && (firstStart === 'starting' || firstStart === 'confirmed') && currentPosition(now) >= duration &&
+      const shortFirstStart = firstStart === 'starting' && duration - position <= minimumPreviewDuration;
+      // The projected position can reach the end before a player has shown its terminal frame.
+      if (startsAt !== null && (!firstStartPending() || shortFirstStart) && currentPosition(now) >= duration &&
           roles.every(seat => players[seat]?.progress?.version === version && players[seat].progress.finished)) {
         align(duration, false);
         ended = true;
