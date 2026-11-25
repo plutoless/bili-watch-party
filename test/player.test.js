@@ -11,7 +11,7 @@ const playerSource = readFileSync(new URL('../public/player.js', import.meta.url
   .replace('    authorizeApproval() {', '    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    authorizeApproval() {');
 
 function roomFixture({ automatic = false, blocked = [], duration = 120,
-  audioStage = () => {}, suspendHostAudio = false } = {}) {
+  audioStage = () => {}, suspendHostAudio = false, resumeHostAudio, cancelHostStart = false } = {}) {
   const room = createPlayback(duration);
   const timers = new Set();
   const saved = { host: new Map(), visitor: new Map() };
@@ -70,6 +70,7 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
     let position = 0;
     let updatedAt = now;
     let rate = 1;
+    let mediaAssociated = false;
     Object.assign(video, {
       duration, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
       readyState: 4, seeking: false, paused: true, src: '',
@@ -124,22 +125,31 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
         removeItem: key => saved[role].delete(key) },
       performance: { now: () => now },
       AbortController, AbortSignal, DOMException,
-      AudioContext: class {
+      AudioContext: class extends EventTarget {
         state = role === 'host' && suspendHostAudio ? 'suspended' : 'running';
-        constructor() { audioStage(role, 'context'); }
+        constructor() { super(); audioStage(role, 'context'); }
         createGain() {
           audioStage(role, 'gain');
           return { gain, connect() { audioStage(role, 'gain connection'); } };
         }
         createMediaElementSource() {
+          if (mediaAssociated) throw new DOMException('Media already associated', 'InvalidStateError');
           audioStage(role, 'media source');
+          mediaAssociated = true;
           return { connect: node => { audioStage(role, 'media connection'); return node; } };
         }
         resume() {
           audioStage(role, 'resume');
+          if (role === 'host' && resumeHostAudio) {
+            return resumeHostAudio().then(() => {
+              this.state = 'running';
+              this.dispatchEvent(new Event('statechange'));
+            });
+          }
           this.state = 'running';
           return Promise.resolve();
         }
+        close() { audioStage(role, 'close'); return Promise.resolve(); }
       },
       setTimeout: schedule,
       setInterval: (fn, delay) => schedule(fn, delay, true),
@@ -213,6 +223,8 @@ function roomFixture({ automatic = false, blocked = [], duration = 120,
     };
     const player = runInNewContext(playerSource + '\ncreatePlayer', context)({
       apiOrigin: '', roomPath: '/rooms/synthetic', role,
+      cancelFirstStart: role === 'host' && cancelHostStart
+        ? playerId => Promise.resolve(room.cancelFirstStart(playerId, now)) : undefined,
     });
     player.load('/media/synthetic.mp4');
     if (automatic) player.admit();
@@ -304,6 +316,167 @@ test('approval reuses the native click even when audio setup consumes 5095 ms', 
       assert.equal(events.find(({ stage }) => stage === 'resume').at, started);
       assert.equal(events.filter(({ stage }) => stage === 'context').length, 1);
       assert.ok(gainWrites.length > 0 && gainWrites.every(value => value === 0));
+    });
+  }
+});
+
+test('a transient audio graph failure has a safe ready-approval fallback', async t => {
+  await t.test('one failed constructor can recover before the approval click', async () => {
+    let contexts = 0;
+    const app = roomFixture({ audioStage(role, stage) {
+      if (role === 'host' && stage === 'context' && ++contexts === 1) throw new Error('Transient constructor failure');
+    } });
+    const { player, video, gain } = app.host;
+    const nativePlay = video.play;
+    const plays = [];
+    let active = false;
+    video.play = function () {
+      plays.push({ active, sameElement: this === video, gain: gain.value });
+      return nativePlay.call(this);
+    };
+    player.load('/media/synthetic.mp4', { prepareApproval: true });
+    await app.advance(1);
+    assert.equal(video.paused, true);
+    assert.deepEqual(plays, []);
+    active = true;
+    player.authorizeApproval();
+    active = false;
+    app.approve();
+    assert.deepEqual(plays, [{ active: true, sameElement: true, gain: 0 }]);
+    assert.equal(contexts, 2);
+  });
+
+  for (const failingStage of ['context', 'gain connection', 'media connection']) {
+    await t.test(failingStage, async () => {
+      const stages = [];
+      let available = false;
+      const app = roomFixture({ audioStage(role, stage) {
+        if (role !== 'host') return;
+        stages.push(stage);
+        if (!available && stage === failingStage) throw new Error('Audio output temporarily unavailable');
+      } });
+      const { player, video, element, gainWrites } = app.host;
+      let plays = 0;
+      const nativePlay = video.play;
+      video.play = function () { plays++; return nativePlay.call(this); };
+      player.load('/media/synthetic.mp4', { prepareApproval: true });
+      player.authorizeApproval();
+      app.approve();
+      player.admit();
+      app.visitor.player.admit();
+      await app.advance(300);
+      assert.equal(plays, 0, 'No native play without a safely connected graph');
+      assert.equal(video.paused, true);
+      assert.equal(app.snapshot().startsAt, null);
+      assert.deepEqual(app.snapshot().blocked, []);
+      if (failingStage === 'gain connection') {
+        assert.equal(stages.includes('media source'), false, 'A failed destination must leave the video unassociated');
+        assert.ok(stages.includes('close'), 'Discard the unassociated context on setup failure');
+      }
+      assert.equal(element('prepare').hidden, false);
+      assert.equal(element('prepare').textContent, '重试音频');
+      assert.equal(app.visitor.element('prepare').hidden, true);
+      available = true;
+      app.host.allowPlayback();
+      assert.equal(plays, 1);
+      assert.equal(stages.filter(stage => stage === 'media source').length, 1);
+      assert.ok(gainWrites.every(value => value === 0));
+      await app.advance(11500);
+      assert.equal(app.snapshot().synchronized, true);
+    });
+  }
+});
+
+test('pending audio resumption is distinct from denial and belongs to the current attempt', async t => {
+  for (const delay of [600, 1200]) {
+    await t.test(delay + ' ms', async () => {
+      const resume = Promise.withResolvers();
+      const app = roomFixture({ automatic: true, suspendHostAudio: true, resumeHostAudio: () => resume.promise });
+      app.approve();
+      await app.advance(delay - 1);
+      assert.deepEqual(app.snapshot().blocked, []);
+      assert.notEqual(app.host.element('prepare').textContent, '允许播放');
+      assert.equal(app.host.video.paused, true, 'Pause the silent probe while waiting for audio');
+      assert.ok(app.host.gainWrites.every(value => value === 0));
+      resume.resolve();
+      await app.advance(11600);
+      assert.equal(app.snapshot().synchronized, true);
+      assert.equal(app.host.element('prepare').hidden, true);
+    });
+  }
+
+  await t.test('explicit denial prompts only the affected seat', async () => {
+    const resume = Promise.withResolvers();
+    const app = roomFixture({ automatic: true, suspendHostAudio: true, resumeHostAudio: () => resume.promise });
+    app.approve();
+    await app.advance(300);
+    assert.deepEqual(app.snapshot().blocked, []);
+    resume.reject(new DOMException('Audio denied', 'NotAllowedError'));
+    await app.advance(300);
+    assert.deepEqual(app.snapshot().blocked, ['host']);
+    assert.equal(app.host.element('prepare').textContent, '允许播放');
+    assert.equal(app.host.element('prepare').hidden, false);
+    assert.equal(app.visitor.element('prepare').hidden, true);
+    assert.ok(app.host.gainWrites.every(value => value === 0));
+  });
+
+  await t.test('local retry is available while native play and resume are pending', async () => {
+    const previousPlay = Promise.withResolvers();
+    const previousResume = Promise.withResolvers();
+    const requestedResume = Promise.withResolvers();
+    let resumes = 0;
+    let plays = 0;
+    const app = roomFixture({ automatic: true, suspendHostAudio: true,
+      resumeHostAudio: () => (++resumes === 1 ? previousResume.promise : requestedResume.promise) });
+    const { video, element, gainWrites } = app.host;
+    const nativePlay = video.play;
+    video.play = function () {
+      return ++plays === 1 ? previousPlay.promise : nativePlay.call(this);
+    };
+    app.approve();
+    await app.advance(300);
+    assert.equal(element('prepare').hidden, false);
+    assert.equal(element('prepare').disabled, false);
+    assert.equal(element('prepare').textContent, '重试音频');
+    app.host.allowPlayback();
+    assert.equal(plays, 2);
+    assert.equal(resumes, 2);
+    previousPlay.reject(new DOMException('Obsolete video attempt', 'NotAllowedError'));
+    previousResume.resolve();
+    await app.advance(300);
+    assert.deepEqual(app.snapshot().blocked, []);
+    assert.equal(app.snapshot().ready.host, false);
+    assert.ok(gainWrites.every(value => value === 0));
+    requestedResume.resolve();
+    await app.advance(11600);
+    assert.equal(app.snapshot().synchronized, true);
+  });
+
+  for (const reject of [false, true]) {
+    await t.test('obsolete ' + (reject ? 'rejection' : 'fulfillment') + ' after cancellation', async () => {
+      const first = Promise.withResolvers();
+      const second = Promise.withResolvers();
+      let resumes = 0;
+      const app = roomFixture({ automatic: true, suspendHostAudio: true, cancelHostStart: true,
+        resumeHostAudio: () => (++resumes === 1 ? first.promise : second.promise) });
+      app.approve();
+      await app.advance(300);
+      app.host.element('play').dispatchEvent(new Event('click'));
+      await app.advance(300);
+      assert.equal(app.snapshot().wantsPlay, false);
+      assert.equal(app.host.video.paused, true);
+      app.host.element('play').dispatchEvent(new Event('click'));
+      await app.advance(300);
+      assert.equal(resumes, 2);
+      if (reject) first.reject(new DOMException('Old denial', 'NotAllowedError'));
+      else first.resolve();
+      await app.advance(400);
+      assert.equal(app.snapshot().ready.host, false);
+      assert.deepEqual(app.snapshot().blocked, []);
+      assert.ok(app.host.gainWrites.every(value => value === 0));
+      second.resolve();
+      await app.advance(11600);
+      assert.equal(app.snapshot().synchronized, true);
     });
   }
 });
