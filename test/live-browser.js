@@ -9,6 +9,7 @@ import { chromium, devices, webkit } from 'playwright';
 import { createImporter, ImportError } from '../src/importer.js';
 import { createR2Media } from '../src/r2-media.js';
 import { startServer } from '../src/server.js';
+import { formatBrowserFailure } from './browser-failure.js';
 import { checkPlaybackReconnect, checkSharedPlayback } from './playback-browser.js';
 import { startR2Fixture } from './r2-fixture.js';
 import { createLoopbackTls, readLoopbackTls, startSplitFixture } from './split-browser-fixture.js';
@@ -57,6 +58,12 @@ const browsers = [];
 let failNextRequest = simulateFirstFailure;
 let importGate;
 let clockOffset = 0;
+let failurePhase = 'configuration';
+
+function reportFailure(error, phase = failurePhase) {
+  console.error('Live check failed:', formatBrowserFailure(error, phase));
+  process.exitCode = 1;
+}
 
 async function checkMediaFile(output) {
   const { stdout } = await run(ffprobe, [
@@ -107,6 +114,7 @@ async function syntheticTracks(directory) {
 }
 
 async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorProfile, origin, apiOrigin, checkFile) {
+  failurePhase = 'room admission';
   const hostOptions = { ...devices[hostProfile], ignoreHTTPSErrors };
   const visitorOptions = { ...devices[visitorProfile], ignoreHTTPSErrors };
   const host = await hostBrowser.newContext(hostOptions);
@@ -289,6 +297,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
       assert.equal(cookie.domain, new URL(apiOrigin).hostname);
     }
   }
+  failurePhase = 'media access';
   const roomResponse = await host.request.get(apiOrigin + '/api' + hostPath);
   assert.equal(roomResponse.status(), 200);
   const room = await roomResponse.json();
@@ -363,6 +372,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   await strangerPage.getByRole('heading', { name: '房主登录' }).waitFor();
   assert.equal(await strangerPage.locator('video').getAttribute('src'), null);
 
+  failurePhase = 'shared playback';
   await checkSharedPlayback({
     hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia,
   });
@@ -372,6 +382,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     await checkMediaFile(path);
   }
 
+  failurePhase = 'public lifecycle';
   let finalMedia = mediaUrl;
   if (publicMedia) {
     for (const page of [hostPage, visitorPage]) {
@@ -418,6 +429,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   }
 
   await openManagement();
+  failurePhase = 'room revocation';
   hostPage.once('dialog', dialog => dialog.accept());
   await hostPage.getByRole('button', { name: '结束房间' }).tap();
   await watchStatus(hostPage, 'ended').waitFor();
@@ -471,6 +483,7 @@ try {
     assert.ok(password, 'Set HOST_PASSWORD for the deployed browser run');
     assert.ok(!simulateFirstFailure, 'Failure injection requires the test-managed app server');
   } else {
+    failurePhase = 'fixture setup';
     if (r2Fixture) {
       const tls = await readLoopbackTls(fixtureTlsDir);
       storage = await startR2Fixture({ tls });
@@ -515,6 +528,7 @@ try {
   }
   const origin = deployedOrigin ?? fixture?.webOrigin ?? app.origin;
   const apiOrigin = deployedApiOrigin ?? fixture?.apiOrigin ?? origin;
+  failurePhase = 'browser launch';
   browsers.push(await chromium.launch());
   browsers.push(await webkit.launch());
   const [android, iphone] = browsers;
@@ -529,16 +543,16 @@ try {
     await checkSessions(host, hostProfile, visitor, visitorProfile, origin, apiOrigin, checkFile);
   }
 } catch (error) {
-  console.error('Live check failed:', error.message
-    .replace(/\/(rooms|media|invite)\/[a-f0-9-]+(?:\.mp4|#[a-f0-9]+)?/g, '/$1/[redacted]')
-    .replace(/\/[a-f0-9-]{36}\.mp4/g, '/[redacted].mp4')
-    .replaceAll(mediaDir ?? '\0', '[temporary data]'));
-  process.exitCode = 1;
+  reportFailure(error);
 } finally {
-  importGate?.resolve();
-  await Promise.all(browsers.map(browser => browser.close()));
-  await fixture?.close();
-  await app?.close();
-  await storage?.close();
-  if (dataDir) await rm(dataDir, { recursive: true, force: true });
+  try {
+    importGate?.resolve();
+    await Promise.all(browsers.map(browser => browser.close()));
+    await fixture?.close();
+    await app?.close();
+    await storage?.close();
+    if (dataDir) await rm(dataDir, { recursive: true, force: true });
+  } catch (error) {
+    reportFailure(error, 'cleanup');
+  }
 }
