@@ -379,7 +379,7 @@ test('an offline pause stays visible after the host refreshes without probing pl
   assert.equal(app.host.element('playback-status').textContent, '已暂停，等待房主播放。');
 });
 
-test('first start waits for both acknowledgments before releasing audio', () => {
+function firstStartAfterPreview() {
   const room = createPlayback(120);
   const ids = { host: randomUUID(), visitor: randomUUID() };
   const update = (role, action, now, fields) =>
@@ -404,6 +404,11 @@ test('first start waits for both acknowledgments before releasing audio', () => 
   const agree = (role, now, deadline, confirms) => update(role, 'observe', now, {
     ...realTarget, startAcknowledgment: deadline, startConfirmation: confirms ? deadline : undefined,
   });
+  return { update, realTarget, first, agree };
+}
+
+test('first start waits for both acknowledgments before releasing audio', () => {
+  const { update, realTarget, first, agree } = firstStartAfterPreview();
   agree('host', 1500, first.startsAt);
   agree('visitor', 1700, first.startsAt);
   agree('visitor', 1900, first.startsAt, true);
@@ -432,6 +437,28 @@ test('first start waits for both acknowledgments before releasing audio', () => 
   assert.equal(visitor.startsAt, deadline, 'A late report does not prove that the host stalled');
   assert.equal(visitor.firstStartPending, false, 'Healthy peers with reports 800 ms apart can release audio');
   assert.equal(visitor.synchronized, true);
+});
+
+test('a proven stall takes priority when stale movement projects both playheads to the same position', () => {
+  const { update, realTarget, first, agree } = firstStartAfterPreview();
+  const deadline = first.startsAt;
+  agree('host', 1500, deadline);
+  agree('visitor', 1700, deadline, true);
+  assert.equal(agree('host', 1900, deadline, true).startConfirmed, true);
+  for (let now = 2500; now < deadline; now += 1000) {
+    for (const role of ['host', 'visitor']) agree(role, now, deadline, true);
+  }
+  const report = (role, elapsed, position) => update(role, 'observe', deadline + elapsed,
+    { ...realTarget, position, playing: true });
+  report('host', 100, 0.1);
+  report('host', 300, 0.3);
+  report('host', 400, 0.3);
+  assert.equal(report('visitor', 900, 0.1).firstStartPending, true);
+  const stalled = report('host', 1100, 0.3);
+  assert.equal(stalled.firstStartPending, true, 'The player must keep gain closed');
+  assert.equal(stalled.synchronized, false);
+  assert.equal(stalled.startsAt, null);
+  assert.equal(stalled.waiting.host, 'buffering');
 });
 
 function shortFirstStartFixture() {

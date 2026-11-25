@@ -236,10 +236,16 @@ export function createPlayback(duration = Infinity) {
           }
         }
       }
+      // A missing report is different from consecutive samples proving the media clock stopped.
+      const stopped = roles.filter(seat => {
+        const progress = players[seat]?.progress;
+        return progress?.version === version && progress.sampledAt - progress.stoppedSince >= progressLeaseMs;
+      });
+      const lease = firstStartPending() ? firstStartProgressLeaseMs : progressLeaseMs;
       const advancing = Object.fromEntries(roles.map(seat => {
         const progress = players[seat]?.progress;
-        const lease = firstStartPending() ? firstStartProgressLeaseMs : progressLeaseMs;
-        return [seat, startsAt !== null && progress?.version === version && now - progress.advancedAt <= lease];
+        return [seat, startsAt !== null && progress?.version === version &&
+          !stopped.includes(seat) && now - progress.advancedAt <= lease];
       }));
       const playbackGap = advancing.host && advancing.visitor
         ? Math.abs((players.host.progress.position - players.host.progress.at / 1000) -
@@ -255,11 +261,6 @@ export function createPlayback(duration = Infinity) {
       // Use the silent preview as evidence that both players can advance, then start
       // the real playback from the original target after both players align again.
       const previewComplete = firstStart === 'preview' && aligned;
-      const stopped = roles.filter(seat => {
-        const progress = players[seat]?.progress;
-        return progress?.version === version && progress.sampledAt - progress.stoppedSince >= progressLeaseMs;
-      });
-      // Missing or late observations are handled by the connection lease, not classified as a media stall.
       const previewStalled = firstStart === 'preview' && startsAt !== null &&
         (stopped.length > 0 || currentPosition(now) >= duration);
       const startStalled = firstStart === 'starting' && stopped.length > 0;
