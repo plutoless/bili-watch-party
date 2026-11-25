@@ -585,6 +585,148 @@ test('late shared audio recovery cannot outlive a source change or lost seat', a
   });
 });
 
+test('a suspended context cannot confirm a future first start', async () => {
+  const app = roomFixture({ automatic: true, resumeHostAudio: () => new Promise(() => {}) });
+  app.approve();
+  let plan;
+  for (let i = 0; i < 80; i++) {
+    await app.advance(25);
+    plan = app.snapshot();
+    if (plan.awaitingStart && plan.startsAt > app.now() && !plan.startConfirmed) break;
+  }
+  assert.ok(plan.awaitingStart && plan.startsAt > app.now() && !plan.startConfirmed);
+  app.host.audioContext.state = 'suspended';
+  app.host.audioContext.dispatchEvent(new Event('statechange'));
+  await app.advance(400);
+  const held = app.snapshot();
+  assert.equal(held.startsAt === plan.startsAt && held.startConfirmed, false);
+  assert.equal(held.waiting.host, 'audio');
+  assert.deepEqual(held.blocked, []);
+  assert.equal(app.host.gain.value, 0);
+  assert.equal(app.visitor.gain.value, 0);
+});
+
+test('pending scheduled play holds the room for a bounded local retry', async t => {
+  for (const reject of [false, true]) await t.test(reject ? 'late rejection' : 'late success', async () => {
+    const previous = Promise.withResolvers();
+    const app = roomFixture({ automatic: true });
+    app.approve();
+    await app.advance(11500);
+    assert.equal(app.snapshot().synchronized, true);
+    const { video, element, gain } = app.host;
+    const nativePlay = video.play;
+    let attempts = 0;
+    video.play = function () { return ++attempts === 1 ? previous.promise : nativePlay.call(this); };
+    element('seek').value = 25;
+    element('seek').dispatchEvent(new Event('change'));
+    await app.advance(3400);
+    const held = app.snapshot();
+    assert.equal(held.startsAt, null);
+    assert.equal(held.waiting.host, 'audio');
+    assert.equal(held.wantsPlay, true);
+    assert.deepEqual(held.blocked, []);
+    assert.equal(app.host.audioContext.state, 'running');
+    assert.equal(video.readyState, video.HAVE_FUTURE_DATA + 1);
+    assert.ok(video.paused && app.visitor.video.paused);
+    assert.equal(gain.value, 0);
+    assert.equal(app.visitor.gain.value, 0);
+    assert.equal(attempts, 1);
+    assert.equal(element('prepare').textContent, '重试音频');
+    assert.equal(element('prepare').hidden, false);
+    assert.equal(app.visitor.element('prepare').hidden, true);
+    app.host.allowPlayback();
+    if (reject) previous.reject(new DOMException('Obsolete scheduled start', 'NotAllowedError'));
+    else previous.resolve();
+    await app.advance(2400);
+    assert.equal(app.snapshot().synchronized, true);
+    assert.deepEqual(app.snapshot().blocked, []);
+    assert.equal(element('prepare').hidden, true);
+  });
+});
+
+test('cancel, source and seat changes retire a pending scheduled play', async t => {
+  for (const changed of ['cancel', 'source', 'seat']) await t.test(changed, async () => {
+    const previous = Promise.withResolvers();
+    const app = roomFixture({ automatic: true });
+    app.approve();
+    await app.advance(11500);
+    const { video, element, player } = app.host;
+    const play = video.play;
+    let attempts = 0;
+    video.play = function () { return ++attempts === 1 ? previous.promise : play.call(this); };
+    const seek = position => {
+      element('seek').value = position;
+      element('seek').dispatchEvent(new Event('change'));
+    };
+    seek(25);
+    for (let i = 0; i < 20 && !attempts; i++) await app.advance(100);
+    assert.equal(attempts, 1);
+    if (changed === 'cancel') element('play').dispatchEvent(new Event('click'));
+    else if (changed === 'source') {
+      player.load('/media/replacement.mp4');
+      seek(35);
+    } else {
+      const seat = app.savedHost();
+      const recovered = app.send({ action: 'recover', playerId: randomUUID(),
+        recoveryId: seat.recoveryId, recoveryGeneration: seat.recoveryGeneration + 1 });
+      assert.equal(recovered.state.ownsSeat, true);
+    }
+    await app.advance(500);
+    previous.reject(new DOMException('Obsolete scheduled start', 'NotAllowedError'));
+    await app.advance(1800);
+    const result = app.snapshot();
+    assert.deepEqual(result.blocked, []);
+    assert.notEqual(result.waiting.host, 'audio');
+    assert.equal(element('prepare').hidden, true);
+    if (changed === 'source') {
+      assert.equal(result.position, 35);
+      assert.equal(result.synchronized, true);
+    } else {
+      assert.equal(result.startsAt, null);
+      assert.ok(video.paused && app.visitor.video.paused);
+      assert.equal(app.host.gain.value, 0);
+      assert.equal(app.visitor.gain.value, 0);
+    }
+  });
+});
+
+test('audio state changes are observed inside a 900 ms reply gap', async t => {
+  for (const duration of [100, 410]) await t.test(duration + ' ms', async () => {
+    const app = roomFixture({ automatic: true });
+    app.approve();
+    await app.advance(11500);
+    const current = app.snapshot();
+    assert.equal(current.synchronized, true);
+    app.setDelay(0, 900);
+    await app.advance(200);
+    app.setDelay(0, 0);
+    const suspendedAt = app.now();
+    const { audioContext, gain } = app.visitor;
+    audioContext.state = 'suspended';
+    audioContext.dispatchEvent(new Event('statechange'));
+    const gainOnEvent = gain.value;
+    await app.advance(duration);
+    const pausedBeforeResponse = app.visitor.video.paused;
+    const peerPausedBeforeResponse = app.host.video.paused;
+    audioContext.state = 'running';
+    audioContext.dispatchEvent(new Event('statechange'));
+    await app.advance(650);
+    const observed = app.snapshot();
+    assert.equal(pausedBeforeResponse, duration > 200);
+    assert.equal(peerPausedBeforeResponse, false, 'The peer still awaits propagation of the local report');
+    assert.equal(gainOnEvent, 0);
+    assert.equal(observed.version > current.version, duration > 200);
+    assert.deepEqual(observed.blocked, []);
+    if (duration < 200) {
+      await app.advance(500);
+      assert.equal(app.snapshot().version, current.version);
+      assert.equal(app.snapshot().synchronized, true);
+    } else assert.notEqual(observed.startsAt, current.startsAt);
+    assert.ok(app.visitorWire.some(reply => reply.action === 'observe' && reply.received - reply.sent === 900 &&
+      reply.sent <= suspendedAt && reply.received > suspendedAt + duration));
+  });
+});
+
 test('initial play alone can stay pending and non-permission rejection allows a retry', async t => {
   await t.test('play alone stays pending', async () => {
     const previous = Promise.withResolvers();
@@ -627,18 +769,24 @@ test('initial play alone can stay pending and non-permission rejection allows a 
 
   await t.test('closed output requires a fresh page', async () => {
     let associations = 0;
+    let resumes = 0;
     const app = roomFixture({ automatic: true, suspendHostAudio: true,
-      audioStage(role, stage) { if (role === 'host' && stage === 'media source') associations++; },
+      audioStage(role, stage) {
+        if (role === 'host' && stage === 'media source') associations++;
+        if (role === 'host' && stage === 'resume') resumes++;
+      },
       resumeHostAudio: () => Promise.reject(new DOMException('Output closed', 'InvalidStateError')) });
     app.approve();
     await app.advance(400);
     app.host.audioContext.state = 'closed';
     app.host.audioContext.dispatchEvent(new Event('statechange'));
+    await app.advance(2300);
     assert.equal(app.host.element('prepare').textContent, '刷新页面');
     assert.equal(app.visitor.element('prepare').hidden, true);
     app.host.allowPlayback();
     assert.equal(app.host.reloads, 1);
     assert.equal(associations, 1);
+    assert.equal(resumes, 1, 'A known closed context is not probed again');
     assert.ok(app.host.gainWrites.every(value => value === 0));
   });
 });
