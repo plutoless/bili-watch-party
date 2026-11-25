@@ -775,6 +775,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     video.removeAttribute('src');
     video.load();
     byId('player').hidden = true;
+    if (host) byId('end-room').hidden = false;
   }
 
   return {

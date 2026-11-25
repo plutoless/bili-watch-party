@@ -80,6 +80,22 @@ test('R2 retries preserve one publication across an ambiguous write and restart'
   assert.equal(storage.objects.size, 1);
   assert.equal(storage.writes, 2);
   assert.equal(imports, 2);
+
+  const application = await app.request(roomPath + '/join', {
+    method: 'POST', body: { token: reimported.invitation.token },
+  });
+  const { requestId } = await application.json();
+  const visitor = application.headers.get('set-cookie').split(';')[0];
+  assert.equal((await app.request(roomPath + '/approve', { cookie, method: 'POST', body: { requestId } })).status, 200);
+  storage.remove(reimported.mediaUrl);
+  time += 60_000;
+  await app.status(cookie, id, 'media-expired');
+  const end = cookie => app.request(roomPath + '/end', { cookie, method: 'POST', body: {} });
+  assert.equal((await end()).status, 401);
+  assert.equal((await end(visitor)).status, 401);
+  const ended = await end(cookie);
+  assert.equal(ended.status, 200);
+  assert.equal((await ended.json()).status, 'ended');
 });
 
 async function setup(t, importVideo, options = {}) {

@@ -10,8 +10,8 @@ const playerSource = readFileSync(new URL('../public/player.js', import.meta.url
   .replaceAll('export function ', 'function ')
   .replace('  return {\n    load(', '  return {\n    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(');
 
-function roomFixture({ publicMedia = false } = {}) {
-  const room = createPlayback(120);
+function roomFixture({ publicMedia = false, duration = 120 } = {}) {
+  const room = createPlayback(duration);
   const timers = new Set();
   const saved = { host: new Map(), visitor: new Map() };
   let now = 1000;
@@ -70,7 +70,7 @@ function roomFixture({ publicMedia = false } = {}) {
     let rate = 1;
     const seeks = [];
     Object.assign(video, {
-      duration: 120, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
+      duration, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
       readyState: 4, seeking: false, paused: true, src: '',
       hasAttribute() { return Boolean(this.src); },
       getAttribute() { return this.src; },
@@ -220,6 +220,48 @@ function roomFixture({ publicMedia = false } = {}) {
     snapshot() { return room.update({ role: 'host', action: 'observe', playerId: randomUUID() }, now).state; },
   };
 }
+
+test('the host can still end the room when a naturally ended public video expires', async () => {
+  const app = roomFixture({ publicMedia: true, duration: 6 });
+  const { player, element, video } = app.host;
+  await app.start();
+  await app.advance(6500);
+  assert.equal(app.snapshot().ended, true);
+  assert.equal(element('end-room').hidden, true);
+  assert.equal(element('player').hidden, false);
+  assert.equal(element('end-after-playback').hidden, false);
+
+  // The room view stops the player when the expired room has no media URL.
+  player.stop();
+  assert.equal(video.src, '');
+  assert.equal(element('player').hidden, true);
+  assert.equal(element('end-room').hidden, false, 'the host can still end the expired room from management');
+
+  player.load('https://media.fixture.test/reimported.mp4', true);
+  assert.equal(element('player').hidden, false);
+  assert.equal(video.crossOrigin, 'anonymous');
+  assert.equal(element('end-after-playback').hidden, true, 'reimport must not reveal the previous playback end control');
+  assert.equal(element('end-room').hidden, false);
+});
+
+test('a naturally ended public video can still replay from zero', async () => {
+  const app = roomFixture({ publicMedia: true, duration: 6 });
+  await app.start();
+  await app.advance(6500);
+  assert.equal(app.snapshot().ended, true);
+  const play = app.host.element('play');
+  assert.equal(play.textContent, '重播');
+  play.dispatchEvent(new Event('click'));
+  await app.advance(2000);
+  assert.equal(app.snapshot().ended, false);
+  assert.equal(app.snapshot().position, 0);
+  for (const { video } of [app.host, app.visitor]) {
+    assert.equal(video.paused, false);
+    assert.ok(video.currentTime > 0.25 && video.currentTime < 2);
+  }
+  assert.equal(app.host.element('end-room').hidden, false);
+  assert.equal(app.host.element('end-after-playback').hidden, true);
+});
 
 for (const direction of [-1, 1]) {
   test('opposing 0.31 second errors converge when the host is ' + (direction > 0 ? 'ahead' : 'behind'), async t => {
