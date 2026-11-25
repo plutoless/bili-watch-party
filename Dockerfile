@@ -6,9 +6,10 @@ RUN apt-get update \
     && install -d -m 0700 -o node -g node /data
 
 WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund
 COPY src ./src
 COPY public ./public
-COPY package.json ./
 USER node
 ENV DATA_DIR=/data
 ARG RELEASE_SHA

@@ -17,5 +17,8 @@
   "devDependencies": {
     "playwright": "1.65.1"
   },
-  "private": true
+  "private": true,
+  "dependencies": {
+    "xgplayer": "3.0.27"
+  }
 }

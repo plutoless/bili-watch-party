@@ -12,6 +12,64 @@ function formatTime(seconds) {
   return Math.floor(whole / 60) + ':' + String(whole % 60).padStart(2, '0');
 }
 
+export function createPageFullscreen() {
+  const page = document.getElementById('player');
+  const button = document.getElementById('fullscreen');
+  const actions = document.getElementById('playback-actions');
+  const video = document.getElementById('video');
+  const outside = [...page.parentElement.children, ...page.closest('main').children]
+    .filter(element => !element.contains(page));
+  // The room renders its own controls. Disable the preset that installs local playback gestures.
+  const Player = window.Player;
+  const xgplayer = new Player({
+    el: page, mediaEl: video, presets: [class RoomPreset {}], controls: false,
+    width: 0, height: 0, videoInit: false, loop: false,
+  });
+  let hideTimer;
+
+  function showControls() {
+    clearTimeout(hideTimer);
+    hideTimer = undefined;
+    actions.hidden = false;
+    if (!xgplayer.cssfullscreen || video.paused) return;
+    hideTimer = setTimeout(() => {
+      hideTimer = undefined;
+      if (!actions.contains(document.activeElement)) actions.hidden = true;
+    }, 4500);
+  }
+
+  xgplayer.on(Player.Events.CSS_FULLSCREEN_CHANGE, active => {
+    document.documentElement.classList.toggle('room-fullscreen', active);
+    for (const element of outside) element.inert = active;
+    button.textContent = active ? '退出全屏' : '网页全屏';
+    button.setAttribute('aria-pressed', String(active));
+    button.focus({ preventScroll: true });
+    showControls();
+  });
+  function exit() {
+    if (xgplayer.cssfullscreen) xgplayer.exitCssFullscreen();
+  }
+  button.addEventListener('click', () => {
+    if (xgplayer.cssfullscreen) exit();
+    else xgplayer.getCssFullscreen();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && xgplayer.cssfullscreen) {
+      event.preventDefault();
+      exit();
+    }
+  });
+  for (const event of ['click', 'focus', 'pause', 'ended']) {
+    video.addEventListener(event, showControls);
+  }
+  video.addEventListener('playing', () => {
+    if (!hideTimer && !actions.hidden) showControls();
+  });
+  actions.addEventListener('focusout', showControls);
+  video.addEventListener('contextmenu', event => event.preventDefault());
+  return { exit };
+}
+
 export function createPlayer({ apiOrigin, roomPath, role }) {
   const byId = id => document.getElementById(id);
   const video = byId('video');
@@ -90,13 +148,34 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     if (element.textContent !== message) element.textContent = message;
   }
 
+  function hasDuration() {
+    return Number.isFinite(video.duration) && video.duration > 0;
+  }
+
   function renderTime() {
-    if (!Number.isFinite(video.duration)) return;
+    const known = hasDuration();
+    byId('playback-progress').hidden = host || !known;
+    if (!known) return;
     if (Number(seek.max) !== video.duration) seek.max = video.duration;
     if (!seekPreview) seek.value = video.currentTime;
     const time = seekPreview ? Number(seek.value) : video.currentTime;
     seek.setAttribute('aria-valuetext', formatTime(time));
     setText('playback-time', formatTime(time) + ' / ' + formatTime(video.duration));
+    if (!host) {
+      const playhead = byId('playhead');
+      playhead.max = video.duration;
+      playhead.value = time;
+    }
+  }
+
+  function renderBuffer() {
+    const known = hasDuration();
+    byId('playback-buffer').hidden = !known;
+    if (!known || !video.buffered) return;
+    const ranges = video.buffered;
+    let seconds = 0;
+    for (let index = 0; index < ranges.length; index++) seconds += ranges.end(index) - ranges.start(index);
+    byId('buffered').value = Math.min(100, Math.round(seconds / video.duration * 100));
   }
 
   function render() {
@@ -109,11 +188,13 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     prepare.disabled = priming || !state || networkError || video.readyState < video.HAVE_CURRENT_DATA;
     prepare.textContent = gestureFailed ? '再次点按以准备' : '准备好了';
     play.hidden = !host;
-    play.textContent = state?.wantsPlay ? '暂停' : '播放';
+    setText('play', state?.wantsPlay ? '暂停' : state?.ended ? '重播' : '播放');
+    byId('end-after-playback').hidden = !host || !state?.ended;
+    byId('end-room').hidden = Boolean(state?.ended);
     const canPauseSeek = state?.wantsPlay && queuedCommand?.action === 'seek';
     play.disabled = !canToggle || Boolean(queuedCommand && !canPauseSeek);
-    byId('seek-controls').hidden = !host;
-    seek.disabled = !canControl || Boolean(queuedCommand);
+    byId('seek-controls').hidden = !host || Boolean(state?.ended);
+    seek.disabled = !canControl || !hasDuration() || Boolean(queuedCommand);
 
     for (const [seat, name] of [['host', '房主'], ['visitor', '访客']]) {
       setText(seat + '-ready', name + ' · ' + (state?.ready[seat] ? '已就绪' : '未就绪'));
@@ -129,6 +210,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       status = '缓冲中，等待双方在同一位置就绪。';
     } else if (state?.startsAt != null) status = video.paused ? '即将同时播放…' : '正在同步播放';
     else if (state?.wantsPlay) status = '正在对齐进度，等待双方就绪。';
+    else if (state?.ended) status = host ? '播放结束。请选择重播或结束房间。' : '播放结束，等待房主决定。';
     else if (bothReady) status = '已暂停，等待房主播放。';
     else if (state) status = '等待双方就绪。';
     setText('playback-status', status);
@@ -555,7 +637,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
 
   function command(action, details) {
     const pausesSeek = action === 'pause' && queuedCommand?.action === 'seek';
-    if (!state?.ownsSeat || (queuedCommand && !pausesSeek) || (networkError && action !== 'pause')) return;
+    if (!host || !state?.ownsSeat || (queuedCommand && !pausesSeek) || (networkError && action !== 'pause')) return;
     mediaRecoveryRetry = visitorBufferingTimeline = undefined;
     queuedCommand = { action, ...details, epoch: state.epoch, version: state.version };
     if (action === 'seek') queuedCommand.seekId = crypto.randomUUID();
@@ -625,7 +707,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       }
     }
   });
-  play.addEventListener('click', () => command(state.wantsPlay ? 'pause' : 'play'));
+  play.addEventListener('click', () => command(state?.wantsPlay ? 'pause' : 'play'));
   seek.addEventListener('input', () => {
     seekPreview = true;
     renderTime();
@@ -658,6 +740,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   });
   video.addEventListener('timeupdate', renderTime);
   video.addEventListener('playing', render);
+  for (const event of ['progress', 'durationchange', 'emptied']) video.addEventListener(event, renderBuffer);
 
   return {
     load(url) {

@@ -20,7 +20,7 @@ first=1111111111111111111111111111111111111111
 second=2222222222222222222222222222222222222222
 third=3333333333333333333333333333333333333333
 for directory in "$fixture/first" "$fixture/upgrade"; do
-  cp -pR Dockerfile .dockerignore compose.yaml compose.release.yaml package.json src public "$directory"
+  cp -pR Dockerfile .dockerignore compose.yaml compose.release.yaml package.json package-lock.json src public "$directory"
   # HTTPS on the fixture port is sufficient. Leave the runner's HTTP port available.
   sed -i '/WATCH_BIND_IP.*:80:80/d' "$directory/compose.yaml"
   printf '%s\n' '{' 'admin off' 'skip_install_trust' 'auto_https disable_redirects' '}' \

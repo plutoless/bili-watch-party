@@ -72,16 +72,47 @@ p { line-height: 1.55; text-wrap: pretty; }
 #status { color: #abdeff; margin: 0 0 .5rem; font-size: .875rem; font-weight: 700; }
 #status[data-status="ready"] { color: #8bdcca; }
 #status[data-status="failed"] { color: #ffc3ad; }
-.player { background: #000; border-radius: .75rem; overflow: hidden; }
-video { width: 100%; display: block; aspect-ratio: 16 / 9; }
+.player-screen { background: #000; border-radius: .75rem; overflow: hidden; }
+#video { width: 100%; display: block; aspect-ratio: 16 / 9; touch-action: manipulation; }
+#video:focus-visible { outline-offset: -3px; }
 .playback-controls { padding-block: .75rem; }
+.playback-toolbar { display: flex; align-items: center; gap: .5rem; justify-content: space-between; }
+#fullscreen { flex-shrink: 0; }
 #playback-status { margin: 0; color: #abdeff; font-weight: 700; }
 .readiness { display: flex; flex-wrap: wrap; gap: .5rem 1rem; margin: .35rem 0; padding: 0; list-style: none; }
 .readiness li, #playback-time { color: #b3c3d2; }
+.playback-meter { display: flex; align-items: center; gap: .5rem; }
+.playback-meter label { margin: 0; color: #b3c3d2; font-size: .8125rem; }
+.playback-meter :is(progress, meter) { flex: 1; min-width: 0; accent-color: #8bdcca; }
 #seek-controls { margin-top: .75rem; }
 #seek-controls label { margin: 0; }
 #seek { margin: 0; padding: 0; accent-color: #8bdcca; }
-#playback-time { margin-block: .25rem 0; font-variant-numeric: tabular-nums; }
+#playback-time { margin: 0; font-variant-numeric: tabular-nums; }
+
+html.room-fullscreen { overflow: hidden; }
+#player.xgplayer-is-cssfullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  width: 100%;
+  height: 100dvh;
+  background: #000;
+}
+#player.xgplayer-is-cssfullscreen .player-screen { height: 100%; border-radius: 0; }
+#player.xgplayer-is-cssfullscreen #video { height: 100%; object-fit: contain; }
+#player.xgplayer-is-cssfullscreen .playback-controls {
+  position: absolute;
+  inset: auto 0 0;
+  max-height: calc(100% - env(safe-area-inset-top));
+  padding: .5rem max(1rem, env(safe-area-inset-right)) max(.75rem, env(safe-area-inset-bottom))
+    max(1rem, env(safe-area-inset-left));
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: #111820f0;
+}
+#player.xgplayer-is-cssfullscreen .readiness { font-size: .875rem; }
+#player.xgplayer-is-cssfullscreen #seek-controls { margin-top: .35rem; }
+
 .back { margin-top: .75rem; }
 #retry { display: block; margin-top: 1rem; }
 

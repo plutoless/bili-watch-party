@@ -23,6 +23,7 @@ const assets = {
   '/app.js': 'text/javascript; charset=utf-8',
   '/player.js': 'text/javascript; charset=utf-8',
   '/style.css': 'text/css; charset=utf-8',
+  '/xgplayer.js': 'text/javascript; charset=utf-8',
 };
 
 class HttpError extends Error {
@@ -352,7 +353,8 @@ export async function startServer({
 
     const asset = path === '/' || pageRoute.test(path) ? '/index.html' : path;
     if (method === 'GET' && Object.hasOwn(assets, asset)) {
-      const file = await readFile(new URL('../public' + asset, import.meta.url));
+      const source = asset === '/xgplayer.js' ? import.meta.resolve('xgplayer') : '../public' + asset;
+      const file = await readFile(new URL(source, import.meta.url));
       res.writeHead(200, { 'Content-Type': assets[asset] }).end(file);
       return;
     }
