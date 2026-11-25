@@ -872,3 +872,40 @@ test('only a later generation in the authorized recovery lineage can take the se
   const reply = await post({ action: 'observe', playerId: third });
   assert.equal((await reply.json()).ownsSeat, true);
 });
+
+test('approval during import starts once and cancellation takes precedence over ready and replayed approval', async t => {
+  const imported = Promise.withResolvers();
+  t.after(imported.resolve);
+  const app = await setup(t, async ({ output, signal }) => {
+    await Promise.race([imported.promise, new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))]);
+    await writeFile(output, 'synthetic media');
+    return 120;
+  });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  const path = '/api/rooms/' + room.id + '/';
+  const post = (route, body, cookie = host) => app.request(path + route, { method: 'POST', body, cookie });
+  const joined = await post('join', { token: room.invitation.token }, '');
+  const { requestId } = await joined.json();
+  const visitor = joined.headers.get('set-cookie').split(';')[0];
+  const hostPlayer = randomUUID();
+  const visitorPlayer = randomUUID();
+  assert.equal((await post('approve', { requestId: randomUUID() })).status, 409);
+  assert.equal((await app.request(path.slice(0, -1), { cookie: host }).then(r => r.json())).firstStartPending, false);
+  const approval = { requestId, startPlayback: true };
+  const approved = await post('approve', approval).then(r => r.json());
+  assert.equal(approved.firstStartPending, true);
+  assert.notEqual(approved.status, 'ready');
+  assert.equal((await post('cancel-start', { playerId: hostPlayer }, visitor)).status, 401);
+  assert.equal((await post('cancel-start', { playerId: hostPlayer }).then(r => r.json())).firstStartPending, false);
+  imported.resolve();
+  await app.status(host, room.id, 'ready');
+  assert.equal((await post('approve', approval).then(r => r.json())).firstStartPending, false);
+  const initial = await post('playback', { playerId: hostPlayer, role: 'host', action: 'observe' }).then(r => r.json());
+  const ready = { action: 'ready', epoch: initial.epoch, version: initial.version, position: 0, claim: true };
+  await post('playback', { ...ready, playerId: hostPlayer, role: 'host' });
+  const aligned = await post('playback', { ...ready, playerId: visitorPlayer, role: 'visitor' }, visitor).then(r => r.json());
+  assert.deepEqual(aligned.ready, { host: true, visitor: true });
+  assert.equal(aligned.wantsPlay, false);
+  assert.equal(aligned.startsAt, null);
+});

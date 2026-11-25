@@ -10,7 +10,11 @@ const apiOrigin = document.querySelector('meta[name="watch-api-origin"]')?.conte
 const visitor = location.pathname.startsWith('/invite/');
 const path = visitor ? location.pathname.replace('/invite/', '/rooms/') : location.pathname;
 const roomPath = path.startsWith('/rooms/') ? '/api' + path : null;
-const player = createPlayer({ apiOrigin, roomPath, role: visitor ? 'visitor' : 'host' });
+const cancelImportStart = byId('cancel-import-start');
+const player = createPlayer({
+  apiOrigin, roomPath, role: visitor ? 'visitor' : 'host',
+  cancelFirstStart: playerId => hostAction('cancel-start', { playerId }, cancelImportStart),
+});
 let fullscreen;
 const recentRoomKey = 'watch-party-recent-room';
 const recentRoomPath = /^\/rooms\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
@@ -131,6 +135,7 @@ function showTerminal(state) {
   byId('invite-url').value = '';
   byId('request-code').hidden = true;
   retry.hidden = true;
+  cancelImportStart.hidden = true;
   roomError.textContent = '';
 }
 
@@ -145,6 +150,8 @@ function render(room) {
   setText(roomError, room.error?.message ?? '');
   failedAttempt = room.error?.retryable ? room.attempt : undefined;
   retry.hidden = visitor || !room.error?.retryable;
+  cancelImportStart.hidden = visitor || !room.firstStartPending || Boolean(room.mediaUrl);
+  if (visitor || room.occupied) player.admit();
   if (room.mediaUrl) {
     fullscreen ??= createPageFullscreen();
     player.load(room.mediaUrl);
@@ -161,7 +168,7 @@ function render(room) {
 function renderHostTools({ invitation, occupied, requests, id }) {
   byId('host-tools').hidden = false;
   const admissionStatus = occupied ? '访客已加入。'
-    : requests.length ? '访客正在等待你的批准。'
+    : requests.length ? '访客正在等待你的批准。双方就绪后会自动开播。'
     : invitation ? '分享邀请后，等待访客申请加入。'
     : '需要新邀请才能让访客申请加入。';
   setText(byId('admission-status'), admissionStatus);
@@ -191,8 +198,12 @@ function renderHostTools({ invitation, occupied, requests, id }) {
     const item = document.createElement('li');
     const button = document.createElement('button');
     button.type = 'button';
-    button.textContent = '批准访客' + (requests.length > 1 ? ' ' + id.slice(0, 8) : '');
-    button.addEventListener('click', () => hostAction('approve', { requestId: id }, button));
+    button.textContent = '批准并一起看' + (requests.length > 1 ? ' ' + id.slice(0, 8) : '');
+    button.addEventListener('click', () => {
+      if (actionPending) return;
+      player.authorizeApproval();
+      hostAction('approve', { requestId: id, startPlayback: true }, button);
+    });
     item.append(button);
     return item;
   }));
@@ -312,6 +323,7 @@ sourceForm.addEventListener('submit', async event => {
 });
 
 retry.addEventListener('click', () => hostAction('retry', { attempt: failedAttempt }, retry));
+cancelImportStart.addEventListener('click', () => player.cancelPendingStart());
 for (const [id, action] of [
   ['generate-invite', 'generate'], ['replace-invite', 'generate'], ['revoke-invite', 'revoke'],
 ]) {

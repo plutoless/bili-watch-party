@@ -68,7 +68,8 @@ async function checkStability(hostPage, visitorPage) {
     Math.max(...differences).toFixed(3) + ' s; calibration RTTs ' +
     clocks.map(({ rtt }) => rtt.toFixed(2) + ' ms').join(', ') +
     '; observed seeking samples ' + seekingSamples.join(', ') + '.');
-  assert.ok(below / differences.length >= 0.95);
+  assert.ok(below / differences.length >= 0.95, 'Paired positions per second: ' + JSON.stringify(
+    Array.from({ length: 10 }, (_, second) => samples.map(side => positionAt(side, start + second * 1000)))));
 }
 
 async function playhead(page) {
@@ -93,6 +94,35 @@ async function waitForPlaying(page, after) {
   }, after, { timeout: 10_000 }).catch(async () => {
     assert.fail('Expected playback past ' + after.toFixed(2) + ' s, observed ' + JSON.stringify(await playbackDetails(page)));
   });
+}
+
+export async function allowPlaybackIfPrompted(page) {
+  const prompt = page.getByRole('button', { name: '允许播放', exact: true });
+  const playing = page.getByText('正在同步播放', { exact: true });
+  const prompted = await Promise.race([prompt.waitFor().then(() => true), playing.waitFor().then(() => false)]);
+  if (prompted) await prompt.tap();
+  return prompted;
+}
+
+export async function checkFirstPlayback(hostPage, visitorPage, approvedAt, automatic) {
+  if (!automatic) {
+    await Promise.all([hostPage, visitorPage].map(async page => {
+      await page.getByRole('button', { name: '准备好了', exact: true }).tap();
+    }));
+    await hostPage.getByRole('button', { name: '播放', exact: true }).tap();
+  }
+  const outcomes = await Promise.all([hostPage, visitorPage].map(async page => {
+    const prompted = automatic && await allowPlaybackIfPrompted(page);
+    await waitForPlaying(page, 0.25);
+    await page.getByText('正在同步播放', { exact: true }).waitFor();
+    return { prompted, elapsed: Math.round(performance.now() - approvedAt) };
+  })).catch(async error => {
+    const players = await Promise.all([hostPage, visitorPage].map(playbackDetails));
+    assert.fail('Initial playback failed for host/visitor ' + JSON.stringify(players) + '. ' + error.message);
+  });
+  console.log('Approval → synchronized advancement (host / visitor): ' +
+    outcomes.map(({ prompted, elapsed }) => elapsed + ' ms' + (prompted ? ' with a permission tap' : ' without a permission tap')).join(' / '));
+  await checkStability(hostPage, visitorPage);
 }
 
 async function checkFullscreen(page, visitorPage) {
@@ -335,19 +365,18 @@ async function waitForSignal(promise, message) {
   }
 }
 
-export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath }) {
+export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, automatic }) {
   const endpoint = apiOrigin + '/api' + hostPath + '/playback';
   const post = (context, data) => context.request.post(endpoint, { data, headers: { Origin: origin } });
   const playerId = randomUUID();
   const play = hostPage.locator('#play');
   const hasFullscreen = await hostPage.locator('#fullscreen').count() > 0;
-  const prepareHost = hostPage.getByRole('button', { name: '准备好了', exact: true });
-  const prepareVisitor = visitorPage.getByRole('button', { name: '准备好了', exact: true });
+  const promptText = automatic ? '允许播放' : '再次点按以准备';
+  const blockedText = automatic ? /浏览器阻止了有声播放/ : /浏览器阻止了起播/;
   assert.equal(await visitorPage.locator('#play').isVisible(), false);
   assert.equal(await visitorPage.locator('#seek').isVisible(), false);
   assert.equal(await visitorPage.locator('video').getAttribute('controls'), null);
 
-  await denyNextPlay(visitorPage);
   const seekAcknowledgment = Promise.withResolvers();
   const releaseAcknowledgment = Promise.withResolvers();
   let holdSeek = false;
@@ -358,20 +387,8 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
       seekAcknowledgment.resolve(body.position);
       await releaseAcknowledgment.promise;
     }
-    await delay(80);
-    await route.continue();
+    await route.fallback();
   });
-
-  await prepareHost.tap();
-  await hostPage.getByText('房主 · 已就绪').waitFor();
-  await prepareVisitor.tap();
-  await visitorPage.getByText(/浏览器阻止了起播/).waitFor();
-  await visitorPage.getByText('访客 · 未就绪').waitFor();
-  assert.ok(await play.isDisabled());
-  assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
-  await visitorPage.getByRole('button', { name: '再次点按以准备' }).tap();
-  await hostPage.getByText('访客 · 已就绪').waitFor();
-  await visitorPage.getByText('房主 · 已就绪').waitFor();
 
   const getTimeline = async () => {
     const response = await post(host, { role: 'host', action: 'observe', playerId });
@@ -390,10 +407,6 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
     if (page === hostPage && holdSeek && operation.action === 'seek') seekTarget = operation.position;
   }));
   let started = performance.now();
-  await play.tap();
-  await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
-  console.log('Initial start: both past 0.25 s after ' + Math.round(performance.now() - started) + ' ms.');
-  await checkStability(hostPage, visitorPage);
   await checkDriftCorrection(visitorPage, getTimeline);
   if (hasFullscreen) {
     await Promise.all([waitForPlaying(hostPage, 0.25), waitForPlaying(visitorPage, 0.25)]);
@@ -404,7 +417,7 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
     assert.equal((await getTimeline()).version, before.version);
     console.log('Both roles entered and exited page fullscreen in portrait and landscape. One tap restored controls.');
   }
-  const expected = hasFullscreen ? ['play', 'pause', 'play'] : ['play'];
+  const expected = hasFullscreen ? ['pause', 'play'] : [];
   assert.deepEqual(commands, expected, 'Gestures and drift corrections must not generate host commands');
 
   holdSeek = true;
@@ -469,10 +482,10 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   const restartPosition = (await playhead(hostPage)).position;
   await denyNextPlay(visitorPage);
   await play.tap();
-  await visitorPage.getByText(/浏览器阻止了起播/).waitFor();
-  await hostPage.getByText('等待点按以允许播放。').waitFor();
+  await visitorPage.getByText(blockedText).waitFor();
+  await hostPage.getByText(automatic ? '等待访客允许播放。' : '等待点按以允许播放。').waitFor();
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
-  await visitorPage.getByRole('button', { name: '再次点按以准备' }).tap();
+  await visitorPage.getByRole('button', { name: promptText }).tap();
   await Promise.all([waitForPlaying(hostPage, restartPosition + 0.25), waitForPlaying(visitorPage, restartPosition + 0.25)]);
   console.log('Paused seek stayed paused; scheduled gesture rejection held the room until the next tap.');
 
@@ -487,15 +500,15 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
   await waitForPause();
   await visitorPage.locator('video').dispatchEvent('test-reject-play');
   await delay(600);
-  assert.equal(await visitorPage.getByRole('button', { name: '再次点按以准备' }).isVisible(), false);
+  assert.equal(await visitorPage.getByRole('button', { name: promptText }).isVisible(), false);
   await waitForPause();
 
   await denyNextPlay(hostPage);
   await play.tap();
-  await hostPage.getByText(/浏览器阻止了起播/).waitFor();
+  await hostPage.getByText(blockedText).waitFor();
   assert.ok(await play.isEnabled(), 'Host must be able to cancel a blocked start');
   await play.tap();
-  await hostPage.getByRole('button', { name: '再次点按以准备' }).tap();
+  if (!automatic) await hostPage.getByRole('button', { name: promptText }).tap();
   await waitForPause();
   await delay(1100);
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
@@ -518,11 +531,11 @@ export async function checkSharedPlayback({ hostPage, visitorPage, host, visitor
     console.log('Delayed start notification and slow seeks did not prevent either player from starting.');
   }
 
-  await checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause });
+  await checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause, automatic, promptText });
   if (hasFullscreen) await checkPlaybackEnd(hostPage, visitorPage, getTimeline);
 }
 
-async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause }) {
+async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, getTimeline, waitForPause, automatic, promptText }) {
   const play = hostPage.locator('#play');
   let started;
 
@@ -537,7 +550,7 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
     const playing = Promise.all([waitForPlaying(hostPage, position + 0.25), waitForPlaying(visitorPage, position + 0.25)]);
     let usedGesture = false;
     if (acceptGesture) {
-      const retry = visitorPage.getByRole('button', { name: '再次点按以准备' });
+      const retry = visitorPage.getByRole('button', { name: promptText });
       usedGesture = await Promise.race([playing.then(() => false), retry.waitFor().then(() => true)]);
       if (usedGesture) await retry.tap();
     }
@@ -565,7 +578,7 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
       await visitorPage.locator('video').evaluate(video => video.load());
       await Promise.all([
         waitForSignal(requested.promise, 'Visitor did not request media after its buffer was cleared'),
-        hostPage.getByText('缓冲中，等待双方在同一位置就绪。').waitFor(),
+        hostPage.getByText(automatic ? '等待访客缓冲并对齐进度。' : '缓冲中，等待双方在同一位置就绪。').waitFor(),
       ]);
       assert.ok((await playhead(hostPage)).paused);
       assert.ok((await playhead(visitorPage)).paused);

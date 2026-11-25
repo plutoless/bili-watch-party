@@ -15,7 +15,7 @@ const cookieName = 'watch_party_host';
 const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
 const uuidPattern = new RegExp('^' + uuid + '$');
 const isUuid = value => typeof value === 'string' && uuidPattern.test(value);
-const roomRoute = new RegExp('^/api/rooms/(' + uuid + ')(?:/(retry|invitation|approve|join|end|playback))?$');
+const roomRoute = new RegExp('^/api/rooms/(' + uuid + ')(?:/(retry|invitation|approve|cancel-start|join|end|playback))?$');
 const pageRoute = new RegExp('^/(?:rooms|invite)/' + uuid + '$');
 const mediaRoute = new RegExp('^/media/(' + uuid + ')\\.mp4$');
 const assets = {
@@ -193,11 +193,17 @@ export async function startServer({
 
   const visitorCookieName = id => 'watch_party_visitor_' + id;
   const visitorToken = (req, id) => getCookie(req, visitorCookieName(id));
+  const roomView = room => ({ ...room, firstStartPending: playback.get(room.id)?.firstStartPending ?? false });
+
+  function roomTimeline(id) {
+    if (!playback.has(id)) playback.set(id, createPlayback());
+    return playback.get(id);
+  }
 
   async function roomPlayback(req, res, id) {
     const body = await readJson(req);
     const { role, action, playerId, previousPlayerId, fallbackPlayerIds = [], recoveryId, recoveryGeneration,
-      position, reason, seekId, afterSeekId } = body ?? {};
+      position, reason, seekId, afterSeekId, waitForReadiness } = body ?? {};
     if (role === 'host') requireHost(req);
     else if (role !== 'visitor' || !admission.isApproved(id, visitorToken(req, id))) {
       throw new HttpError(401, '仅房主和已批准的访客可读取播放状态。');
@@ -211,7 +217,8 @@ export async function startServer({
     if ((!hostCommand && !['observe', 'ready', 'blocked', 'unavailable', 'recover'].includes(action)) ||
         !isUuid(playerId) ||
         (action === 'recover' && invalidRecovery) ||
-        (action === 'ready' && recoveryId !== undefined && (body.claim !== true || !isUuid(recoveryId))) ||
+        (['ready', 'blocked', 'play'].includes(action) && recoveryId !== undefined &&
+          (body.claim !== true || !isUuid(recoveryId))) ||
         [seekId, afterSeekId].some(value => value !== undefined && !isUuid(value)) ||
         (action === 'unavailable' && !['buffering', 'connection', 'background'].includes(reason)) ||
         (['ready', 'seek'].includes(action) && !Number.isFinite(position))) {
@@ -223,8 +230,12 @@ export async function startServer({
     if (rooms.isEnded(id)) throw new HttpError(410, '房间已结束。');
     const room = rooms.get(id);
     if (room?.status !== 'ready') throw new HttpError(404, '视频还不可用。');
-    if (!playback.has(id)) playback.set(id, createPlayback(room.duration));
-    const { conflict, state } = playback.get(id).update(body, playbackNow());
+    if (action === 'play' && waitForReadiness === true && !admission.hasApprovedVisitor(id)) {
+      throw new HttpError(409, '请先批准访客。');
+    }
+    const timeline = roomTimeline(id);
+    timeline.setDuration(room.duration);
+    const { conflict, state } = timeline.update(body, playbackNow());
     return send(res, conflict ? 409 : 200, state);
   }
 
@@ -243,7 +254,7 @@ export async function startServer({
     else if (token && ['expired', 'ended'].includes(status.state)) {
       res.setHeader('Set-Cookie', sessionCookie(name, '', secure) + '; Max-Age=0');
     }
-    if (status.state === 'approved') status.room = room;
+    if (status.state === 'approved') status.room = roomView(room);
     return send(res, 200, status);
   }
 
@@ -265,9 +276,18 @@ export async function startServer({
         if (!['generate', 'revoke'].includes(body?.action)) throw new HttpError(400, '请选择邀请操作。');
         admission.changeInvitation(id, body.action);
         break;
-      case 'approve':
-        if (typeof body?.requestId !== 'string' || !admission.approve(id, body.requestId)) {
+      case 'approve': {
+        const approval = isUuid(body?.requestId) && admission.approve(id, body.requestId);
+        if (!approval) {
           throw new HttpError(409, '申请已失效，或唯一访客席位已被占用。');
+        }
+        if (approval === 'approved' && body.startPlayback === true) roomTimeline(id).startOnApproval();
+        break;
+      }
+      case 'cancel-start':
+        if (!isUuid(body?.playerId)) throw new HttpError(400, '播放操作无效。');
+        if (playback.get(id)?.cancelFirstStart(body.playerId, playbackNow()) === false) {
+          throw new HttpError(409, '这个席位已由另一个页面使用。');
         }
         break;
       case 'end':
@@ -276,7 +296,7 @@ export async function startServer({
         for (const response of mediaResponses.get(id) ?? []) response.destroy();
         return send(res, 200, { status: 'ended' });
     }
-    return send(res, 200, { ...room, ...admission.hostView(id) });
+    return send(res, 200, { ...roomView(room), ...admission.hostView(id) });
   }
 
   async function roomMedia(req, res, id) {
@@ -347,7 +367,7 @@ export async function startServer({
       if (path === '/api/rooms' && method === 'POST') {
         const body = await readJson(req);
         const { created, room } = rooms.submit(parseSource(body?.url));
-        return send(res, created ? 201 : 200, { ...room, ...admission.hostView(room.id) });
+        return send(res, created ? 201 : 200, { ...roomView(room), ...admission.hostView(room.id) });
       }
     }
 

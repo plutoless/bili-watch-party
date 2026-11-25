@@ -4,10 +4,11 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { setTimeout as delay } from 'node:timers/promises';
 import { chromium, devices, webkit } from 'playwright';
 import { createImporter, ImportError } from '../src/importer.js';
 import { startServer } from '../src/server.js';
-import { checkSharedPlayback } from './playback-browser.js';
+import { checkFirstPlayback, checkSharedPlayback } from './playback-browser.js';
 import { startSplitFixture } from './split-browser-fixture.js';
 
 const run = promisify(execFile);
@@ -21,7 +22,10 @@ const dataDir = deployedOrigin ? null : await mkdtemp(join(tmpdir(), 'watch-part
 const mediaDir = dataDir ?? process.env.BROWSER_DATA_DIR;
 const simulateFirstFailure = process.env.SIMULATE_FIRST_FAILURE === '1';
 const synthetic = process.env.SYNTHETIC_VIDEO === '1';
-const splitFixture = process.env.BROWSER_SYNTHETIC_SPLIT === '1';
+const firstStartOnly = process.env.BROWSER_FIRST_START_ONLY === '1';
+const selectedPair = process.env.BROWSER_PAIR;
+const permissionCases = process.env.BROWSER_PERMISSION_CASES === '1';
+const splitFixture = process.env.BROWSER_SPLIT === '1' || process.env.BROWSER_SYNTHETIC_SPLIT === '1';
 const ignoreHTTPSErrors = splitFixture || process.env.BROWSER_LOCAL_TLS === '1';
 let app;
 let fixture;
@@ -29,6 +33,88 @@ const browsers = [];
 let failNextRequest = simulateFirstFailure;
 let importGate;
 let clockOffset = 0;
+
+async function checkPermissionCases(browser, origin, apiOrigin) {
+  const cases = [[], ['host'], ['visitor'], ['host', 'visitor'], ['cancel']];
+  for (const [caseIndex, blocked] of cases.entries()) {
+    importGate = Promise.withResolvers();
+    const options = { ...devices['Pixel 7'], ignoreHTTPSErrors };
+    const contexts = await Promise.all([browser.newContext(options), browser.newContext(options)]);
+    try {
+      await Promise.all(contexts.map((context, index) => context.addInitScript(block => {
+        const play = HTMLMediaElement.prototype.play;
+        let granted = !block;
+        window.testPlayCalls = 0;
+        document.addEventListener('click', event => {
+          if (event.isTrusted && event.target.id === 'prepare') granted = true;
+        }, true);
+        HTMLMediaElement.prototype.play = function () {
+          if (this.id !== 'video') return play.call(this);
+          window.testPlayCalls++;
+          return granted ? play.call(this)
+            : Promise.reject(new DOMException('Injected autoplay policy', 'NotAllowedError'));
+        };
+      }, blocked.includes(index === 0 ? 'host' : 'visitor'))));
+      const [host, visitor] = await Promise.all(contexts.map(context => context.newPage()));
+      await host.goto(origin);
+      await host.getByLabel('房主密码').fill(password);
+      await host.getByRole('button', { name: '登录', exact: true }).tap();
+      await host.getByLabel('B 站视频链接').fill(source + '?p=' + (10 + caseIndex));
+      await host.getByRole('button', { name: '创建房间并导入' }).tap();
+      await host.getByRole('button', { name: '复制邀请' }).waitFor();
+      const invitation = await host.getByLabel('邀请链接').inputValue();
+      await visitor.goto(invitation);
+      const approve = host.getByRole('button', { name: '批准并一起看', exact: true });
+      if (blocked.includes('cancel')) {
+        await host.route('**/api/rooms/*/approve', route => route.fulfill({ status: 409 }), { times: 1 });
+        await approve.tap();
+        await host.locator('#action-message').filter({ hasText: /请求失败/ }).waitFor();
+        await visitor.getByText('等待房主批准', { exact: true }).waitFor();
+        assert.equal(await host.getByRole('button', { name: '取消开播', exact: true }).isVisible(), false);
+      }
+      const approved = host.waitForResponse(response => response.url().endsWith('/approve') && response.ok());
+      await approve.tap();
+      const approval = await approved;
+      await visitor.getByText('已获批准，等待视频导入完成。', { exact: true }).waitFor();
+      if (blocked.includes('cancel')) {
+        await host.getByRole('button', { name: '取消开播', exact: true }).tap();
+        await host.locator('#cancel-import-start').waitFor({ state: 'hidden' });
+        const replay = await contexts[0].request.post(apiOrigin + new URL(approval.url()).pathname, {
+          data: approval.request().postDataJSON(), headers: { Origin: origin },
+        });
+        assert.equal(replay.status(), 200);
+        assert.equal((await replay.json()).firstStartPending, false);
+        await Promise.all([host, visitor].map(page => page.reload({ waitUntil: 'domcontentloaded' })));
+      }
+      importGate.resolve();
+      const pages = [host, visitor];
+      await Promise.all(pages.map(page => page.getByText('视频已就绪', { exact: true }).waitFor()));
+      if (blocked.includes('cancel')) {
+        for (const page of pages) {
+          await page.getByText('已暂停，等待房主播放。', { exact: true }).waitFor();
+          assert.equal(await page.evaluate(() => window.testPlayCalls), 0);
+        }
+        await host.getByRole('button', { name: '播放', exact: true }).tap();
+      } else {
+        const prompts = pages.map(page => page.getByRole('button', { name: '允许播放', exact: true }));
+        await Promise.all(prompts.map((prompt, index) =>
+          blocked.includes(index === 0 ? 'host' : 'visitor') ? prompt.waitFor() : Promise.resolve()));
+        for (const [index, prompt] of prompts.entries()) {
+          assert.equal(await prompt.isVisible(), blocked.includes(index === 0 ? 'host' : 'visitor'));
+        }
+        if (blocked.length) {
+          await Promise.all(pages.map(page => page.waitForFunction(() => document.querySelector('video').paused)));
+          await Promise.all(prompts.filter((_, index) => blocked.includes(index === 0 ? 'host' : 'visitor')).map(prompt => prompt.tap()));
+        }
+      }
+      await Promise.all(pages.map(page => page.getByText('正在同步播放', { exact: true }).waitFor()));
+      console.log('First-start browser policy case passed: ' + (blocked.join(' + ') || 'no policy block') + '.');
+    } finally {
+      importGate.resolve();
+      await Promise.all(contexts.map(context => context.close()));
+    }
+  }
+}
 
 async function checkMediaFile(media) {
   const output = join(mediaDir, 'media', media.split('/').at(-1));
@@ -53,25 +139,68 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const host = await hostBrowser.newContext(hostOptions);
   const visitor = await visitorBrowser.newContext(visitorOptions);
   const stranger = await visitorBrowser.newContext(visitorOptions);
-  if (synthetic) {
-    await host.addInitScript(() => {
-      const matchesInvitation = url => url === document.querySelector('#invite-url').value;
-      Object.defineProperty(navigator, 'share', {
-        value: async ({ url }) => { window.sharedExpectedInvitation = matchesInvitation(url); },
-      });
-      Object.defineProperty(navigator, 'clipboard', {
-        get: () => window.allowInvitationCopy ? {
-          async writeText(url) { window.copiedExpectedInvitation = matchesInvitation(url); },
-        } : undefined,
-      });
+  await host.addInitScript(() => {
+    const play = HTMLMediaElement.prototype.play;
+    const fetch = window.fetch;
+    let playedWithGesture = false;
+    HTMLMediaElement.prototype.play = function () {
+      if (this.id === 'video' && navigator.userActivation.isActive) playedWithGesture = true;
+      return play.call(this);
+    };
+    window.fetch = (url, init) => {
+      if (String(url).endsWith('/approve')) window.reusedApprovalGesture = playedWithGesture;
+      return fetch(url, init);
+    };
+    const matchesInvitation = url => url === document.querySelector('#invite-url').value;
+    Object.defineProperty(navigator, 'share', {
+      value: async ({ url }) => { window.sharedExpectedInvitation = matchesInvitation(url); },
     });
+    Object.defineProperty(navigator, 'clipboard', {
+      get: () => window.allowInvitationCopy ? {
+        async writeText(url) { window.copiedExpectedInvitation = matchesInvitation(url); },
+      } : undefined,
+    });
+  });
+  if (synthetic) {
+    for (const context of [host, visitor]) {
+      await context.addInitScript(() => {
+        const createGain = AudioContext.prototype.createGain;
+        AudioContext.prototype.createGain = function () {
+          const gain = createGain.call(this);
+          const analyser = this.createAnalyser();
+          gain.connect(analyser);
+          window.testAudio = { gain, analyser };
+          return gain;
+        };
+      });
+    }
   }
   const hostPage = await host.newPage();
   const visitorPage = await visitor.newPage();
   const strangerPage = await stranger.newPage();
+  await visitorPage.route('**/api/rooms/*/playback', async route => {
+    await delay(80);
+    await route.continue();
+  });
   const mediaRanges = new Map([hostPage, visitorPage].map(page => [page, new Set()]));
+  const observations = new Map([hostPage, visitorPage].map(page => [page, []]));
   for (const [page, requested] of mediaRanges) {
     page.on('response', async response => {
+      if (response.url().endsWith('/playback') && [200, 409].includes(response.status())) {
+        const state = await response.json().catch(() => null);
+        if (state) {
+          const { version, startsAt, ready, blocked, waiting, advancing, synchronized, preview,
+            startAcknowledged, startConfirmed, playbackGap, serverTime } = state;
+          const action = response.request().postDataJSON().action;
+          const entries = observations.get(page);
+          const snapshot = { version, startsAt, ready, blocked, waiting, advancing, synchronized, preview,
+            startAcknowledged, startConfirmed };
+          if (JSON.stringify(entries.at(-1)?.snapshot) !== JSON.stringify(snapshot)) {
+            entries.push({ action, serverTime, playbackGap, snapshot });
+            if (entries.length > 10) entries.shift();
+          }
+        }
+      }
       if (response.status() === 206 && response.request().resourceType() === 'media' &&
           new URL(response.url()).origin === apiOrigin) {
         requested.add(await response.headerValue('content-range'));
@@ -91,27 +220,31 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
 
   const home = await hostPage.goto(origin);
   const legacyWeb = await hostPage.locator('#recent-room').count() === 0;
+  const automatic = await hostPage.locator('#prepare').textContent() === '允许播放';
+  const approveLabel = automatic ? '批准并一起看' : '批准访客';
   assert.ok(!legacyWeb || (splitFixture && process.env.BROWSER_WEB_SOURCE),
     'The current webpage must provide a recent-room entry');
   const singleApproval = hostPage.getByRole('button', {
-    name: legacyWeb ? /^批准访客 [a-f0-9]{8}$/ : '批准访客', exact: true,
+    name: legacyWeb ? /^批准访客 [a-f0-9]{8}$/ : approveLabel, exact: true,
   });
   async function openManagement() {
-    if (!legacyWeb) await manage.tap();
+    if (!legacyWeb && await hostPage.locator('#room-management').getAttribute('open') === null) await manage.tap();
   }
   assert.equal((await home.allHeaders())['permissions-policy'], 'microphone=()');
   assert.equal((await stranger.request.get(apiOrigin + '/api/rooms')).status(), 401);
   await hostPage.getByLabel('房主密码').fill(password);
   await hostPage.getByRole('button', { name: '登录', exact: true }).tap();
   await sourceInput.fill(source);
+  const submittedAt = performance.now();
   await create.tap();
   await copy.waitFor();
+  const invitationAt = performance.now();
   const hostPath = new URL(hostPage.url()).pathname;
   assert.equal(new URL(hostPage.url()).origin, origin);
   const originalLink = await inviteLink.inputValue();
   assert.ok(originalLink.startsWith(origin + '/invite/'));
-  if (synthetic && !legacyWeb) {
-    await hostPage.locator('#status:is([data-status="preparing"], [data-status="failed"])').waitFor();
+  if (!legacyWeb) {
+    if (synthetic) await hostPage.locator('#status:is([data-status="preparing"], [data-status="failed"])').waitFor();
     await hostPage.getByRole('button', { name: '分享邀请' }).tap();
     assert.ok(await hostPage.evaluate(() => window.sharedExpectedInvitation));
     await hostPage.evaluate(() => { window.allowInvitationCopy = true; });
@@ -190,12 +323,14 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   assert.ok(invitation.startsWith(origin + '/invite/') && invitation !== originalLink);
   await copy.tap();
   await hostPage.locator('#action-message').filter({ hasText: /已复制邀请|请复制已选中/ }).waitFor();
+  const sharedAt = performance.now();
 
   await strangerPage.goto(replacedLink, { waitUntil: 'domcontentloaded' });
   await strangerPage.waitForFunction(() => !location.hash);
   await watchStatus(strangerPage, 'expired').waitFor();
   await visitorPage.goto(invitation, { waitUntil: 'domcontentloaded' });
   await watchStatus(visitorPage, 'pending').waitFor();
+  const pendingAt = performance.now();
   const requestCode = (await visitorPage.locator('#request-code').textContent()).match(/[a-f0-9]{8}/)[0];
   await strangerPage.goto(invitation, { waitUntil: 'domcontentloaded' });
   await watchStatus(strangerPage, 'pending').waitFor();
@@ -203,7 +338,16 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const media = '/media/' + hostPath.split('/').at(-1) + '.mp4';
   assert.equal((await visitor.request.get(apiOrigin + media, { headers: range })).status(), 401);
   assert.equal((await stranger.request.get(apiOrigin + media, { headers: range })).status(), 401);
-  await hostPage.getByRole('button', { name: '批准访客 ' + requestCode, exact: true }).tap();
+  if (!synthetic) {
+    await hostPage.locator('#status:is([data-status="ready"], [data-status="failed"])').waitFor({ timeout: 360_000 });
+    assert.equal(await watchStatus(hostPage, 'ready').count(), 1, await hostPage.locator('#room-error').textContent());
+  }
+  const approvedAt = performance.now();
+  await hostPage.getByRole('button', { name: approveLabel + ' ' + requestCode, exact: true }).tap();
+  if (!synthetic && automatic) {
+    assert.equal(await hostPage.evaluate(() => window.reusedApprovalGesture), true,
+      'Approval must call play within the tap when a source is already loaded');
+  }
   await watchStatus(strangerPage, 'full').waitFor();
   const visitorStatus = visitorPage.locator('#status[data-status="waiting"], #status[data-status="ready"], #status[data-status="failed"]');
   await visitorStatus.waitFor();
@@ -212,9 +356,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     assert.ok(waitedForVideo, 'Approval during import must show waiting for import');
     importGate.resolve();
   }
-  await visitorPage.reload({ waitUntil: 'domcontentloaded' });
-  await hostPage.reload({ waitUntil: 'domcontentloaded' });
-  for (const page of [hostPage, visitorPage]) {
+  await Promise.all([hostPage, visitorPage].map(async page => {
     await page.locator('#status[data-status="ready"], #status[data-status="failed"]').waitFor({ timeout: 360_000 });
     assert.equal(await page.locator('#status').textContent(), '视频已就绪',
       await page.locator('#room-error').textContent());
@@ -222,6 +364,24 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     assert.notEqual(await page.locator('#title').textContent(), '观影房间');
     assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth),
       'Mobile page must fit the viewport');
+  }));
+  console.log(hostProfile + ' / ' + visitorProfile + ' milestones: submit → invitation ' +
+    Math.round(invitationAt - submittedAt) + ' ms, share → pending ' + Math.round(pendingAt - sharedAt) +
+    ' ms, approval → both media ready ' + Math.round(performance.now() - approvedAt) + ' ms.');
+  try {
+    await checkFirstPlayback(hostPage, visitorPage, approvedAt, automatic);
+  } catch (error) {
+    console.error('First-start timeline transitions (host, visitor): ' + JSON.stringify([...observations.values()]));
+    throw error;
+  }
+  if (synthetic && automatic) {
+    await Promise.all([hostPage, visitorPage].map(page => page.waitForFunction(() => {
+      const { gain, analyser } = window.testAudio;
+      const pulse = new Float32Array(analyser.fftSize);
+      analyser.getFloatTimeDomainData(pulse);
+      return gain.gain.value === 1 && pulse.some(value => Math.abs(value) > 0.02);
+    })));
+    console.log('Both Web Audio outputs carried the synthetic tone.');
   }
 
   if (deployedOrigin || splitFixture) {
@@ -276,7 +436,9 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   await strangerPage.getByRole('heading', { name: '房主登录' }).waitFor();
   assert.equal(await strangerPage.locator('video').getAttribute('src'), null);
 
-  await checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath });
+  if (!firstStartOnly) {
+    await checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, automatic });
+  }
   if (synthetic) {
     for (const ranges of mediaRanges.values()) {
       assert.ok([...ranges].some(range => /^bytes \d+-\d+\/\d+$/.test(range)),
@@ -316,14 +478,14 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   }
   const resumeSummary = legacyWeb ? '' : 'home resume, ';
   console.log(hostProfile + ' / ' + visitorProfile + ': initial invitation, ' + resumeSummary +
-    'deduplication, approval, shared playback and seek, denied third session, and invalidation passed. ' +
+    'deduplication, approval, shared playback' + (firstStartOnly ? '' : ' and seek') + ', denied third session, and invalidation passed. ' +
     'Observed approved visitor waiting for import: ' + waitedForVideo + '.');
   await Promise.all([host, visitor, stranger].map(context => context.close()));
 }
 
 try {
   assert.ok(!synthetic || !deployedOrigin, 'Synthetic video requires the standalone test server');
-  assert.ok(!splitFixture || synthetic, 'The isolated split fixture requires SYNTHETIC_VIDEO=1');
+  assert.ok(!splitFixture || !deployedOrigin, 'The split fixture requires the standalone test server');
   assert.ok(!deployedApiOrigin || deployedOrigin, 'BROWSER_API_ORIGIN requires BROWSER_ORIGIN');
   if (deployedOrigin) {
     for (const origin of [deployedOrigin, deployedApiOrigin ?? deployedOrigin]) {
@@ -349,7 +511,7 @@ try {
           await importGate.promise;
           await run(ffmpeg, [
             '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24',
-            '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '60',
+            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-t', '60',
             '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-movflags', '+faststart', output,
           ], { signal });
           return 60;
@@ -377,11 +539,17 @@ try {
   const [android, iphone] = browsers;
   console.log('Chromium ' + android.version() + ' (Pixel 7), WebKit ' + iphone.version() +
     ' (iPhone 13), ' + new URL(origin).protocol);
-  for (const [host, hostProfile, visitor, visitorProfile, checkFile] of [
-    [android, 'Pixel 7', android, 'Pixel 7', true],
-    [iphone, 'iPhone 13', iphone, 'iPhone 13', false],
-    [android, 'Pixel 7', iphone, 'iPhone 13', false],
-  ]) {
+  if (permissionCases) {
+    assert.ok(splitFixture && synthetic && !deployedOrigin, 'Permission cases require the isolated synthetic split fixture');
+    await checkPermissionCases(android, origin, apiOrigin);
+  }
+  const pairs = (permissionCases ? [] : [
+    ['android', android, 'Pixel 7', android, 'Pixel 7', true],
+    ['iphone', iphone, 'iPhone 13', iphone, 'iPhone 13', false],
+    ['mixed', android, 'Pixel 7', iphone, 'iPhone 13', false],
+  ]).filter(([name]) => !selectedPair || name === selectedPair);
+  assert.ok(permissionCases || pairs.length, 'BROWSER_PAIR must be android, iphone or mixed');
+  for (const [, host, hostProfile, visitor, visitorProfile, checkFile] of pairs) {
     importGate = Promise.withResolvers();
     await checkSessions(host, hostProfile, visitor, visitorProfile, origin, apiOrigin, checkFile);
   }

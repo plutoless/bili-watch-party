@@ -10,7 +10,7 @@ const playerSource = readFileSync(new URL('../public/player.js', import.meta.url
   .replaceAll('export function ', 'function ')
   .replace('    load(url) {', '    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(url) {');
 
-function roomFixture() {
+function roomFixture({ automatic = false, blocked = [] } = {}) {
   const room = createPlayback(120);
   const timers = new Set();
   const saved = { host: new Map(), visitor: new Map() };
@@ -28,6 +28,7 @@ function roomFixture() {
   const recovery = [];
   const pauses = [];
   const visitorWire = [];
+  const grants = new Set();
 
   const wait = ms => ms ? new Promise(resolve => schedule(resolve, ms)) : undefined;
 
@@ -75,13 +76,20 @@ function roomFixture() {
       getAttribute() { return this.src; },
       removeAttribute() { this.src = ''; },
       load() {},
-      play() { this.paused = false; updatedAt = now; return Promise.resolve(); },
+      play() {
+        if (blocked.includes(role) && !grants.has(role)) {
+          return Promise.reject(new DOMException('Policy blocked playback', 'NotAllowedError'));
+        }
+        this.paused = false;
+        updatedAt = now;
+        return Promise.resolve();
+      },
       pause() { position = this.currentTime; this.paused = true; }
     });
     Object.defineProperties(video, {
       currentTime: {
-        get: () => position + (video.paused ? 0 : (now - updatedAt) * rate / 1000),
-        set: seconds => { position = seconds; updatedAt = now; },
+        get: () => position + (video.paused || video.stuck ? 0 : (now - updatedAt) * rate / 1000),
+        set: seconds => { if (!video.stuck) { position = seconds; updatedAt = now; } },
       },
       playbackRate: {
         get: () => rate,
@@ -94,6 +102,11 @@ function roomFixture() {
       }
       return elements.get(id);
     };
+    const gainWrites = [];
+    const gain = {
+      get value() { return gainWrites.at(-1) ?? 0; },
+      set value(value) { gainWrites.push(value); },
+    };
     const context = {
       document: Object.assign(new EventTarget(), { getElementById: element, hidden: false }),
       window: new EventTarget(),
@@ -102,7 +115,13 @@ function roomFixture() {
         setItem: (key, value) => saved[role].set(key, value),
         removeItem: key => saved[role].delete(key) },
       performance: { now: () => now },
-      AbortController, AbortSignal,
+      AbortController, AbortSignal, DOMException,
+      AudioContext: class {
+        state = 'running';
+        createGain() { return { gain, connect() {} }; }
+        createMediaElementSource() { return { connect: node => node }; }
+        resume() { return Promise.resolve(); }
+      },
       setTimeout: schedule,
       setInterval: (fn, delay) => schedule(fn, delay, true),
       clearTimeout: timer => timers.delete(timer),
@@ -177,7 +196,11 @@ function roomFixture() {
       apiOrigin: '', roomPath: '/rooms/synthetic', role,
     });
     player.load('/media/synthetic.mp4');
-    return { player, video, element };
+    if (automatic) player.admit();
+    return { player, video, element, gain, gainWrites, allowPlayback() {
+      grants.add(role);
+      element('prepare').dispatchEvent(new Event('click'));
+    } };
   }
 
   let host = open('host');
@@ -194,6 +217,7 @@ function roomFixture() {
   }
   return {
     advance, start, visitor, recovery, pauses, visitorWire, now: () => now,
+    approve() { room.startOnApproval(); },
     setDelay(request, reply) { delay = { request, reply }; },
     loseNextRecovery(kind) { recoveryLoss = kind; },
     loseNextPauseReply() { pausedReplyLoss = true; },
@@ -219,6 +243,244 @@ function roomFixture() {
     snapshot() { return room.update({ role: 'host', action: 'observe', playerId: randomUUID() }, now).state; },
   };
 }
+
+for (const blocked of [[], ['host'], ['visitor'], ['host', 'visitor']]) {
+  test('first start keeps probes silent and prompts only blocked seats (' + (blocked.join(', ') || 'none') + ')', async () => {
+    const app = roomFixture({ automatic: true, blocked });
+    app.approve();
+    await app.advance(600);
+    for (const role of ['host', 'visitor']) {
+      assert.equal(app[role].element('prepare').hidden, !blocked.includes(role));
+      assert.equal(app[role].gain.value, 0);
+    }
+    if (blocked.length) {
+      assert.equal(app.snapshot().startsAt, null);
+      assert.deepEqual(app.snapshot().blocked, blocked);
+      for (const role of blocked) app[role].allowPlayback();
+    }
+    await app.advance(11500);
+    assert.equal(app.snapshot().synchronized, true);
+    for (const role of ['host', 'visitor']) {
+      assert.equal(app[role].element('prepare').hidden, true);
+      assert.equal(app[role].video.paused, false);
+      assert.equal(app[role].gain.value, 1);
+    }
+  });
+}
+
+test('a visitor stuck at the opening keeps both outputs silent and exposes the waiting reason', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(600);
+  app.visitor.video.stuck = true;
+  await app.advance(1050);
+  assert.equal(app.snapshot().advancing.host, true);
+  assert.equal(app.snapshot().advancing.visitor, false);
+  assert.equal(app.snapshot().firstStartPending, true);
+  assert.equal(app.host.element('playback-status').textContent, '等待访客的播放进度推进。');
+  assert.equal(app.host.gain.value, 0);
+  assert.equal(app.visitor.gain.value, 0);
+  app.visitor.video.stuck = false;
+  app.visitor.video.currentTime = app.host.video.currentTime;
+  await app.advance(9500);
+  assert.equal(app.snapshot().firstStartPending, false);
+  assert.equal(app.host.gain.value, 1);
+  assert.equal(app.visitor.gain.value, 1);
+});
+
+test('both outputs remain silent when the visitor stalls only after each rewind', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  let attempts = 0;
+  let lastDeadline;
+  for (let step = 0; step < 450 && attempts < 3; step++) {
+    await app.advance(100);
+    const state = app.snapshot();
+    if (state.preview) app.visitor.video.stuck = false;
+    if (state.awaitingStart && state.startConfirmed && state.startsAt !== lastDeadline) {
+      lastDeadline = state.startsAt;
+      app.visitor.video.stuck = true;
+      attempts++;
+    }
+  }
+  assert.equal(attempts, 3, 'Both previews must succeed before each stalled audible attempt');
+  await app.advance(800);
+  assert.equal(app.host.gainWrites.includes(1), false);
+  assert.equal(app.visitor.gainWrites.includes(1), false);
+});
+
+test('a healthy silent preview survives staggered progress responses 800 ms apart', () => {
+  const room = createPlayback(120);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  const update = (role, action, now, fields) =>
+    room.update({ role, playerId: ids[role], action, ...fields }, now).state;
+  room.startOnApproval();
+  const { epoch, version } = update('host', 'observe', 0);
+  const target = { epoch, version, claim: true, position: 0 };
+  update('host', 'ready', 0, target);
+  const { startsAt } = update('visitor', 'ready', 0, target);
+  const observe = (role, now) => update(role, 'observe', now, {
+    ...target, observedAt: now, sampledAt: now, position: (now - startsAt) / 1000, playing: true,
+  });
+  observe('host', startsAt + 200);
+  observe('host', startsAt + 1100);
+  observe('visitor', startsAt + 1900);
+  observe('host', startsAt + 2700);
+  const state = observe('host', startsAt + 3100);
+  assert.equal(state.version, version, 'An observation gap alone does not establish video stalled');
+  const visitor = observe('visitor', startsAt + 3500);
+  assert.equal(visitor.preview, false);
+  assert.equal(visitor.position, 0);
+  assert.equal(visitor.awaitingStart, true);
+});
+
+test('an offline pause stays visible after the host refreshes without probing playback', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  await app.advance(11500);
+  assert.equal(app.snapshot().synchronized, true);
+  app.disconnectHost();
+  await app.advance(450);
+  app.host.element('play').dispatchEvent(new Event('click'));
+  app.reloadHost();
+  app.restoreHost();
+  await app.advance(1200);
+  assert.equal(app.snapshot().wantsPlay, false);
+  assert.equal(app.host.video.paused, true);
+  assert.equal(app.host.gain.value, 0);
+  assert.equal(app.host.element('playback-status').textContent, '已暂停，等待房主播放。');
+});
+
+test('first start waits for both acknowledgments before releasing audio', () => {
+  const room = createPlayback(120);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  const update = (role, action, now, fields) =>
+    room.update({ role, playerId: ids[role], action, ...fields }, now).state;
+  room.startOnApproval();
+  const { epoch, version } = update('host', 'observe', 0);
+  const target = { epoch, version, claim: true, position: 0 };
+  update('host', 'ready', 0, target);
+  const { startsAt } = update('visitor', 'ready', 0, target);
+  function progress(role, now) {
+    return update(role, 'observe', now, { epoch, version, position: (now - startsAt) / 1000, playing: true });
+  }
+  progress('host', 1100);
+  progress('visitor', 1100);
+  progress('host', 1300);
+  const aligned = progress('visitor', 1300);
+  assert.equal(aligned.position, 0);
+  assert.equal(aligned.startsAt, null);
+  const realTarget = { ...target, version: aligned.version };
+  update('host', 'ready', 1400, realTarget);
+  const first = update('visitor', 'ready', 1400, realTarget);
+  const agree = (role, now, deadline, confirms) => update(role, 'observe', now, {
+    ...realTarget, startAcknowledgment: deadline, startConfirmation: confirms ? deadline : undefined,
+  });
+  agree('host', 1500, first.startsAt);
+  agree('visitor', 1700, first.startsAt);
+  agree('visitor', 1900, first.startsAt, true);
+  const revised = agree('host', first.startsAt - 2200, first.startsAt, true);
+  assert.ok(revised.startsAt > first.startsAt);
+  assert.equal(revised.startConfirmed, false);
+  const deadline = revised.startsAt;
+  const retryAt = revised.serverTime;
+  agree('host', retryAt + 200, deadline);
+  agree('visitor', retryAt + 400, deadline);
+  agree('host', retryAt + 500, deadline, true);
+  const agreed = agree('visitor', retryAt + 600, deadline, true);
+  assert.equal(agreed.startConfirmed, true);
+  assert.equal(agreed.synchronized, false);
+  for (let now = retryAt + 1000; now < deadline; now += 1000) {
+    for (const role of ['host', 'visitor']) agree(role, now, deadline, true);
+  }
+  const started = agree('host', deadline, deadline);
+  assert.equal(started.firstStartPending, true);
+  assert.equal(started.position, 0);
+  for (const role of ['host', 'visitor']) {
+    update(role, 'observe', deadline + 100, { ...realTarget, position: 0.1, playing: true });
+  }
+  const delayed = update('host', 'observe', deadline + 1100, { ...realTarget, position: 1.1, playing: true });
+  assert.equal(delayed.startsAt, deadline, 'A late report does not prove that the visitor stalled');
+  const active = update('visitor', 'observe', deadline + 1400, { ...realTarget, position: 1.4, playing: true });
+  assert.equal(active.firstStartPending, false);
+});
+
+function shortFirstStartFixture() {
+  const room = createPlayback(1);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  const update = (role, action, now, fields) =>
+    room.update({ role, playerId: ids[role], action, ...fields }, now).state;
+  room.startOnApproval();
+  const { epoch, version } = update('host', 'observe', 0);
+  const target = { epoch, version, claim: true, position: 0 };
+  update('host', 'ready', 0, target);
+  const { startsAt } = update('visitor', 'ready', 0, target);
+  const plan = { ...target, startAcknowledgment: startsAt, startConfirmation: startsAt };
+  update('host', 'observe', 200, plan);
+  update('visitor', 'observe', 400, plan);
+  assert.equal(update('host', 'observe', 600, plan).startConfirmed, true);
+  for (let now = 1500; now < startsAt; now += 1000) {
+    for (const role of ['host', 'visitor']) update(role, 'observe', now, plan);
+  }
+  return { update, target, startsAt };
+}
+
+test('a short clip cannot end while one player still shows its first frame', () => {
+  const { update, target, startsAt } = shortFirstStartFixture();
+  update('host', 'observe', startsAt + 100, { ...target, position: 0.1, playing: true });
+  update('visitor', 'observe', startsAt + 100, { ...target, playing: true });
+  update('host', 'observe', startsAt + 1000, { ...target, position: 1, ended: true });
+  const stalled = update('visitor', 'observe', startsAt + 1000, { ...target, playing: true });
+  assert.equal(stalled.ended, false);
+  assert.equal(stalled.startsAt, null);
+  assert.equal(stalled.position, 0);
+  assert.equal(stalled.waiting.visitor, 'buffering');
+});
+
+test('a delayed stationary sample uses its capture time when checking for a stall', () => {
+  const { update, target, startsAt } = shortFirstStartFixture();
+  update('visitor', 'observe', startsAt + 10, {
+    ...target, sampledAt: 10, observedAt: startsAt + 10, playing: true,
+  });
+  update('host', 'observe', startsAt + 1000, { ...target, position: 1, ended: true });
+  const delayed = update('visitor', 'observe', startsAt + 1410, {
+    ...target, sampledAt: 210, observedAt: startsAt + 210, playing: true,
+  });
+  assert.equal(delayed.startsAt, startsAt);
+  assert.equal(delayed.ended, false);
+  assert.equal(delayed.waiting.visitor, null);
+});
+
+test('a short clip plays through both terminal frames when the visitor starts 300 ms late', () => {
+  const { update, target, startsAt } = shortFirstStartFixture();
+  const report = (role, ms, position, ended = false) => update(role, 'observe', startsAt + ms,
+    { ...target, position, playing: !ended, ended });
+  report('host', 100, 0.1);
+  report('host', 300, 0.3);
+  report('visitor', 400, 0.1);
+  const playing = report('visitor', 500, 0.2);
+  assert.equal(playing.synchronized, true);
+  assert.equal(report('host', 1000, 1, true).ended, false);
+  assert.equal(report('visitor', 1300, 1, true).ended, true);
+});
+
+test('projected duration cannot end a first start with a media clock stuck at zero', () => {
+  const room = createPlayback(2);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  room.startOnApproval();
+  const update = (role, action, now, fields) =>
+    room.update({ role, playerId: ids[role], action, ...fields }, now).state;
+  const { epoch, version } = update('host', 'observe', 0);
+  const target = { epoch, version, claim: true, position: 0 };
+  update('host', 'ready', 0, target);
+  const { startsAt } = update('visitor', 'ready', 0, target);
+  const waiting = update('visitor', 'observe', startsAt + 2000, { ...target, playing: true });
+  assert.equal(waiting.ended, false);
+  assert.equal(waiting.firstStartPending, true);
+  assert.equal(waiting.position, 0);
+  assert.equal(waiting.startsAt, null);
+  assert.equal(waiting.waiting.visitor, 'buffering');
+});
 
 for (const direction of [-1, 1]) {
   test('opposing 0.31 second errors converge when the host is ' + (direction > 0 ? 'ahead' : 'behind'), async t => {

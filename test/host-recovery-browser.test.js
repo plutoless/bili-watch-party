@@ -9,6 +9,7 @@ import { setTimeout as wait } from 'node:timers/promises';
 import test from 'node:test';
 import { devices, webkit } from 'playwright';
 import { startServer } from '../src/server.js';
+import { allowPlaybackIfPrompted } from './playback-browser.js';
 
 const fixture = process.env.ITEM5_FIXTURE;
 const evidence = process.env.ITEM5_EVIDENCE;
@@ -248,7 +249,7 @@ async function scenario(kind, root, t) {
   assert.ok((await Promise.all(pages.map(page => page.evaluate(() => isSecureContext)))).every(Boolean));
   const request = await (await pending).json();
   assert.equal(request.state, 'pending');
-  assert.equal((await post(room + '/approve', { requestId: request.requestId })).status(), 200);
+  assert.equal((await post(room + '/approve', { requestId: request.requestId, startPlayback: true })).status(), 200);
   const hostActions = track(hp, 'host', trace, nextState => {
     if (state && (nextState.serverTime < state.serverTime || nextState.version < state.version)) return;
     if (!state || nextState.version !== state.version || nextState.startsAt !== state.startsAt ||
@@ -284,15 +285,7 @@ async function scenario(kind, root, t) {
     }
   })().catch(error => { failures.push(error); });
 
-  for (const page of pages) await page.locator('#prepare').tap({ timeout: 12000 });
-  await next(() => state?.ready.visitor, 10_000, 'Guest did not prepare');
-  if (!state.ready.host) {
-    // Only preflight can nudge a freshly primed WebKit host whose initial rewind stalls.
-    trace('preflight-host-load');
-    await hp.locator('video').evaluate(video => video.load());
-  }
-  await next(() => state?.ready.host && state?.ready.visitor, 10_000, 'Both seats did not prepare');
-  await hp.getByRole('button', { name: '播放', exact: true }).tap({ timeout: 10000 });
+  await Promise.all(pages.map(allowPlaybackIfPrompted));
   await next(() => paired.at(-1)?.pair.every(row => !row.paused && row.position > 3), 12_000, 'Both players did not advance beyond three seconds');
 
   const previous = state.version;
