@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { getCACertificates, setDefaultCACertificates } from 'node:tls';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { chromium, devices, webkit } from 'playwright';
 import { createImporter, ImportError } from '../src/importer.js';
@@ -11,7 +11,7 @@ import { createR2Media } from '../src/r2-media.js';
 import { startServer } from '../src/server.js';
 import { checkPlaybackReconnect, checkSharedPlayback } from './playback-browser.js';
 import { startR2Fixture } from './r2-fixture.js';
-import { createLoopbackTls, startSplitFixture } from './split-browser-fixture.js';
+import { createLoopbackTls, readLoopbackTls, startSplitFixture } from './split-browser-fixture.js';
 
 const run = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH ?? 'ffmpeg';
@@ -19,18 +19,39 @@ const ffprobe = process.env.FFPROBE_PATH ?? 'ffprobe';
 const source = 'https://www.bilibili.com/video/BV1TDyazeEuY';
 const deployedOrigin = process.env.BROWSER_ORIGIN;
 const deployedApiOrigin = process.env.BROWSER_API_ORIGIN;
+const r2Fixture = process.env.BROWSER_R2_FIXTURE === '1';
+const fixtureTlsDir = process.env.BROWSER_R2_TLS_DIR;
+
+// Node reads extra roots at startup. Trust only the generated loopback fixture in this run.
+if (r2Fixture && !deployedOrigin && !fixtureTlsDir) {
+  const directory = await mkdtemp(join(tmpdir(), 'watch-party-r2-tls-'));
+  let exitCode;
+  try {
+    const { cert } = await createLoopbackTls(directory);
+    const extra = process.env.NODE_EXTRA_CA_CERTS;
+    const trust = join(directory, 'ca.pem');
+    await writeFile(trust, extra ? Buffer.concat([await readFile(extra), Buffer.from('\n'), cert]) : cert);
+    const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+      env: { ...process.env, NODE_EXTRA_CA_CERTS: trust, BROWSER_R2_TLS_DIR: directory },
+      stdio: 'inherit',
+    });
+    if (result.error) throw result.error;
+    exitCode = result.status ?? 1;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  process.exit(exitCode);
+}
 const password = deployedOrigin ? process.env.HOST_PASSWORD : 'synthetic-browser-test-password';
 const dataDir = deployedOrigin ? null : await mkdtemp(join(tmpdir(), 'watch-party-live-'));
 const mediaDir = dataDir ?? process.env.BROWSER_DATA_DIR;
 const simulateFirstFailure = process.env.SIMULATE_FIRST_FAILURE === '1';
 const synthetic = process.env.SYNTHETIC_VIDEO === '1';
-const r2Fixture = process.env.BROWSER_R2_FIXTURE === '1';
 const splitFixture = r2Fixture || process.env.BROWSER_SYNTHETIC_SPLIT === '1';
 const ignoreHTTPSErrors = splitFixture || process.env.BROWSER_LOCAL_TLS === '1';
 let app;
 let fixture;
 let storage;
-let previousCAs;
 const browsers = [];
 let failNextRequest = simulateFirstFailure;
 let importGate;
@@ -423,9 +444,7 @@ try {
     assert.ok(!simulateFirstFailure, 'Failure injection requires the test-managed app server');
   } else {
     if (r2Fixture) {
-      const tls = await createLoopbackTls(dataDir);
-      previousCAs = getCACertificates('default');
-      setDefaultCACertificates([...previousCAs, tls.cert.toString()]);
+      const tls = await readLoopbackTls(fixtureTlsDir);
       storage = await startR2Fixture({ tls });
       fixture = await startSplitFixture(dataDir, { tls, mediaOrigin: storage.options.publicOrigin });
     } else if (splitFixture) fixture = await startSplitFixture(dataDir);
@@ -493,6 +512,5 @@ try {
   await fixture?.close();
   await app?.close();
   await storage?.close();
-  if (previousCAs) setDefaultCACertificates(previousCAs);
   if (dataDir) await rm(dataDir, { recursive: true, force: true });
 }

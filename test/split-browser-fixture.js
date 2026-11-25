@@ -10,7 +10,14 @@ export async function createLoopbackTls(directory) {
   const cert = join(directory, 'cert.pem');
   execFileSync('openssl', ['req', '-x509', '-nodes', '-days', '1', '-newkey', 'rsa:2048',
     '-subj', '/CN=localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
-  return { key: await readFile(key), cert: await readFile(cert) };
+  return readLoopbackTls(directory);
+}
+
+export async function readLoopbackTls(directory) {
+  return {
+    key: await readFile(join(directory, 'key.pem')),
+    cert: await readFile(join(directory, 'cert.pem')),
+  };
 }
 
 export async function startSplitFixture(directory, { mediaOrigin = '', tls } = {}) {
