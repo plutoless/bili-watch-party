@@ -33,14 +33,23 @@ function sample(page, localStart) {
   return page.locator('video').evaluate((video, { localStart, sampleMs, stabilityMs }) =>
     new Promise(resolve => {
       const samples = [];
-      const record = () => {
+      let preRoll;
+      const readSample = () => {
         const before = performance.now();
         const position = video.currentTime;
         const after = performance.now();
         const time = (before + after) / 2;
-        samples.push({ time, position, paused: video.paused, seeking: video.seeking });
-        if (time >= localStart + stabilityMs + sampleMs) resolve(samples);
-        else setTimeout(record, Math.max(0, localStart - sampleMs + samples.length * sampleMs - performance.now()));
+        return { time, position, paused: video.paused, seeking: video.seeking };
+      };
+      const preRollTimer = setTimeout(() => { preRoll = readSample(); },
+        Math.max(0, localStart - 2 * sampleMs - performance.now()));
+      const record = () => {
+        const observation = readSample();
+        samples.push(observation);
+        if (observation.time >= localStart + stabilityMs + sampleMs) {
+          clearTimeout(preRollTimer);
+          resolve({ samples, preRoll });
+        } else setTimeout(record, Math.max(0, localStart - sampleMs + samples.length * sampleMs - performance.now()));
       };
       setTimeout(record, Math.max(0, localStart - sampleMs - performance.now()));
     }), { localStart, sampleMs, stabilityMs });
@@ -57,17 +66,22 @@ function positionAt(samples, time, stage, role) {
   return first.position + ratio * (second.position - first.position);
 }
 
-async function checkStability(hostPage, visitorPage, stage) {
+export async function checkStability(hostPage, visitorPage, stage) {
   const clocks = await Promise.all([pageClock(hostPage), pageClock(visitorPage)]);
   const start = performance.now() + 1500;
   const samples = await Promise.all([hostPage, visitorPage].map(async (page, index) => {
     const { offset } = clocks[index];
-    const samples = await sample(page, start - offset);
+    const localStart = start - offset;
+    const { samples, preRoll } = await sample(page, localStart);
     const role = index === 0 ? 'host' : 'guest';
     const paused = samples.some(sample => sample.paused);
     assertPlayback(!paused, stage, role, { paused });
     const advanced = samples.at(-1).position - samples[0].position >= 9;
     assertPlayback(advanced, stage, role, { advanced });
+    // Use pre-roll only for a missing opening bracket; keep the primary collection and checks intact.
+    if (samples[0].time >= localStart && preRoll && !preRoll.paused && preRoll.time < localStart) {
+      samples.unshift(preRoll);
+    }
     return samples.map(sample => ({ ...sample, time: sample.time + offset }));
   }));
   const differences = Array.from({ length: stabilityMs / sampleMs }, (_, index) => {
