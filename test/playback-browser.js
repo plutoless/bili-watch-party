@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { playbackFailure } from './browser-failure.js';
+import { waitForPausedStatus } from './paused-status-browser.js';
 
 const playbackRoute = '**/api/rooms/*/playback';
 const stabilityMs = 10_000;
@@ -580,20 +581,19 @@ export async function checkSharedPlayback({
   await waitForBothPlaying(hostPage, visitorPage, restartPosition + 0.25, 'gesture-retry');
   console.log('Paused seek stayed paused; scheduled gesture rejection held the room until the next tap.');
 
-  const waitForPause = () => Promise.all([hostPage, visitorPage].map(page =>
-    page.getByText('已暂停，等待房主播放。').waitFor()));
+  const waitForPause = stage => waitForPausedStatus(hostPage, visitorPage, endpoint, stage);
   await play.tap();
-  await waitForPause();
+  await waitForPause('pause-after-gesture-retry');
   await delayNextPlayFailure(visitorPage);
   await play.tap();
   await visitorPage.locator('video[data-delayed-play]').waitFor();
   await play.tap();
-  await waitForPause();
+  await waitForPause('pause-after-cancel-delayed-guest-play');
   await visitorPage.locator('video').dispatchEvent('test-reject-play');
   await delay(600);
   const retryVisible = await visitorPage.getByRole('button', { name: '再次点按以准备' }).isVisible();
   assertPlayback(!retryVisible, 'blocked-start', 'guest', { retryVisible });
-  await waitForPause();
+  await waitForPause('pause-after-obsolete-guest-rejection');
 
   await denyNextPlay(hostPage);
   await play.tap();
@@ -602,7 +602,7 @@ export async function checkSharedPlayback({
   assertPlayback(controlEnabled, 'blocked-start', 'host', { controlEnabled });
   await play.tap();
   await hostPage.getByRole('button', { name: '再次点按以准备' }).tap();
-  await waitForPause();
+  await waitForPause('pause-after-cancel-blocked-host-reprepare');
   await delay(1100);
   await assertBothPaused(hostPage, visitorPage, 'blocked-start');
   console.log('Obsolete rejection was ignored; host could cancel a blocked start and re-prepare without resuming.');
@@ -620,7 +620,7 @@ export async function checkSharedPlayback({
       });
     }
     await play.tap();
-    await waitForPause();
+    await waitForPause('pause-after-delayed-start');
     console.log('Delayed start notification and slow seeks did not prevent either player from starting.');
   }
 
@@ -707,7 +707,7 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
     assert.equal((await getTimeline()).wantsPlay, false);
   });
   started = performance.now();
-  await waitForPause();
+  await waitForPause('pause-after-buffer-release');
   assert.ok((await playhead(hostPage)).paused && (await playhead(visitorPage)).paused);
   assert.ok(Math.abs((await playhead(visitorPage)).position - frozen.position) < 0.12);
   console.log('Buffer release after host pause: ' + Math.round(performance.now() - started) + ' ms to aligned pause.');
@@ -741,7 +741,7 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
     releaseFirst.resolve();
     assert.equal((await staleReply).status(), 409);
     await inRange(visitorPage, 0.48, 0.62);
-    await waitForPause();
+    await waitForPause('pause-after-repeated-seeks');
     console.log('Repeated seeks with late readiness: newest target settled paused after ' +
       Math.round(performance.now() - started) + ' ms; difference ' + await assertAligned() + ' s.');
   } finally {
@@ -822,7 +822,7 @@ async function checkRecovery({ hostPage, visitorPage, host, visitor, endpoint, g
   }
   await hostPage.locator('#play').filter({ hasText: '播放' }).waitFor();
   await hostPage.waitForFunction(() => document.querySelector('#playback-status').textContent === '已暂停，等待房主播放。');
-  await waitForPause();
+  await waitForPause('pause-after-offline-refresh');
   assert.equal((await getTimeline()).wantsPlay, false);
   const pausePosition = (await playhead(hostPage)).position;
   const alignedAfter = Math.round(performance.now() - started);

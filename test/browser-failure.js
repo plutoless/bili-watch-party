@@ -8,7 +8,18 @@ const transportCodes = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOT
 const wrappedTransport = /\b(?:read|connect|write|getaddrinfo) (ECONNREFUSED|ECONNRESET|ETIMEDOUT|ENOTFOUND|EPIPE)\b/;
 
 const playbackFailures = new WeakMap();
+const pauseStages = new Set([
+  'pause-after-gesture-retry', 'pause-after-cancel-delayed-guest-play',
+  'pause-after-obsolete-guest-rejection', 'pause-after-cancel-blocked-host-reprepare',
+  'pause-after-delayed-start', 'pause-after-buffer-release', 'pause-after-repeated-seeks',
+  'pause-after-offline-refresh',
+]);
+const pauseStatuses = new Set([
+  'paused', 'waiting-ready', 'waiting-gesture', 'connecting', 'disconnected', 'buffering',
+  'background', 'recovering', 'starting', 'playing', 'aligning', 'ended', 'other', 'missing', 'unavailable',
+]);
 const playbackStages = new Set([
+  ...pauseStages,
   'initial-start', 'initial-stability', 'public-drift', 'protected-drift', 'fullscreen', 'fullscreen-resume',
   'shared-seek', 'shared-pause', 'paused-seek', 'gesture-hold', 'gesture-retry', 'blocked-start', 'delayed-start',
   'protected-recovery', 'buffer-recovery', 'network-recovery', 'foreground-recovery', 'refresh-recovery',
@@ -17,12 +28,20 @@ const playbackStages = new Set([
 ]);
 const playbackRoles = new Set(['host', 'guest', 'both']);
 const playbackFlags = ['paused', 'seeking', 'advanced', 'decoded', 'muted', 'bracketed', 'withinGap',
-  'withinBudget', 'aligned', 'controlEnabled', 'retryVisible', 'neutralRate', 'ready'];
+  'withinBudget', 'aligned', 'controlEnabled', 'retryVisible', 'neutralRate', 'ready',
+  'statusVisible', 'timelineReceived', 'wantsPlay', 'startScheduled', 'hostReady', 'guestReady'];
 
-export function playbackFailure(error, stage, role, flags = {}) {
+export function playbackFailure(error, stage, role, flags = {}, pause = {}) {
   if (error instanceof Error && !playbackFailures.has(error) && playbackStages.has(stage) && playbackRoles.has(role)) {
     const details = playbackFlags.filter(flag => typeof flags[flag] === 'boolean')
       .map(flag => flag + '=' + flags[flag]);
+    if (pauseStages.has(stage)) {
+      details.push('expectedStatus=paused');
+      if (pauseStatuses.has(pause.displayedStatus)) details.push('displayedStatus=' + pause.displayedStatus);
+      for (const field of ['firstVersion', 'timelineVersion']) {
+        if (Number.isSafeInteger(pause[field]) && pause[field] >= 0) details.push(field + '=' + pause[field]);
+      }
+    }
     playbackFailures.set(error, ['stage=' + stage, 'role=' + role, ...details].join(' '));
   }
   return error;
