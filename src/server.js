@@ -13,7 +13,8 @@ import { openRooms } from './rooms.js';
 const lifetime = 12 * 60 * 60;
 const cookieName = 'watch_party_host';
 const uuid = '[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}';
-const playerIdPattern = new RegExp('^' + uuid + '$');
+const uuidPattern = new RegExp('^' + uuid + '$');
+const isUuid = value => typeof value === 'string' && uuidPattern.test(value);
 const roomRoute = new RegExp('^/api/rooms/(' + uuid + ')(?:/(retry|invitation|approve|join|end|playback))?$');
 const pageRoute = new RegExp('^/(?:rooms|invite)/' + uuid + '$');
 const mediaRoute = new RegExp('^/media/(' + uuid + ')\\.mp4$');
@@ -194,14 +195,24 @@ export async function startServer({
 
   async function roomPlayback(req, res, id) {
     const body = await readJson(req);
-    const { role, action, playerId, position } = body ?? {};
+    const { role, action, playerId, previousPlayerId, fallbackPlayerIds = [], recoveryId, recoveryGeneration,
+      position, reason, seekId, afterSeekId } = body ?? {};
     if (role === 'host') requireHost(req);
     else if (role !== 'visitor' || !admission.isApproved(id, visitorToken(req, id))) {
       throw new HttpError(401, '仅房主和已批准的访客可读取播放状态。');
     }
     const hostCommand = ['play', 'pause', 'seek'].includes(action);
-    if ((!hostCommand && !['observe', 'ready', 'blocked'].includes(action)) ||
-        typeof playerId !== 'string' || !playerIdPattern.test(playerId) ||
+    const hasRecoveryGeneration = recoveryId !== undefined || recoveryGeneration !== undefined;
+    const invalidRecovery = (hasRecoveryGeneration && (!isUuid(recoveryId) ||
+      !Number.isSafeInteger(recoveryGeneration) || recoveryGeneration < 1)) ||
+      ((!hasRecoveryGeneration || previousPlayerId !== undefined) && !isUuid(previousPlayerId)) ||
+      !Array.isArray(fallbackPlayerIds) || !fallbackPlayerIds.every(isUuid);
+    if ((!hostCommand && !['observe', 'ready', 'blocked', 'unavailable', 'recover'].includes(action)) ||
+        !isUuid(playerId) ||
+        (action === 'recover' && invalidRecovery) ||
+        (action === 'ready' && recoveryId !== undefined && (body.claim !== true || !isUuid(recoveryId))) ||
+        [seekId, afterSeekId].some(value => value !== undefined && !isUuid(value)) ||
+        (action === 'unavailable' && !['buffering', 'connection', 'background'].includes(reason)) ||
         (['ready', 'seek'].includes(action) && !Number.isFinite(position))) {
       throw new HttpError(400, '播放操作无效。');
     }

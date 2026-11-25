@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 const startLeadMs = 900;
 const playerLeaseMs = 4_000;
 const alignmentTolerance = 0.12;
+const maxRecoveryRewind = 2;
 const roles = ['host', 'visitor'];
 
 export function createPlayback(duration) {
@@ -12,14 +13,12 @@ export function createPlayback(duration) {
   let startsAt = null;
   let wantsPlay = false;
   let version = 0;
+  let hostCommandVersion = 0;
+  let lastHostSeek;
 
   function currentPosition(now) {
     const elapsed = startsAt === null ? 0 : Math.max(0, now - startsAt) / 1000;
     return Math.min(duration, position + elapsed);
-  }
-
-  function changeTimeline() {
-    version++;
   }
 
   function align(target, resume) {
@@ -29,7 +28,7 @@ export function createPlayback(duration) {
     for (const player of Object.values(players)) {
       if (player) player.ready = false;
     }
-    changeTimeline();
+    version++;
   }
 
   function scheduleStart(now) {
@@ -38,51 +37,115 @@ export function createPlayback(duration) {
 
   const bothReady = () => players.host?.ready && players.visitor?.ready;
 
+  function interrupt(player, reason, now, observedPosition) {
+    const projected = currentPosition(now);
+    const reported = observedPosition ?? (player.progress?.version === version ? player.progress.position : undefined);
+    // Allow a short recovery rewind without treating a participant's report as a seek.
+    const lastContact = reason === 'connection' ? player.lastSeen ?? now : now;
+    const floor = Math.max(position, currentPosition(lastContact) - maxRecoveryRewind);
+    const target = startsAt === null || !Number.isFinite(reported) ? projected
+      : Math.max(floor, Math.min(projected, reported));
+    align(target, wantsPlay && target < duration);
+    player.waiting = reason;
+  }
+
+  function expirePlayers(now) {
+    const expiring = Object.values(players)
+      .filter(player => player?.lastSeen != null && now - player.lastSeen >= playerLeaseMs)
+      .sort((first, second) => first.lastSeen - second.lastSeen);
+    for (const player of expiring) {
+      interrupt(player, 'connection', player.lastSeen);
+      player.lastSeen = null;
+    }
+  }
+
   return {
     update({ role, action, playerId, ...command }, now) {
-      let expired = false;
-      for (const seat of roles) {
-        if (players[seat] && now - players[seat].lastSeen >= playerLeaseMs) {
-          players[seat] = null;
-          expired = true;
-        }
-      }
-      if (expired) align(currentPosition(now), false);
+      expirePlayers(now);
       if (startsAt !== null && currentPosition(now) >= duration) align(duration, false);
 
       const player = players[role];
       const ownsSeat = player?.id === playerId;
-      if (ownsSeat) player.lastSeen = now;
       let conflict = false;
-      if (action !== 'observe') {
-        if (command.epoch !== epoch || command.version !== version) conflict = true;
+      if (action === 'recover') {
+        const sameSeat = player && player.recoveryId === command.recoveryId;
+        if (ownsSeat) {
+          conflict = command.recoveryId !== undefined &&
+            (!sameSeat || command.recoveryGeneration !== player.recoveryGeneration);
+        } else {
+          // New documents carry the same seat ID and a strictly increasing generation across lost replies.
+          const canRecover = player && (sameSeat ? command.recoveryGeneration > player.recoveryGeneration
+            : player.id === command.previousPlayerId || command.fallbackPlayerIds?.includes(player.id));
+          if (!canRecover) conflict = true;
+          else {
+            interrupt(player, 'connection', now);
+            if (role === 'host' && lastHostSeek?.playerId === player.id) lastHostSeek.playerId = playerId;
+            player.id = playerId;
+            player.recoveryId = command.recoveryId ?? playerId;
+            player.recoveryGeneration = command.recoveryGeneration ?? 0;
+            player.blocked = false;
+          }
+        }
+      } else if (action !== 'observe') {
+        // Readiness and interruptions may advance the timeline while a host pause is in flight.
+        const concurrentPause = action === 'pause' &&
+          Number.isInteger(command.version) && command.version >= hostCommandVersion && command.version <= version;
+        // A newer local pause may follow a seek whose acknowledgment never reached this host.
+        const pauseAfterSeek = action === 'pause' && role === 'host' && ownsSeat &&
+          lastHostSeek?.playerId === playerId && command.afterSeekId === lastHostSeek.id &&
+          command.version === lastHostSeek.previousVersion;
+        if (command.epoch !== epoch || (command.version !== version && !concurrentPause && !pauseAfterSeek)) conflict = true;
         else if (action === 'ready') {
-          if ((!ownsSeat && (command.claim !== true || player)) || startsAt !== null ||
+          if ((!ownsSeat && (command.claim !== true || player?.lastSeen != null)) ||
+              startsAt !== null ||
               Math.abs(command.position - position) > alignmentTolerance) {
             conflict = true;
           } else if (!player?.ready) {
-            players[role] = { id: playerId, ready: true, blocked: false, lastSeen: now };
+            players[role] = {
+              id: playerId,
+              recoveryId: ownsSeat ? player.recoveryId : command.recoveryId ?? playerId,
+              recoveryGeneration: ownsSeat ? player.recoveryGeneration : 0,
+              ready: true, blocked: false, waiting: null, lastSeen: now,
+            };
             if (wantsPlay && bothReady()) scheduleStart(now);
           }
         } else if (!ownsSeat) conflict = true;
-        else if (action === 'blocked') {
-          align(currentPosition(now), wantsPlay);
+        else if (action === 'unavailable') {
+          interrupt(player, command.reason, now, command.position);
+        } else if (action === 'blocked') {
+          interrupt(player, null, now);
           player.blocked = true;
         } else if (action === 'pause') {
+          lastHostSeek = undefined;
           if (wantsPlay) align(currentPosition(now), false);
+          hostCommandVersion = version;
         } else if (action === 'seek') {
           const target = Math.min(duration, Math.max(0, command.position));
           align(target, wantsPlay && target < duration);
+          hostCommandVersion = version;
+          lastHostSeek = command.seekId ? { id: command.seekId, playerId, previousVersion: command.version } : undefined;
         } else if (action === 'play') {
           if (!bothReady()) conflict = true;
-          else if (!wantsPlay) {
-            wantsPlay = true;
-            if (position === duration) align(0, true);
-            else {
-              scheduleStart(now);
-              changeTimeline();
+          else {
+            lastHostSeek = undefined;
+            if (!wantsPlay) {
+              wantsPlay = true;
+              if (position === duration) align(0, true);
+              else {
+                scheduleStart(now);
+                version++;
+              }
+              hostCommandVersion = version;
             }
           }
+        }
+      }
+      const currentPlayer = players[role];
+      if (!conflict && currentPlayer?.id === playerId) {
+        currentPlayer.lastSeen = now;
+        if (action === 'observe' && startsAt !== null && command.epoch === epoch &&
+            command.version === version && Number.isFinite(command.position)) {
+          currentPlayer.progress = { version, position: command.position };
         }
       }
       return {
@@ -90,9 +153,10 @@ export function createPlayback(duration) {
         state: {
           epoch, version, position, startsAt, wantsPlay, serverTime: now,
           ready: Object.fromEntries(roles.map(seat => [seat, Boolean(players[seat]?.ready)])),
+          waiting: Object.fromEntries(roles.map(seat => [seat, players[seat]?.waiting ?? null])),
           blocked: roles.filter(seat => players[seat]?.blocked),
-          ownsSeat: players[role]?.id === playerId,
-          otherPlayer: Boolean(players[role] && players[role].id !== playerId),
+          ownsSeat: currentPlayer?.id === playerId,
+          otherPlayer: currentPlayer?.lastSeen != null && currentPlayer.id !== playerId,
         },
       };
     },
