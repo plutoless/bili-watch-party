@@ -1682,6 +1682,11 @@ test('a proven stall takes priority when stale movement projects both playheads 
   assert.equal(stalled.synchronized, false);
   assert.equal(stalled.startsAt, null);
   assert.equal(stalled.waiting.host, 'buffering');
+  const retry = { ...realTarget, version: stalled.version, position: stalled.position };
+  update('host', 'ready', deadline + 1150, retry);
+  const scheduled = update('visitor', 'ready', deadline + 1200, retry);
+  assert.equal(scheduled.awaitingStart, true);
+  assert.equal(scheduled.startConfirmed, false);
 });
 
 function shortFirstStartFixture() {
@@ -1701,8 +1706,100 @@ function shortFirstStartFixture() {
   for (let now = 1500; now < startsAt; now += 1000) {
     for (const role of ['host', 'visitor']) update(role, 'observe', now, plan);
   }
-  return { update, target, startsAt };
+  return { update, target, startsAt, cancel: now => room.cancelFirstStart(ids.host, now), ids };
 }
+
+test('a discarded first plan keeps its confirmation gate until both players have advanced', async t => {
+  const cases = [
+    { name: 'before release', fault: 'buffering', elapsed: -50 },
+    { name: 'released without movement', fault: 'buffering' },
+    { name: 'only host advanced', fault: 'connection', moving: ['host'] },
+    { name: 'only visitor advanced', fault: 'buffering', moving: ['visitor'] },
+    { name: 'expired host and a new claim', fault: 'lease' },
+    { name: 'released host recovered', fault: 'recover' },
+    { name: 'released legacy host recovered', fault: 'recover', legacy: true },
+    { name: 'both players advanced', fault: 'buffering', moving: ['host', 'visitor'] },
+    { name: 'host paused explicitly', fault: 'pause' },
+    { name: 'host cancelled explicitly', fault: 'cancel' },
+    { name: 'both players finished', fault: 'ended' },
+  ];
+  for (const { name, fault, elapsed = 300, moving = [], legacy = false } of cases) await t.test(name, () => {
+    const { update, target, startsAt, cancel, ids } = shortFirstStartFixture();
+    const roles = ['host', 'visitor'];
+    let now = startsAt + elapsed;
+    const proof = { ...target, startAcknowledgment: startsAt, startConfirmation: startsAt };
+    if (elapsed >= 0) {
+      for (const role of roles) update(role, 'observe', startsAt, proof);
+      for (const ms of [100, 200]) for (const role of moving) {
+        update(role, 'observe', startsAt + ms, { ...target, position: ms / 1000, playing: true, ended: false });
+      }
+    }
+    const before = update('host', 'observe', now, { epoch: target.epoch, version: target.version });
+    assert.equal(before.awaitingStart, elapsed < 0);
+    assert.equal(before.startConfirmed, true);
+    assert.equal(before.firstStartPending, moving.length < 2);
+    assert.deepEqual(before.advancing, { host: moving.includes('host'), visitor: moving.includes('visitor') });
+
+    let stopped;
+    let replacement;
+    if (fault === 'lease') {
+      update('visitor', 'observe', now + 3900, target);
+      now += 4000;
+      stopped = update('visitor', 'observe', now, target);
+      assert.equal(stopped.hostSupportsAutomaticStart, undefined);
+      replacement = randomUUID();
+    } else if (fault === 'recover') {
+      replacement = randomUUID();
+      stopped = update('host', 'recover', now, { playerId: replacement, previousPlayerId: ids.host });
+      assert.equal(stopped.ownsSeat, true);
+    } else if (fault === 'pause') {
+      stopped = update('host', 'pause', now, target);
+    } else if (fault === 'cancel') {
+      assert.equal(cancel(now), true);
+      stopped = update('host', 'observe', now, target);
+    } else if (fault === 'ended') {
+      now = startsAt + 1000;
+      const terminal = { ...target, position: 1, ended: true, playing: false };
+      assert.equal(update('host', 'observe', now, terminal).ended, false);
+      stopped = update('visitor', 'observe', now, terminal);
+    } else {
+      stopped = update('host', 'unavailable', now, { ...target, reason: fault, position: moving.includes('host') ? 0.2 : 0 });
+      assert.equal(stopped.waiting.host, fault);
+    }
+    const complete = fault === 'ended';
+    const paused = complete || fault === 'pause' || fault === 'cancel';
+    assert.equal(stopped.startsAt, null);
+    assert.equal(stopped.wantsPlay, !paused);
+    assert.equal(stopped.ended, complete);
+    assert.equal(stopped.position, complete ? 1 : moving.length === 2 ? 0.2 : 0);
+    const retry = { ...target, version: stopped.version, position: stopped.position };
+    update('host', 'ready', now + 20, { ...retry, ...(replacement && { playerId: replacement }),
+      ...(legacy && { nativeEnd: undefined }) });
+    const scheduled = update('visitor', 'ready', now + 40, retry);
+    assert.deepEqual(scheduled.ready, { host: true, visitor: true });
+    if (paused) {
+      assert.equal(scheduled.startsAt, null);
+      assert.equal(scheduled.wantsPlay, false);
+      assert.equal(scheduled.ended, complete);
+    } else {
+      assert.ok(scheduled.startsAt > now);
+    }
+    const needsConfirmation = !paused && !legacy && moving.length < 2;
+    assert.equal(scheduled.awaitingStart, needsConfirmation);
+    assert.equal(scheduled.startConfirmed, !needsConfirmation);
+    assert.equal(scheduled.startAcknowledged, false);
+    for (const role of roles) {
+      const stale = update(role, 'observe', now + 50, proof);
+      if (role === 'host' && replacement) assert.equal(stale.ownsSeat, false);
+      assert.equal(stale.startsAt, scheduled.startsAt);
+      assert.equal(stale.awaitingStart, needsConfirmation);
+      assert.equal(stale.startConfirmed, !needsConfirmation);
+      assert.equal(stale.startAcknowledged, false);
+      assert.equal(stale.ended, complete);
+      assert.equal(stale.wantsPlay, !paused);
+    }
+  });
+});
 
 test('a short clip cannot end while one player still shows its first frame', () => {
   const { update, target, startsAt } = shortFirstStartFixture();

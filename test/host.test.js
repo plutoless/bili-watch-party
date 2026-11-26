@@ -991,3 +991,61 @@ test('approval during import starts once and cancellation takes precedence over 
   assert.equal(aligned.wantsPlay, false);
   assert.equal(aligned.startsAt, null);
 });
+
+test('buffering after first release requires new confirmation over playback HTTP', async t => {
+  let now = 1000;
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 1;
+  }, { now: () => now });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  await app.status(host, room.id, 'ready');
+  const path = '/api/rooms/' + room.id + '/';
+  const post = (route, body, cookie = host) => app.request(path + route, { method: 'POST', body, cookie });
+  const joined = await post('join', { token: room.invitation.token }, '');
+  const { requestId } = await joined.json();
+  const visitor = joined.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('approve', { requestId, startPlayback: true })).status, 200);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  const send = async (role, action, fields = {}) => {
+    const response = await post('playback', { role, playerId: ids[role], action, ...fields }, role === 'host' ? host : visitor);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const { epoch, version } = await send('host', 'observe');
+  const target = { epoch, version, position: 0, claim: true, nativeEnd: true };
+  await send('host', 'ready', target);
+  const armed = await send('visitor', 'ready', target);
+  const proof = { ...target, startAcknowledgment: armed.startsAt, startConfirmation: armed.startsAt };
+  await send('host', 'observe', proof);
+  await send('visitor', 'observe', proof);
+  assert.equal((await send('host', 'observe', proof)).startConfirmed, true);
+  for (now += 1000; now < armed.startsAt; now += 1000) {
+    for (const role of ['host', 'visitor']) await send(role, 'observe', proof);
+  }
+  now = armed.startsAt;
+  const released = await send('host', 'observe', proof);
+  assert.equal(released.awaitingStart, false);
+  assert.equal(released.firstStartPending, true);
+  assert.deepEqual(released.advancing, { host: false, visitor: false });
+  now += 100;
+  const held = await send('host', 'unavailable', { ...target, reason: 'buffering' });
+  assert.equal(held.startsAt, null);
+  assert.equal(held.position, 0);
+  const retry = { ...target, version: held.version };
+  await send('host', 'ready', { ...retry, nativeEnd: undefined });
+  const scheduled = await send('visitor', 'ready', retry);
+  assert.deepEqual(scheduled.ready, { host: true, visitor: true });
+  assert.equal(scheduled.awaitingStart, true);
+  assert.equal(scheduled.startConfirmed, false);
+  for (const role of ['host', 'visitor']) {
+    const stale = await send(role, 'observe', proof);
+    assert.equal(stale.startAcknowledged, false);
+    assert.equal(stale.startConfirmed, false);
+  }
+  const current = { ...retry, startAcknowledgment: scheduled.startsAt, startConfirmation: scheduled.startsAt };
+  assert.equal((await send('host', 'observe', current)).startConfirmed, false);
+  assert.equal((await send('visitor', 'observe', current)).startConfirmed, false);
+  assert.equal((await send('host', 'observe', current)).startConfirmed, true);
+});

@@ -32,6 +32,8 @@ export function createPlayback(duration = Infinity) {
   }
 
   function align(target, resume) {
+    // A replacement plan needs fresh confirmation until both players have advanced together.
+    if (resume && firstStart === 'starting') firstStart = 'armed';
     position = target;
     if (target < duration) ended = false;
     wantsPlay = resume;
@@ -207,7 +209,6 @@ export function createPlayback(duration = Infinity) {
           if (!canRecover) conflict = true;
           else {
             interrupt(player, 'connection', now);
-            if (firstStart === 'starting') firstStart = 'armed';
             if (role === 'host' && lastHostSeek?.playerId === player.id) lastHostSeek.playerId = playerId;
             player.id = playerId;
             player.recoveryId = command.recoveryId ?? playerId;
@@ -320,7 +321,6 @@ export function createPlayback(duration = Infinity) {
       if (previewComplete || previewStalled || startStalled) {
         const stalled = previewComplete ? [] : stopped.length ? stopped : roles.filter(seat => !nativeAdvancing[seat]);
         if (previewComplete) firstStart = 'armed';
-        if (startStalled) firstStart = 'preview';
         align(position, true);
         for (const seat of roles) {
           if (stalled.includes(seat)) players[seat].waiting = 'buffering';
