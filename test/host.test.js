@@ -711,10 +711,11 @@ test('only the host directs playback and both players must acknowledge the curre
   const refreshedVersion = { epoch: afterRefresh.epoch, version: afterRefresh.version };
   const current = await send('host', 'observe').then(r => r.json());
   const interrupted = await send('visitor', 'unavailable', {
-    ...refreshedVersion, reason: 'buffering', position: 0,
+    ...refreshedVersion, reason: 'audio', position: 0,
   }).then(r => r.json());
   assert.equal(interrupted.startsAt, null);
-  assert.equal(interrupted.waiting.visitor, 'buffering');
+  assert.equal(interrupted.waiting.visitor, 'audio');
+  assert.deepEqual(interrupted.blocked, []);
   assert.ok(interrupted.position >= current.position,
     'An outlying visitor report must not rewind to the start of the room');
   assert.ok(Math.abs(interrupted.position - (current.position + 4)) < 0.00001,
@@ -743,7 +744,15 @@ test('only the host directs playback and both players must acknowledge the curre
   await send('host', 'ready', nearEndTarget);
   const finishing = await send('visitor', 'ready', nearEndTarget).then(r => r.json());
   now = finishing.startsAt + 1_100;
-  const ended = await send('visitor', 'observe').then(r => r.json());
+  const terminalFrame = { ...nearEndTarget, position: 120, ended: true };
+  const projectedEnd = await send('visitor', 'observe', { ...terminalFrame, ended: false }).then(r => r.json());
+  assert.equal(projectedEnd.ended, false);
+  assert.equal(projectedEnd.startsAt, finishing.startsAt);
+  const hostFinished = await send('host', 'observe', terminalFrame).then(r => r.json());
+  assert.equal(hostFinished.ended, false);
+  const obsolete = await send('visitor', 'observe', { ...terminalFrame, version: finishing.version - 1 }).then(r => r.json());
+  assert.equal(obsolete.ended, false);
+  const ended = await send('visitor', 'observe', terminalFrame).then(r => r.json());
   assert.equal(ended.ended, true);
   assert.equal(ended.position, 120);
   assert.equal(ended.wantsPlay, false);
@@ -767,6 +776,79 @@ test('only the host directs playback and both players must acknowledge the curre
   }).then(r => r.json());
   assert.equal(seekBack.position, 119);
   assert.equal(seekBack.wantsPlay, false);
+});
+
+test('backend-first release accepts published and upgraded Observe requests at the end', async t => {
+  let now = 1_000_000;
+  const webOrigin = 'https://web.fixture.test';
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 3;
+  }, { now: () => now, webOrigin, publicOrigin: 'https://api.fixture.test' });
+  const postFromWeb = (path, body, cookie) =>
+    app.request(path, { method: 'POST', body, cookie, headers: { Origin: webOrigin } });
+  const loggedIn = await postFromWeb('/api/session', { password: fixturePassword });
+  assert.equal(loggedIn.status, 204);
+  const host = loggedIn.headers.get('set-cookie').split(';')[0];
+  const pairs = [[], ['host'], ['visitor'], ['host', 'visitor']];
+  for (const [index, upgraded] of pairs.entries()) {
+    await t.test(upgraded.join(' + ') || 'published pages', async () => {
+      const room = await postFromWeb('/api/rooms', { url: source + '?p=' + (index + 1) }, host)
+        .then(response => response.json());
+      await app.status(host, room.id, 'ready');
+      const path = '/api/rooms/' + room.id + '/';
+      const post = (route, body, cookie = host) => postFromWeb(path + route, body, cookie);
+      const { invitation } = await post('invitation', { action: 'generate' }).then(response => response.json());
+      const joined = await post('join', { token: invitation.token }, '');
+      assert.equal(joined.status, 200);
+      const { requestId } = await joined.json();
+      const visitor = joined.headers.get('set-cookie').split(';')[0];
+      const autoStart = upgraded.length === 1 && upgraded.includes('host');
+      assert.equal((await post('approve', { requestId, ...(autoStart && { startPlayback: true }) })).status, 200);
+      const ids = { host: randomUUID(), visitor: randomUUID() };
+      const send = async (role, action, fields) => {
+        const response = await post('playback', { role, playerId: ids[role], action, ...fields },
+          role === 'host' ? host : visitor);
+        assert.equal(response.status, 200);
+        return response.json();
+      };
+      const { epoch, version } = await send('host', 'observe');
+      let aligned;
+      for (const role of ['host', 'visitor']) {
+        aligned = await send(role, 'ready', { epoch, version, claim: true, position: 0,
+          ...(upgraded.includes(role) ? { nativeEnd: true } : {}) });
+      }
+      const plan = autoStart ? aligned : await send('host', 'play', { epoch, version });
+      assert.ok(plan.startsAt > now);
+      assert.equal(plan.firstStartPending, false);
+      const target = { epoch, version: plan.version };
+      now = plan.startsAt + 1500;
+      for (const role of ['host', 'visitor']) {
+        await send(role, 'observe', { ...target, position: 1.5,
+          ...(upgraded.includes(role) ? { ended: false, playing: true, sampledAt: 1500, observedAt: now } : {}) });
+      }
+      now = plan.startsAt + 3100;
+      // The published page sends only role, playerId, action, epoch, version and position.
+      for (const role of ['host', 'visitor']) {
+        if (!upgraded.length && role === 'visitor') break;
+        assert.equal((await send(role, 'observe', { ...target, position: 3 })).ended, false);
+      }
+      let result;
+      if (!upgraded.length) result = await send('visitor', 'observe', { ...target, position: 3 });
+      else for (const role of upgraded) {
+        for (const bad of [{ position: 3000, playing: false }, { position: 3, playing: true }]) {
+          assert.equal((await send(role, 'observe', { ...target, ended: true, ...bad })).ended, false);
+          assert.equal((await send(role, 'observe', { ...target, position: 3 })).ended, false);
+        }
+        result = await send(role, 'observe', { ...target, position: 2.99, ended: true, playing: false,
+          sampledAt: 3100, observedAt: now });
+        if (!result.ended) await send(role, 'observe', { ...target, position: 3 });
+      }
+      assert.equal(result.ended, true);
+      assert.equal(result.position, 3);
+      assert.equal(result.wantsPlay, false);
+    });
+  }
 });
 
 test('a host pause can follow its committed seek without admitting obsolete or unrelated commands', async t => {
@@ -871,4 +953,99 @@ test('only a later generation in the authorized recovery lineage can take the se
   assert.equal((await post(recover)).status, 409);
   const reply = await post({ action: 'observe', playerId: third });
   assert.equal((await reply.json()).ownsSeat, true);
+});
+
+test('approval during import starts once and cancellation takes precedence over ready and replayed approval', async t => {
+  const imported = Promise.withResolvers();
+  t.after(imported.resolve);
+  const app = await setup(t, async ({ output, signal }) => {
+    await Promise.race([imported.promise, new Promise(resolve => signal.addEventListener('abort', resolve, { once: true }))]);
+    await writeFile(output, 'synthetic media');
+    return 120;
+  });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  const path = '/api/rooms/' + room.id + '/';
+  const post = (route, body, cookie = host) => app.request(path + route, { method: 'POST', body, cookie });
+  const joined = await post('join', { token: room.invitation.token }, '');
+  const { requestId } = await joined.json();
+  const visitor = joined.headers.get('set-cookie').split(';')[0];
+  const hostPlayer = randomUUID();
+  const visitorPlayer = randomUUID();
+  assert.equal((await post('approve', { requestId: randomUUID() })).status, 409);
+  assert.equal((await app.request(path.slice(0, -1), { cookie: host }).then(r => r.json())).firstStartPending, false);
+  const approval = { requestId, startPlayback: true };
+  const approved = await post('approve', approval).then(r => r.json());
+  assert.equal(approved.firstStartPending, true);
+  assert.notEqual(approved.status, 'ready');
+  assert.equal((await post('cancel-start', { playerId: hostPlayer }, visitor)).status, 401);
+  assert.equal((await post('cancel-start', { playerId: hostPlayer }).then(r => r.json())).firstStartPending, false);
+  imported.resolve();
+  await app.status(host, room.id, 'ready');
+  assert.equal((await post('approve', approval).then(r => r.json())).firstStartPending, false);
+  const initial = await post('playback', { playerId: hostPlayer, role: 'host', action: 'observe' }).then(r => r.json());
+  const ready = { action: 'ready', epoch: initial.epoch, version: initial.version, position: 0, claim: true };
+  await post('playback', { ...ready, playerId: hostPlayer, role: 'host' });
+  const aligned = await post('playback', { ...ready, playerId: visitorPlayer, role: 'visitor' }, visitor).then(r => r.json());
+  assert.deepEqual(aligned.ready, { host: true, visitor: true });
+  assert.equal(aligned.wantsPlay, false);
+  assert.equal(aligned.startsAt, null);
+});
+
+test('buffering after first release requires new confirmation over playback HTTP', async t => {
+  let now = 1000;
+  const app = await setup(t, async ({ output }) => {
+    await writeFile(output, 'synthetic media');
+    return 1;
+  }, { now: () => now });
+  const host = await app.login();
+  const [, room] = await app.submit(host);
+  await app.status(host, room.id, 'ready');
+  const path = '/api/rooms/' + room.id + '/';
+  const post = (route, body, cookie = host) => app.request(path + route, { method: 'POST', body, cookie });
+  const joined = await post('join', { token: room.invitation.token }, '');
+  const { requestId } = await joined.json();
+  const visitor = joined.headers.get('set-cookie').split(';')[0];
+  assert.equal((await post('approve', { requestId, startPlayback: true })).status, 200);
+  const ids = { host: randomUUID(), visitor: randomUUID() };
+  const send = async (role, action, fields = {}) => {
+    const response = await post('playback', { role, playerId: ids[role], action, ...fields }, role === 'host' ? host : visitor);
+    assert.equal(response.status, 200);
+    return response.json();
+  };
+  const { epoch, version } = await send('host', 'observe');
+  const target = { epoch, version, position: 0, claim: true, nativeEnd: true };
+  await send('host', 'ready', target);
+  const armed = await send('visitor', 'ready', target);
+  const proof = { ...target, startAcknowledgment: armed.startsAt, startConfirmation: armed.startsAt };
+  await send('host', 'observe', proof);
+  await send('visitor', 'observe', proof);
+  assert.equal((await send('host', 'observe', proof)).startConfirmed, true);
+  for (now += 1000; now < armed.startsAt; now += 1000) {
+    for (const role of ['host', 'visitor']) await send(role, 'observe', proof);
+  }
+  now = armed.startsAt;
+  const released = await send('host', 'observe', proof);
+  assert.equal(released.awaitingStart, false);
+  assert.equal(released.firstStartPending, true);
+  assert.deepEqual(released.advancing, { host: false, visitor: false });
+  now += 100;
+  const held = await send('host', 'unavailable', { ...target, reason: 'buffering' });
+  assert.equal(held.startsAt, null);
+  assert.equal(held.position, 0);
+  const retry = { ...target, version: held.version };
+  await send('host', 'ready', { ...retry, nativeEnd: undefined });
+  const scheduled = await send('visitor', 'ready', retry);
+  assert.deepEqual(scheduled.ready, { host: true, visitor: true });
+  assert.equal(scheduled.awaitingStart, true);
+  assert.equal(scheduled.startConfirmed, false);
+  for (const role of ['host', 'visitor']) {
+    const stale = await send(role, 'observe', proof);
+    assert.equal(stale.startAcknowledged, false);
+    assert.equal(stale.startConfirmed, false);
+  }
+  const current = { ...retry, startAcknowledgment: scheduled.startsAt, startConfirmation: scheduled.startsAt };
+  assert.equal((await send('host', 'observe', current)).startConfirmed, false);
+  assert.equal((await send('visitor', 'observe', current)).startConfirmed, false);
+  assert.equal((await send('host', 'observe', current)).startConfirmed, true);
 });

@@ -2,10 +2,14 @@ const pollMs = 200;
 const driftCheckMs = 100;
 const startSnapshotLeadMs = 2 * pollMs;
 const stallConfirmMs = 200;
+const playbackProbeMs = 1000;
 const alignmentTolerance = 0.05;
 const initialDriftSeekLeadMs = 200;
 const maxStartLeadMs = 650;
 const legacyRecoveryBatchSize = 32;
+const seatNames = { host: '房主', visitor: '访客' };
+const seats = Object.keys(seatNames);
+const describeSeats = roles => roles.map(role => seatNames[role]).join('和');
 
 function formatTime(seconds) {
   const whole = Math.floor(seconds || 0);
@@ -73,7 +77,7 @@ export function createPageFullscreen() {
   return { exit };
 }
 
-export function createPlayer({ apiOrigin, roomPath, role }) {
+export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   const byId = id => document.getElementById(id);
   const video = byId('video');
   const prepare = byId('prepare');
@@ -118,14 +122,14 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let stallTimer;
   let mediaRecoveryRetry;
   let visitorBufferingTimeline;
-  let hasStartedScheduledPlayback = false;
+  let startedPlan;
   let inFlight;
-  let priming = false;
+  let priming;
   let primed = false;
   let claim = false;
   let gestureFailed = false;
   let reportBlocked;
-  let reportBuffering;
+  let unavailableReport;
   let outage;
   let reloadAfterReconnect = false;
   let mediaReloaded = false;
@@ -143,7 +147,14 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let currentTimeline;
   let initialRewindRetry;
   let initialReloadClosed = false;
-  let prepareIntent = 0;
+  let admitted = false;
+  let audio;
+  let audioFailed = false;
+  let audioRetryRequired = false;
+  let audioLoss;
+  let approvalAudioRetry;
+  let authorizationRetryAt = 0;
+  let firstStartCancellation;
   let seekPreview = false;
 
   function setText(id, message) {
@@ -181,44 +192,83 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     byId('buffered').value = Math.min(100, Math.round(seconds / video.duration * 100));
   }
 
+  function awaitingLocalAudio() {
+    return Boolean(priming?.waitingForAudio || priming?.waitingForPlay);
+  }
+
   function render() {
     const ownsControls = host && state?.ownsSeat;
     const canControl = ownsControls && !networkError;
     const bothReady = state?.ready.host && state.ready.visitor;
     const waiting = Object.values(state?.waiting ?? {});
-    const canToggle = ownsControls && (state.wantsPlay || (canControl && bothReady && primed));
-    prepare.hidden = primed || Boolean(state?.otherPlayer);
-    prepare.disabled = priming || !state || networkError || video.readyState < video.HAVE_CURRENT_DATA;
-    prepare.textContent = gestureFailed ? '再次点按以准备' : '准备好了';
+    const canPlay = admitted && state && !state.otherPlayer && !networkError;
+    const canToggle = state?.wantsPlay ? ownsControls : canPlay || (canControl && bothReady && primed);
+    const waitingForAudio = awaitingLocalAudio();
+    const retryAudio = audioFailed || waitingForAudio;
+    const retryPlayback = state?.ownsSeat && state.waiting[role] === 'stalled' && !primed;
+    const prepareForManualStart = !host && state?.hostSupportsAutomaticStart !== true && state?.wantsPlay === false &&
+      !state.ended && !state.ready[role] && !primed;
+    const reloadAudio = (retryAudio || retryPlayback) && audio?.context.state === 'closed';
+    prepare.hidden = !admitted || (!state?.wantsPlay && !prepareForManualStart) ||
+      (!gestureFailed && !retryAudio && !retryPlayback && !prepareForManualStart) ||
+      Boolean(state?.otherPlayer || firstStartCancellation || queuedCommand?.action === 'pause');
+    prepare.disabled = Boolean((priming && !waitingForAudio) || unavailableReport || outage) ||
+      networkError || video.readyState < video.HAVE_METADATA;
+    setText('prepare', reloadAudio ? '刷新页面' : gestureFailed ? '允许播放'
+      : retryPlayback ? '重试播放' : retryAudio ? '重试音频' : prepareForManualStart ? '准备好了' : '允许播放');
     play.hidden = !host;
-    setText('play', state?.wantsPlay ? '暂停' : state?.ended ? '重播' : '播放');
+    setText('play', state?.firstStartPending ? '取消开播' : state?.wantsPlay ? '暂停' : state?.ended ? '重播' : '播放');
     byId('end-after-playback').hidden = !host || !state?.ended;
     byId('end-room').hidden = Boolean(state?.ended);
     const canPauseSeek = state?.wantsPlay && queuedCommand?.action === 'seek';
-    play.disabled = !canToggle || Boolean(queuedCommand && !canPauseSeek);
+    const canCancel = state?.firstStartPending && !state.otherPlayer;
+    play.disabled = (!canToggle && !canCancel) || Boolean(firstStartCancellation || (queuedCommand && !canPauseSeek));
     byId('seek-controls').hidden = !host || Boolean(state?.ended);
     seek.disabled = !canControl || !hasDuration() || Boolean(queuedCommand);
 
-    for (const [seat, name] of [['host', '房主'], ['visitor', '访客']]) {
-      setText(seat + '-ready', name + ' · ' + (state?.ready[seat] ? '已就绪' : '未就绪'));
+    for (const seat of seats) {
+      setText(seat + '-ready', seatNames[seat] + ' · ' + (state?.ready[seat] ? '已就绪' : '未就绪'));
     }
     let status = '正在连接播放状态…';
-    if (networkError) status = '连接中断，等待播放状态。';
-    else if (gestureFailed || state?.blocked.length) status = '等待点按以允许播放。';
+    const blocked = state?.wantsPlay ? seats.filter(seat => state.blocked.includes(seat) || (seat === role && gestureFailed)) : [];
+    const unready = seats.filter(seat => !state?.ready[seat]);
+    const stopped = seats.filter(seat => !state?.advancing?.[seat]);
+    if (firstStartCancellation) status = '正在取消开播…';
+    else if (networkError) status = '连接中断，等待播放状态。';
+    else if (admitted && state?.wantsPlay === false && !state.ended) status = '已暂停，等待房主播放。';
+    else if (blocked.length) status = '等待' + describeSeats(blocked) + '允许播放。';
     else if (outage?.reason === 'connection' || waiting.includes('connection')) {
       status = '等待重新连接并对齐进度。';
     } else if (document.hidden || waiting.includes('background')) {
       status = '等待双方回到观影页面。';
-    } else if (reportBuffering || waiting.includes('buffering')) {
-      status = '缓冲中，等待双方在同一位置就绪。';
-    } else if (state?.startsAt != null) status = video.paused ? '即将同时播放…' : '正在同步播放';
-    else if (state?.wantsPlay) status = '正在对齐进度，等待双方就绪。';
+    } else if (waiting.includes('audio') || unavailableReport?.reason === 'audio') {
+      const interrupted = seats.filter(seat => state?.waiting[seat] === 'audio' ||
+        (seat === role && unavailableReport?.reason === 'audio'));
+      status = '等待' + describeSeats(interrupted) + '恢复音频输出。';
+    } else if (waiting.includes('stalled')) {
+      status = '等待' + describeSeats(seats.filter(seat => state.waiting[seat] === 'stalled')) + '重试播放。';
+    } else if (unavailableReport?.reason === 'buffering' || waiting.includes('buffering')) {
+      const buffering = seats.filter(seat => state?.waiting[seat] === 'buffering' ||
+        (seat === role && unavailableReport?.reason === 'buffering'));
+      status = '等待' + describeSeats(buffering) + '缓冲并对齐进度。';
+    } else if (state?.wantsPlay && waitingForAudio) {
+      status = priming.waitingForAudio ? '正在等待本机音频输出就绪。' : '正在等待本机播放器就绪。';
+    } else if (state?.startsAt != null) {
+      status = mediaPlaying() && state.synchronized ? '正在同步播放'
+        : state.awaitingStart ? '已对齐，等待同时开播。'
+        : stopped.length ? '等待' + describeSeats(stopped) + '的播放进度推进。'
+        : mediaPlaying() && !state.firstStartPending && state.playbackGap === null ? '双方播放进度在推进。'
+        : '等待双方对齐播放进度。';
+    } else if (state?.wantsPlay) status = '等待' + describeSeats(unready) + '缓冲并对齐进度。';
     else if (state?.ended) status = host ? '播放结束。请选择重播或结束房间。' : '播放结束，等待房主决定。';
     else if (bothReady) status = '已暂停，等待房主播放。';
-    else if (state) status = '等待双方就绪。';
+    else if (host && !admitted) status = '等待访客加入后开播。';
+    else if (state) status = '已暂停，等待' + describeSeats(unready) + '就绪。';
     setText('playback-status', status);
     setText('playback-message', video.error ? '无法读取视频，请刷新页面后重试。'
-      : gestureFailed ? '浏览器阻止了起播。请再次点按准备按钮，房间会等待你。'
+      : !prepare.hidden && gestureFailed ? '浏览器阻止了有声播放，请点「允许播放」。'
+      : !prepare.hidden && reloadAudio ? '本机音频输出已关闭，请刷新页面。'
+      : !prepare.hidden && audioFailed ? '无法准备本机播放，请点「重试音频」。'
       : state?.otherPlayer ? '这个席位已由另一个页面使用。'
       : commandMessage);
     renderTime();
@@ -229,6 +279,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   }
 
   function pauseVideo() {
+    if (audio) audio.gain.gain.value = 0;
     video.pause();
     setRate(1);
   }
@@ -236,7 +287,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   function pauseAndAlign(target) {
     pauseVideo();
     if (video.readyState >= video.HAVE_METADATA && !video.seeking &&
-        Math.abs(video.currentTime - target) > alignmentTolerance) {
+        ((video.ended && target < video.duration) || Math.abs(video.currentTime - target) > alignmentTolerance)) {
       if (target === 0 && canRetryInitialRewind()) initialRewindRetry = 'rewinding';
       video.currentTime = target;
     }
@@ -250,16 +301,50 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     pauseVideo();
   }
 
-  async function measurePlaybackStart(generation, startPosition, started) {
+  function prepareAudioGraph() {
+    let context;
+    try {
+      if (!audio) {
+        context = new AudioContext();
+        const gain = context.createGain();
+        gain.gain.value = 0;
+        // Finish the output before associating the element, which cannot be associated twice.
+        gain.connect(context.destination);
+        const source = context.createMediaElementSource(video);
+        audio = { context, gain, source, connected: false };
+      }
+      if (!audio.connected) {
+        audio.source.connect(audio.gain);
+        audio.connected = true;
+        audio.context.addEventListener?.('statechange', () => {
+          watchAudioOutput();
+          wake();
+        });
+      }
+      audioFailed = false;
+    } catch {
+      audioFailed = true;
+      if (!audio && context) context.close().catch(() => {});
+    }
+  }
+
+  async function resumeAudio() {
+    const context = audio?.context;
+    if (!context || context.state === 'running') return;
+    await context.resume();
+    if (context.state !== 'running') throw new Error('Audio output interrupted');
+  }
+
+  async function measurePlaybackStart(attempt, startPosition, started) {
     // Some players resolve play() before their media clock starts moving.
-    while (generation === loadGeneration && !video.paused) {
+    while (priming === attempt && !video.paused) {
       const elapsed = performance.now() - started;
       const advanced = video.currentTime - startPosition;
       if (advanced >= 0.08) return Math.max(0, Math.min(maxStartLeadMs, elapsed - advanced * 1000));
-      if (elapsed >= 1000) break;
+      if (elapsed >= playbackProbeMs) break;
       await new Promise(resolve => setTimeout(resolve, 25));
     }
-    return playbackStartLeadMs;
+    return video.ended && video.currentTime > startPosition ? playbackStartLeadMs : null;
   }
 
   function hasPlaybackData() {
@@ -267,11 +352,16 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       (video.readyState >= video.HAVE_CURRENT_DATA && state.position >= video.duration - alignmentTolerance);
   }
 
+  function mediaPlaying() {
+    return !priming && !video.paused && !video.ended && !video.seeking && hasPlaybackData() &&
+      audioReady();
+  }
+
   function canRetryInitialRewind() {
-    return !host && !initialReloadClosed && video.hasAttribute('src') && state &&
+    return !initialReloadClosed && video.hasAttribute('src') && state &&
       primed && claim && !priming && !needsRecovery && !networkError && !outage && !document.hidden &&
-      !state.ownsSeat && !state.otherPlayer && !state.ready.visitor &&
-      !state.wantsPlay && state.startsAt === null && state.position === 0;
+      !state.otherPlayer && !state.ready[role] && (!state.wantsPlay || state.firstStartPending) &&
+      state.startsAt === null && state.position === 0;
   }
 
   function closeInitialReload() {
@@ -317,13 +407,96 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     }
   }
 
-  function checkBuffering() {
-    if (reportBuffering || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData()) return;
+  function reportUnavailable(reason) {
     const { epoch, version } = state;
-    reportBuffering = { action: 'unavailable', reason: 'buffering', epoch, version, position: mediaPosition() };
-    pendingStart = undefined;
+    unavailableReport = { action: 'unavailable', reason, epoch, version, position: mediaPosition() };
+    clearPendingStart();
+    clearAudioLoss();
     pauseVideo();
     wake();
+  }
+
+  function checkBuffering() {
+    if (unavailableReport || state?.startsAt == null || !state.ownsSeat || priming || hasPlaybackData() ||
+        finishedPlan()) return;
+    reportUnavailable('buffering');
+  }
+
+  function audioReady() {
+    return !audio || (audio.connected && audio.context.state === 'running');
+  }
+
+  function activePlan() {
+    return state?.startsAt != null && state.wantsPlay && state.ownsSeat && state.ready[role] &&
+      primed && !priming && !queuedCommand && !firstStartCancellation && !reportBlocked && !unavailableReport &&
+      !outage && !networkError && !document.hidden;
+  }
+
+  function planIdentity() {
+    return { epoch: state.epoch, version: state.version, startsAt: state.startsAt, source: video.getAttribute('src') };
+  }
+
+  function samePlan(attempt) {
+    return activePlan() && state.epoch === attempt.epoch && state.version === attempt.version &&
+      state.startsAt === attempt.startsAt && video.getAttribute('src') === attempt.source;
+  }
+
+  function finishedPlan() {
+    return video.ended && Boolean(startedPlan && samePlan(startedPlan));
+  }
+
+  function holdForAudio() {
+    audioFailed = true;
+    primed = claim = false;
+    reportUnavailable('audio');
+  }
+
+  function clearAudioLoss() {
+    clearTimeout(audioLoss?.timer);
+    audioLoss = undefined;
+  }
+
+  function watchAudioOutput() {
+    const unavailable = !audioReady();
+    if (!unavailable) {
+      const interrupted = audioLoss;
+      clearAudioLoss();
+      if (interrupted?.wasAudible && samePlan(interrupted) && state.startConfirmed !== false &&
+          !video.seeking && !video.ended && performance.now() - interrupted.observedAt < stallConfirmMs) updateAudioGain();
+      return;
+    }
+    const wasAudible = audio.gain.gain.value > 0;
+    audio.gain.gain.value = 0;
+    if (!activePlan() || video.ended) {
+      clearAudioLoss();
+      return;
+    }
+    if (audioLoss && samePlan(audioLoss)) return;
+    clearAudioLoss();
+    const attempt = { ...planIdentity(), wasAudible, observedAt: performance.now() };
+    audioLoss = attempt;
+    // Observe the device even while a playback response is in flight.
+    attempt.timer = setTimeout(() => {
+      if (audioLoss !== attempt) return;
+      audioLoss = undefined;
+      if (samePlan(attempt) && !video.ended && !audioReady()) holdForAudio();
+    }, stallConfirmMs);
+  }
+
+  function clearPendingStart() {
+    clearTimeout(pendingStart?.timer);
+    pendingStart = undefined;
+  }
+
+  function completeScheduledStart(attempt) {
+    if (!attempt?.played || !samePlan(attempt) || video.seeking) return false;
+    const advanced = video.currentTime - attempt.position;
+    const complete = video.ended ? advanced > 0 && video.currentTime >= video.duration - alignmentTolerance
+      : !video.paused && advanced > 0.03;
+    if (!complete) return false;
+    startedPlan = attempt;
+    clearPendingStart();
+    return true;
   }
 
   function confirmStall(retry) {
@@ -352,24 +525,32 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       checkBuffering();
       return;
     }
-    if (pendingStart || video.seeking) return;
+    if (pendingStart || video.seeking || video.ended || !activePlan()) return;
     // Readiness already aligned the media. Chasing a moving target before starting can seek forever on slow media.
-    const { epoch, version } = state;
-    const attempt = { action: 'blocked', epoch, version };
+    const attempt = { ...planIdentity(), position: video.currentTime, played: false };
     pendingStart = attempt;
     mediaReloaded = false;
+    attempt.timer = setTimeout(() => {
+      if (pendingStart !== attempt || !samePlan(attempt)) return;
+      if (completeScheduledStart(attempt)) return;
+      audioRetryRequired = true;
+      holdForAudio();
+    }, playbackProbeMs);
     video.play().then(() => {
-      if (pendingStart === attempt) hasStartedScheduledPlayback = true;
+      if (pendingStart !== attempt || !samePlan(attempt)) return;
+      attempt.played = true;
+      completeScheduledStart(attempt);
     }).catch(error => {
-      if (pendingStart === attempt && error.name !== 'AbortError') {
-        reportBlocked = attempt;
+      if (pendingStart !== attempt || !samePlan(attempt)) return;
+      clearPendingStart();
+      if (error.name === 'AbortError') return;
+      if (error.name === 'NotAllowedError') {
         pauseVideo();
+        reportBlocked = { action: 'blocked', epoch: attempt.epoch, version: attempt.version };
         wake();
-      }
-    }).finally(() => {
-      if (pendingStart === attempt) {
-        pendingStart = undefined;
-        render();
+      } else {
+        authorizationRetryAt = performance.now() + playbackProbeMs;
+        holdForAudio();
       }
     });
   }
@@ -379,15 +560,17 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   }
 
   function correctDrift() {
+    if (pendingStart && !completeScheduledStart(pendingStart)) return;
     if (state?.startsAt == null || !state.ownsSeat || !primed || priming ||
-        networkError || outage || reportBlocked || reportBuffering || document.hidden ||
+        networkError || outage || reportBlocked || unavailableReport || document.hidden ||
         video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
     const now = performance.now() + offset;
     const target = positionAt(now);
     if (now < state.startsAt || !Number.isFinite(target) || target >= video.duration) return;
     const drift = target - video.currentTime;
     const distance = Math.abs(drift);
-    hardDriftSamples = distance > 0.9 ? hardDriftSamples + 1 : 0;
+    const hardDriftLimit = state.firstStartPending ? 0.55 : 0.9;
+    hardDriftSamples = distance > hardDriftLimit ? hardDriftSamples + 1 : 0;
     // Changing playback rate can briefly stop frame presentation even with data buffered.
     // Leave short phase differences alone and require a sustained, same-direction error.
     // A midpoint clock estimate can err by half its RTT on an asymmetric path.
@@ -397,15 +580,20 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     const direction = Math.sign(drift);
     rateDriftSamples = distance <= correctionStart ? 0
       : (Math.sign(rateDriftSamples) === direction ? rateDriftSamples : 0) + direction;
+    // Avoid retiming the host for small clock errors while its peer is advancing in step.
+    const needsRateCorrection = !(audio && host && state.playbackGap !== null && state.playbackGap < 0.3);
     if ((distance > 1.25 || hardDriftSamples >= 2) && now >= nextHardSeek) {
       // Allow for the time spent decoding the destination while the room keeps playing.
+      const catchUp = positionAt(now + driftSeekLeadMs);
+      // Let native playback reach the last frame instead of seeking to the duration.
+      if (catchUp >= video.duration) return;
       driftSeekStarted = performance.now();
-      video.currentTime = positionAt(now + driftSeekLeadMs);
+      video.currentTime = catchUp;
       setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
       rateDriftSamples = 0;
-    } else if (video.playbackRate === 1 && Math.abs(rateDriftSamples) >= 4) {
+    } else if (video.playbackRate === 1 && Math.abs(rateDriftSamples) >= 4 && needsRateCorrection) {
       setRate(1 + direction * 0.10);
     } else if (video.playbackRate !== 1 && (distance <= correctionStop || drift * (video.playbackRate - 1) < 0)) {
       rateDriftSamples = 0;
@@ -415,19 +603,25 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
 
   function followTimeline() {
     clearTimeout(startTimer);
+    if (pendingStart && !samePlan(pendingStart)) clearPendingStart();
+    completeScheduledStart(pendingStart);
+    watchAudioOutput();
     if (!state || priming) return;
-    if (queuedCommand?.action === 'pause' || reportBlocked || reportBuffering || outage ||
+    if (firstStartCancellation || queuedCommand?.action === 'pause' || reportBlocked || unavailableReport || outage ||
         networkError || document.hidden) {
       pauseVideo();
       return;
     }
-    if (state.startsAt === null || !state.ownsSeat || !primed) {
+    if (state.startsAt === null && state.wantsPlay && !state.ready[role] && !audioReady()) primed = false;
+    if (state.startsAt === null || !state.ownsSeat || !primed || state.startConfirmed === false) {
       pauseAndAlign(state.position);
       return;
     }
+    if (!audioReady()) return;
     const now = performance.now() + offset;
     // The first start after a media reload can be quicker than the original gesture calibration.
-    const lead = mediaReloaded ? Math.min(playbackStartLeadMs, 250) : playbackStartLeadMs;
+    const firstAudibleStart = state.firstStartPending && !state.preview;
+    const lead = firstAudibleStart ? 0 : mediaReloaded ? Math.min(playbackStartLeadMs, 250) : playbackStartLeadMs;
     const untilStart = state.startsAt - now - lead;
     if (untilStart > 0) {
       pauseAndAlign(state.position);
@@ -437,16 +631,20 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       }, untilStart);
       return;
     }
-    const target = positionAt(now);
-    if (!Number.isFinite(target) || target >= video.duration) return;
+    if (!Number.isFinite(positionAt(now)) || video.ended) return;
     if (video.paused) {
       // An early readiness snapshot can precede a Pause that supersedes the scheduled start.
-      if (!host && state.serverTime < state.startsAt - lead - startSnapshotLeadMs) {
+      if ((!host || state.firstStartPending) && state.serverTime < state.startsAt - lead - startSnapshotLeadMs) {
         wake();
         return;
       }
       beginPlayback();
     }
+    updateAudioGain();
+  }
+
+  function updateAudioGain() {
+    if (audio) audio.gain.gain.value = Number(!state.firstStartPending && !video.paused && audioReady());
   }
 
   function updateClock(sent, received, serverTime) {
@@ -473,12 +671,20 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       const position = outage.epoch === epoch && outage.version === version ? outage.position : undefined;
       return { action: 'unavailable', reason: outage.reason, epoch, version, position };
     }
-    if (reportBuffering) return reportBuffering;
-    if (primed && !priming && !document.hidden && hasPlaybackData() && !video.seeking && !state.ready[role] &&
-        (claim || state.ownsSeat) && Math.abs(state.position - video.currentTime) <= alignmentTolerance) {
-      return { action: 'ready', epoch, version, position: video.currentTime, claim };
+    if (unavailableReport) return unavailableReport;
+    if (state.wantsPlay && admitted && gestureFailed && !priming && !state.otherPlayer && !state.blocked.includes(role)) {
+      return { action: 'blocked', epoch, version, claim: !state.ownsSeat };
     }
-    return { action: 'observe', epoch, version, position: mediaPosition() };
+    if ((!audio || admitted) && audioReady() && primed && !priming && !document.hidden && hasPlaybackData() && !video.seeking && !state.ready[role] &&
+        (claim || state.ownsSeat) && Math.abs(state.position - video.currentTime) <= alignmentTolerance) {
+      return { action: 'ready', epoch, version, position: video.currentTime, claim, nativeEnd: true };
+    }
+    const startAcknowledgment = state.awaitingStart && primed && audioReady() &&
+      video.paused && !video.seeking && hasPlaybackData() ? state.startsAt : undefined;
+    const sampledAt = performance.now();
+    return { action: 'observe', epoch, version, position: mediaPosition(), sampledAt, observedAt: sampledAt + offset,
+      playing: mediaPlaying(), ended: finishedPlan(), startAcknowledgment,
+      startConfirmation: state.startAcknowledged ? startAcknowledgment : undefined };
   }
 
   function sendPlayback(operation, options) {
@@ -510,7 +716,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     try {
       // Persist the proposed owner before a lost reply or refresh can hide its acknowledgment.
       if (operation.action === 'recover') rememberSeat();
-      if (operation.action === 'ready' && operation.claim && !state.ownsSeat) {
+      if (operation.claim && !state.ownsSeat) {
         // Each fresh claim has a different lineage, even when the document reclaims the seat.
         pendingClaimId ??= crypto.randomUUID();
         recoveryId = operation.recoveryId = pendingClaimId;
@@ -545,20 +751,26 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       }
       // A new version invalidates the rewind even when its target is still zero.
       if (epochChanged || result.version !== state?.version || result.position !== 0 ||
-          result.wantsPlay || result.startsAt !== null || result.otherPlayer) {
+          (result.wantsPlay && !result.firstStartPending) || result.startsAt !== null || result.otherPlayer) {
         initialRewindRetry = undefined;
       }
       if (state && (epochChanged || (previouslyOwned && !result.ownsSeat) || result.otherPlayer)) {
-        prepareIntent++;
-        hasStartedScheduledPlayback = primed = claim = false;
+        if (priming) pauseVideo();
+        priming = undefined;
+        startedPlan = undefined;
+        primed = claim = false;
         visitorBufferingTimeline = undefined;
         pendingClaimId = undefined;
       }
-      if (!host && result.ownsSeat) closeInitialReload();
+      if (state?.wantsPlay && !result.wantsPlay && priming) {
+        priming = undefined;
+        pauseVideo();
+      }
+      if (result.ready[role]) closeInitialReload();
       updateClock(sent, received, result.serverTime);
       state = result;
       if (operation.action === 'recover') {
-        primed = result.ownsSeat;
+        primed = result.ownsSeat && (primed || !admitted);
         legacySeats = result.ownsSeat ? [] : legacySeats.slice(legacyRecoveryBatchSize);
         needsRecovery = legacySeats.length > 0;
         if (!result.ownsSeat) {
@@ -587,7 +799,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
         reloadAfterReconnect = false;
         outage = undefined;
       }
-      if (operation === reportBuffering) reportBuffering = undefined;
+      if (operation === unavailableReport) unavailableReport = undefined;
       if (operation === queuedCommand) {
         if (ok) unacknowledgedSeekId = undefined;
         commandMessage = ok ? '' : '播放状态已更新，请重试操作。';
@@ -603,6 +815,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       if (timeline !== currentTimeline) {
         currentTimeline = timeline;
         clearTimeout(stallTimer);
+        if (state.ownsSeat && state.waiting[role] === 'stalled') primed = claim = false;
         const visitorInterrupted = state.waiting.visitor === 'buffering' || state.waiting.visitor === 'connection' ||
           (wasWaitingForVisitor && state.ready.visitor && operation.action === 'observe');
         // A host stall can cancel a start scheduled after visitor buffering.
@@ -611,9 +824,9 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
           state.wantsPlay && state.startsAt === null && !state.ready[role] && !queuedCommand;
         mediaRecoveryRetry = mayRetry && (recoveringVisitorInterruption || hostInterruptedBufferingStart)
           ? { timeline, source: video.getAttribute('src'), afterVisitorInterruption: recoveringVisitorInterruption } : undefined;
-        visitorBufferingTimeline = mayRetry && hasStartedScheduledPlayback && state.waiting.visitor === 'buffering'
+        visitorBufferingTimeline = mayRetry && startedPlan && state.waiting.visitor === 'buffering'
           ? timeline : undefined;
-        pendingStart = undefined;
+        clearPendingStart();
         hardDriftSamples = 0;
         rateDriftSamples = 0;
         nextHardSeek = 0;
@@ -621,12 +834,17 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       }
       if (!state.ownsSeat || state.ready[role] || !state.wantsPlay) mediaRecoveryRetry = undefined;
       followTimeline();
+      if (state.wantsPlay && admitted && !primed && !priming && !gestureFailed && !audioRetryRequired && !state.otherPlayer &&
+          !unavailableReport && !outage && state.waiting[role] !== 'stalled' &&
+          !firstStartCancellation && queuedCommand?.action !== 'pause' &&
+          !document.hidden && !video.error && !video.seeking && video.readyState >= video.HAVE_CURRENT_DATA &&
+          performance.now() >= authorizationRetryAt) authorize();
     } finally {
       if (generation === loadGeneration) {
         if (networkError && operation === queuedCommand && operation.action !== 'pause') queuedCommand = undefined;
         inFlight = undefined;
         render();
-        const pendingReport = needsRecovery || queuedCommand || reportBlocked || outage || reportBuffering;
+        const pendingReport = needsRecovery || queuedCommand || reportBlocked || outage || unavailableReport;
         poll = setTimeout(synchronize, pendingReport && !networkError ? 0 : pollMs);
       }
     }
@@ -640,7 +858,13 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
 
   function command(action, details) {
     const pausesSeek = action === 'pause' && queuedCommand?.action === 'seek';
-    if (!host || !state?.ownsSeat || (queuedCommand && !pausesSeek) || (networkError && action !== 'pause')) return;
+    const preparesPlay = action === 'play' && admitted && state && !state.otherPlayer;
+    if (!host || (!state?.ownsSeat && !preparesPlay) || (queuedCommand && !pausesSeek) ||
+        (networkError && action !== 'pause')) return;
+    if (preparesPlay) {
+      authorize(true);
+      details = { waitForReadiness: true, claim: !state.ownsSeat };
+    }
     mediaRecoveryRetry = visitorBufferingTimeline = undefined;
     queuedCommand = { action, ...details, epoch: state.epoch, version: state.version };
     if (action === 'seek') queuedCommand.seekId = crypto.randomUUID();
@@ -648,7 +872,9 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       const interrupted = inFlight?.operation;
       queuedCommand.afterSeekId = interrupted?.action === 'seek' ? interrupted.seekId : unacknowledgedSeekId;
       clearTimeout(startTimer);
-      pendingStart = undefined;
+      clearPendingStart();
+      clearAudioLoss();
+      priming = undefined;
       pauseVideo();
       rememberSeat();
       // The previous request may already have applied. Let the server order the pause without waiting for its reply.
@@ -663,7 +889,9 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     if (reason === 'connection') reloadAfterReconnect = true;
     outage = playbackOutage(reason);
     clearTimeout(startTimer);
-    pendingStart = undefined;
+    clearPendingStart();
+    clearAudioLoss();
+    priming = undefined;
     pauseVideo();
     wake();
   }
@@ -682,35 +910,113 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     sendPlayback({ action: 'unavailable', ...outage, epoch, version }, { keepalive: true }).catch(() => {});
   });
 
-  prepare.addEventListener('click', async () => {
-    const generation = loadGeneration;
-    const intent = prepareIntent;
-    priming = true;
+  async function probePlayback(attempt) {
+    const startPosition = video.currentTime;
+    const started = performance.now();
+    attempt.waitingForPlay = true;
+    await video.play();
+    if (priming !== attempt) return;
+    attempt.waitingForPlay = false;
+    render();
+    const startLeadMs = await measurePlaybackStart(attempt, startPosition, started);
+    if (priming !== attempt) return;
+    pauseVideo();
+    if (startLeadMs === null) throw new Error('Media clock did not advance');
+    return startLeadMs;
+  }
+
+  async function resumeAuthorization(attempt) {
+    if (!audio || audio.context.state === 'running') return;
+    attempt.waitingForAudio = true;
+    const resuming = resumeAudio();
+    render();
+    await resuming;
+    if (priming === attempt) {
+      attempt.waitingForAudio = false;
+      render();
+    }
+  }
+
+  async function authorize(withGesture = false) {
+    if (priming || primed || firstStartCancellation || queuedCommand?.action === 'pause' ||
+        unavailableReport || outage || !video.hasAttribute('src') || state?.otherPlayer) return;
+    if (audio?.context.state === 'closed') {
+      audioFailed = audioRetryRequired = true;
+      render();
+      return;
+    }
+    const attempt = { waitingForAudio: false };
+    priming = attempt;
+    audioRetryRequired = false;
+    gestureFailed = false;
     render();
     try {
-      // Call play from the tap itself so WebKit can authorize this element for later starts.
-      const startPosition = video.currentTime;
-      const started = performance.now();
-      await video.play();
-      const startLeadMs = await measurePlaybackStart(generation, startPosition, started);
-      if (generation !== loadGeneration || intent !== prepareIntent) return;
+      // Keep the unmuted element subject to the browser's policy while the gain silences the probe.
+      if (!audio?.connected && (audio || admitted || withGesture)) {
+        prepareAudioGraph();
+        if (!audio?.connected) {
+          authorizationRetryAt = performance.now() + 1000;
+          return;
+        }
+      }
+      if (audio) audio.gain.gain.value = 0;
+      // Give native playback the gesture before resuming the audio context.
+      const result = Promise.all([probePlayback(attempt), resumeAuthorization(attempt)]);
+      render();
+      const [startLeadMs] = await result;
+      if (priming !== attempt) return;
+      audioFailed = false;
       playbackStartLeadMs = startLeadMs;
       mediaReloaded = false;
-      pauseVideo();
       primed = true;
       claim = true;
-      gestureFailed = false;
-    } catch {
-      if (generation === loadGeneration && intent === prepareIntent) markGestureFailed();
+    } catch (error) {
+      if (priming !== attempt) return;
+      pauseVideo();
+      authorizationRetryAt = performance.now() + 1000;
+      if (error.name === 'NotAllowedError') markGestureFailed();
+      else if (error.name !== 'AbortError') audioFailed = true;
     } finally {
-      if (generation === loadGeneration) {
-        priming = false;
+      if (priming === attempt) {
+        priming = undefined;
         followTimeline();
         wake();
       }
     }
+  }
+  prepare.addEventListener('click', () => {
+    if (!prepare.hidden && audio?.context.state === 'closed') return window.location.reload();
+    if (awaitingLocalAudio()) {
+      priming = undefined;
+      pauseVideo();
+    }
+    authorize();
   });
-  play.addEventListener('click', () => command(state?.wantsPlay ? 'pause' : 'play'));
+  play.addEventListener('click', () => {
+    if (state?.firstStartPending && !state.ownsSeat && cancelFirstStart) cancelPendingStart();
+    else command(state?.firstStartPending || state?.wantsPlay ? 'pause' : 'play');
+  });
+
+  async function cancelPendingStart() {
+    if (firstStartCancellation) return;
+    clearTimeout(startTimer);
+    clearPendingStart();
+    clearAudioLoss();
+    priming = undefined;
+    pauseVideo();
+    const cancellation = cancelFirstStart(playerId);
+    firstStartCancellation = cancellation;
+    render();
+    try {
+      await cancellation;
+    } finally {
+      if (firstStartCancellation === cancellation) {
+        inFlight?.controller.abort();
+        firstStartCancellation = undefined;
+        wake();
+      }
+    }
+  }
   seek.addEventListener('input', () => {
     seekPreview = true;
     renderTime();
@@ -743,14 +1049,51 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   });
   video.addEventListener('timeupdate', renderTime);
   video.addEventListener('playing', render);
+  video.addEventListener('ended', () => {
+    completeScheduledStart(pendingStart);
+    wake();
+  });
   for (const event of ['progress', 'durationchange', 'emptied']) video.addEventListener(event, renderBuffer);
 
   return {
-    load(url) {
+    admit() {
+      admitted = true;
+    },
+    authorizeApproval() {
+      if (audio?.connected) authorize(true);
+    },
+    cancelPendingStart,
+    load(url, { prepareApproval = false } = {}) {
       url = apiOrigin + url;
+      if (prepareApproval && !audio?.connected) {
+        // Connect the silent graph when applying the room snapshot, before the approval gesture.
+        prepareAudioGraph();
+        if (!audio?.connected && approvalAudioRetry === undefined) {
+          approvalAudioRetry = setTimeout(() => {
+            approvalAudioRetry = undefined;
+            if (!admitted && video.getAttribute('src') === url && !audio?.connected) prepareAudioGraph();
+          }, 0);
+        }
+      }
       if (video.getAttribute('src') === url) return;
-      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = pendingStart = undefined;
-      hasStartedScheduledPlayback = initialReloadClosed = false;
+      if (video.hasAttribute('src')) {
+        loadGeneration++;
+        inFlight?.controller.abort();
+        inFlight = undefined;
+        clearTimeout(stallTimer);
+        // A pending buffering or audio report describes the previous source.
+        if (unavailableReport?.reason === 'audio') {
+          audioFailed = audioRetryRequired = false;
+        }
+        unavailableReport = undefined;
+      }
+      if (priming || pendingStart) pauseVideo();
+      priming = undefined;
+      clearTimeout(startTimer);
+      clearPendingStart();
+      clearAudioLoss();
+      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = startedPlan = undefined;
+      initialReloadClosed = false;
       video.src = url;
       clearInterval(driftTimer);
       driftTimer = setInterval(correctDrift, driftCheckMs);
@@ -758,28 +1101,37 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       wake();
     },
     stop() {
-      if (!video.hasAttribute('src')) return;
       loadGeneration++;
-      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = undefined;
-      hasStartedScheduledPlayback = initialReloadClosed = false;
+      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = startedPlan = undefined;
+      initialReloadClosed = false;
       clearTimeout(poll);
       clearTimeout(startTimer);
       clearInterval(driftTimer);
       clearTimeout(stallTimer);
+      clearTimeout(approvalAudioRetry);
+      approvalAudioRetry = undefined;
       state = undefined;
       queuedCommand = unacknowledgedSeekId = undefined;
-      reportBlocked = reportBuffering = outage = pendingStart = undefined;
+      reportBlocked = unavailableReport = outage = undefined;
+      clearPendingStart();
       reloadAfterReconnect = false;
       mediaReloaded = false;
       inFlight = pendingClaimId = undefined;
-      priming = primed = claim = gestureFailed = networkError = false;
+      priming = undefined;
+      clearAudioLoss();
+      primed = claim = gestureFailed = networkError = audioFailed = audioRetryRequired = false;
+      admitted = false;
+      firstStartCancellation = undefined;
       seekPreview = false;
       commandMessage = '';
       driftSeekStarted = undefined;
       driftSeekLeadMs = initialDriftSeekLeadMs;
       clockSamples = [];
-      video.removeAttribute('src');
-      video.load();
+      if (video.hasAttribute('src')) {
+        pauseVideo();
+        video.removeAttribute('src');
+        video.load();
+      }
       byId('player').hidden = true;
     },
   };

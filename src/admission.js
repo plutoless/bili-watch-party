@@ -22,7 +22,7 @@ export function openAdmission(db, now) {
     CREATE UNIQUE INDEX IF NOT EXISTS visitor_seat ON visitors(roomId) WHERE approved = 1;
   `);
   const invitation = db.prepare('SELECT token, expiresAt FROM invitations WHERE roomId = ? AND expiresAt > ?');
-  const seat = db.prepare('SELECT 1 FROM visitors WHERE roomId = ? AND approved = 1');
+  const seat = db.prepare('SELECT id FROM visitors WHERE roomId = ? AND approved = 1');
   const pending = db.prepare('SELECT id FROM visitors WHERE roomId = ? AND approved = 0 ORDER BY rowid');
   const removePending = db.prepare('DELETE FROM visitors WHERE roomId = ? AND approved = 0');
   const removeInvitation = db.prepare('DELETE FROM invitations WHERE roomId = ?');
@@ -90,11 +90,16 @@ export function openAdmission(db, now) {
       return { state: 'pending', requestId, visitorToken: newVisitorToken };
     },
     approve(roomId, requestId) {
-      if (seat.get(roomId) || !invitation.get(roomId, now())) return false;
-      return approve.run(roomId, requestId).changes === 1;
+      const approved = seat.get(roomId);
+      if (approved) return approved.id === requestId ? 'already-approved' : null;
+      if (!invitation.get(roomId, now())) return null;
+      return approve.run(roomId, requestId).changes === 1 ? 'approved' : null;
     },
     isApproved(roomId, token) {
       return member(roomId, token)?.approved === 1;
+    },
+    hasApprovedVisitor(roomId) {
+      return Boolean(seat.get(roomId));
     },
     sweep() {
       const cutoff = now();

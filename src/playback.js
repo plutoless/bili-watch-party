@@ -1,17 +1,26 @@
 import { randomUUID } from 'node:crypto';
 
 const startLeadMs = 900;
+const initialFirstStartLeadMs = 5600;
+const maximumFirstStartLeadMs = 12000;
 const playerLeaseMs = 4_000;
+const progressLeaseMs = 650;
+const firstStartProgressLeaseMs = 2200;
+// A client may still be waiting on its pre-release reply. Allow two request timeouts plus a poll.
+const releaseDeliveryMs = 4400;
+const minimumPreviewDuration = 1;
 const alignmentTolerance = 0.12;
 const maxRecoveryRewind = 2;
 const roles = ['host', 'visitor'];
 
-export function createPlayback(duration) {
+export function createPlayback(duration = Infinity) {
   const epoch = randomUUID();
   const players = { host: null, visitor: null };
   let position = 0;
   let startsAt = null;
   let wantsPlay = false;
+  let firstStart = null;
+  let firstStartLeadMs = initialFirstStartLeadMs;
   let ended = false;
   let version = 0;
   let hostCommandVersion = 0;
@@ -23,30 +32,92 @@ export function createPlayback(duration) {
   }
 
   function align(target, resume) {
+    // A replacement plan needs fresh confirmation until both players have advanced together.
+    if (resume && firstStart === 'starting') firstStart = 'armed';
     position = target;
     if (target < duration) ended = false;
     wantsPlay = resume;
     startsAt = null;
     for (const player of Object.values(players)) {
-      if (player) player.ready = false;
+      if (player) {
+        player.ready = false;
+        player.startAcknowledgment = null;
+        player.startConfirmation = null;
+      }
     }
     version++;
   }
 
   function scheduleStart(now) {
-    startsAt = now + startLeadMs;
+    // The published page can align and play but cannot participate in preview and release.
+    if (firstStartPending() && roles.some(seat => players[seat]?.nativeEnd === false)) firstStart = null;
+    if (firstStart === 'preview' && duration - position <= minimumPreviewDuration) firstStart = 'armed';
+    startsAt = now + (firstStart === 'armed' ? firstStartLeadMs : startLeadMs);
   }
 
   const bothReady = () => players.host?.ready && players.visitor?.ready;
+  const firstStartPending = () => ['preview', 'armed', 'starting'].includes(firstStart);
+  const startAcknowledged = () => startsAt !== null &&
+    roles.every(seat => players[seat]?.startAcknowledgment === startsAt);
+  const startConfirmed = () => startsAt !== null &&
+    roles.every(seat => players[seat]?.startConfirmation === startsAt);
+
+  function planProgress(player) {
+    const progress = player?.progress;
+    if (startsAt !== null && progress?.version === version && progress.startsAt === startsAt) return progress;
+  }
+
+  function finishedPlan(player) {
+    const progress = planProgress(player);
+    return progress && (progress.finished || (!player.nativeEnd && progress.legacyEnd));
+  }
+
+  function tailResumePosition(now, interrupted, observedPosition) {
+    if (startsAt === null) return;
+    const projected = currentPosition(now);
+    const unfinished = roles.map(seat => players[seat]).filter(player => !finishedPlan(player));
+    if (!unfinished.length || (unfinished.length > 1 && projected < duration)) return;
+    const hasPlayableReport = Number.isFinite(observedPosition) && observedPosition >= position && observedPosition < duration;
+    // Every unfinished seat caps the resume point, even when it has not sent a usable sample.
+    const checkpoints = unfinished.map(player => player === interrupted && hasPlayableReport
+      ? observedPosition : planProgress(player)?.resumePosition ?? position);
+    return Math.max(position, Math.min(projected, ...checkpoints));
+  }
+
+  function newSeat(playerId, recoveryId, now) {
+    return { id: playerId, recoveryId: recoveryId ?? playerId, recoveryGeneration: 0,
+      ready: false, blocked: false, waiting: null, lastSeen: now };
+  }
+
+  function pause(now) {
+    // Until both players confirm first playback, keep the target they were preparing.
+    if (firstStartPending()) startsAt = null;
+    firstStart = null;
+    lastHostSeek = undefined;
+    if (wantsPlay) align(tailResumePosition(now) ?? currentPosition(now), false);
+    hostCommandVersion = version;
+  }
+
+  function play(now) {
+    lastHostSeek = undefined;
+    if (wantsPlay) return;
+    if (position === duration) align(0, true);
+    else {
+      wantsPlay = true;
+      if (bothReady()) scheduleStart(now);
+      version++;
+    }
+    hostCommandVersion = version;
+  }
 
   function interrupt(player, reason, now, observedPosition) {
     const projected = currentPosition(now);
-    const reported = observedPosition ?? (player.progress?.version === version ? player.progress.position : undefined);
+    const reported = observedPosition ?? planProgress(player)?.position;
     // Allow a short recovery rewind without treating a participant's report as a seek.
     const lastContact = reason === 'connection' ? player.lastSeen ?? now : now;
     const floor = Math.max(position, currentPosition(lastContact) - maxRecoveryRewind);
-    const target = startsAt === null || !Number.isFinite(reported) ? projected
-      : Math.max(floor, Math.min(projected, reported));
+    const target = firstStartPending() ? position : tailResumePosition(now, player, observedPosition) ??
+      (startsAt === null || !Number.isFinite(reported) ? projected : Math.max(floor, Math.min(projected, reported)));
     align(target, wantsPlay && target < duration);
     player.waiting = reason;
   }
@@ -61,14 +132,68 @@ export function createPlayback(duration) {
     }
   }
 
+  function legacyAdvanceSteps(previous, reported, now) {
+    if (previous?.legacySteps === undefined || previous.at < startsAt) return 0;
+    const elapsed = now - previous.at;
+    const movement = reported - previous.position;
+    // The old page has no capture clock. Require a series that is plausible at receipt time.
+    return elapsed > 0 && elapsed <= progressLeaseMs && movement > 0 && movement <= elapsed / 1000 + alignmentTolerance
+      ? previous.legacySteps + 1 : 0;
+  }
+
+  function observeProgress(player, command, now) {
+    const { position: reported, ended: nativeEnded, playing } = command;
+    const nearEnd = reported >= duration - alignmentTolerance && reported <= duration + alignmentTolerance;
+    const legacy = ['ended', 'playing', 'sampledAt', 'observedAt'].every(field => !Object.hasOwn(command, field));
+    if (!Number.isFinite(reported) || reported < 0 || reported > duration + alignmentTolerance ||
+        (legacy && player.nativeEnd) || (Object.hasOwn(command, 'ended') && typeof nativeEnded !== 'boolean') ||
+        (nativeEnded === true && (!nearEnd || playing === true))) return;
+    const previous = planProgress(player);
+    const observedAt = Number.isFinite(command.observedAt)
+      ? Math.max(now - 500, Math.min(now + 100, command.observedAt)) : now;
+    const hasSampleClock = Number.isFinite(command.sampledAt);
+    const sampledAt = hasSampleClock ? command.sampledAt : now;
+    const comparable = previous?.hasSampleClock === hasSampleClock;
+    if ((previous?.hasSampleClock && !hasSampleClock) || (comparable && sampledAt < previous.sampledAt)) return;
+    const finished = previous?.finished || (observedAt >= startsAt && nativeEnded === true);
+    const legacyEnd = legacy && observedAt >= startsAt && nearEnd;
+    const moving = playing === true && observedAt >= startsAt && reported > position + 0.03;
+    const advanced = moving && previous && reported > previous.position;
+    const advancedAt = advanced ? now : moving ? previous?.advancedAt : undefined;
+    const legacySteps = legacy ? (legacyEnd ? 0 : legacyAdvanceSteps(previous, reported, now)) : undefined;
+    const stoppedSince = observedAt >= startsAt && !advanced && !legacySteps && !finished && !legacyEnd
+      ? (comparable ? previous.stoppedSince : undefined) ?? sampledAt : undefined;
+    // A numeric endpoint without native completion is not a playable resume target.
+    const resumePosition = observedAt >= startsAt && reported < duration ? reported : previous?.resumePosition;
+    player.progress = { version, startsAt, position: reported, at: observedAt, advancedAt, sampledAt, hasSampleClock, stoppedSince,
+      resumePosition, finished, legacyEnd, legacySteps, hasAdvanced: Boolean(advanced || previous?.hasAdvanced) };
+  }
+
   return {
+    setDuration(seconds) { duration = seconds; },
+    startOnApproval() {
+      firstStart = 'preview';
+      align(0, true);
+      hostCommandVersion = version;
+    },
+    get firstStartPending() { return firstStartPending(); },
+    cancelFirstStart(playerId, now) {
+      expirePlayers(now);
+      if (!firstStart) return true;
+      if (players.host?.lastSeen != null && players.host.id !== playerId) return false;
+      pause(now);
+      return true;
+    },
     update({ role, action, playerId, ...command }, now) {
       expirePlayers(now);
-      if (startsAt !== null && currentPosition(now) >= duration) {
-        align(duration, false);
-        ended = true;
+      if (firstStart === 'armed' && startsAt !== null && now >= startsAt - releaseDeliveryMs &&
+          !startConfirmed()) {
+        firstStartLeadMs = Math.min(maximumFirstStartLeadMs, firstStartLeadMs * 2);
+        scheduleStart(now);
       }
-
+      if (firstStart === 'armed' && startsAt !== null && now >= startsAt && startConfirmed()) {
+        firstStart = 'starting';
+      }
       const player = players[role];
       const ownsSeat = player?.id === playerId;
       let conflict = false;
@@ -89,6 +214,7 @@ export function createPlayback(duration) {
             player.recoveryId = command.recoveryId ?? playerId;
             player.recoveryGeneration = command.recoveryGeneration ?? 0;
             player.blocked = false;
+            player.nativeEnd = undefined;
           }
         }
       } else if (action !== 'observe') {
@@ -110,10 +236,18 @@ export function createPlayback(duration) {
               id: playerId,
               recoveryId: ownsSeat ? player.recoveryId : command.recoveryId ?? playerId,
               recoveryGeneration: ownsSeat ? player.recoveryGeneration : 0,
+              nativeEnd: command.nativeEnd === true || (ownsSeat && player.nativeEnd === true),
               ready: true, blocked: false, waiting: null, lastSeen: now,
             };
             if (wantsPlay && bothReady()) scheduleStart(now);
           }
+        } else if (action === 'play' && command.waitForReadiness === true &&
+            (ownsSeat || (command.claim === true && player?.lastSeen == null))) {
+          if (!ownsSeat) players[role] = newSeat(playerId, command.recoveryId, now);
+          play(now);
+        } else if (action === 'blocked' && !ownsSeat && command.claim === true &&
+            player?.lastSeen == null && startsAt === null) {
+          players[role] = { ...newSeat(playerId, command.recoveryId, now), blocked: true };
         } else if (!ownsSeat) conflict = true;
         else if (action === 'unavailable') {
           interrupt(player, command.reason, now, command.position);
@@ -121,43 +255,94 @@ export function createPlayback(duration) {
           interrupt(player, null, now);
           player.blocked = true;
         } else if (action === 'pause') {
-          lastHostSeek = undefined;
-          if (wantsPlay) align(currentPosition(now), false);
-          hostCommandVersion = version;
+          pause(now);
         } else if (action === 'seek') {
           const target = Math.min(duration, Math.max(0, command.position));
           ended = false;
+          if (firstStart === 'confirmed') firstStart = null;
           align(target, wantsPlay && target < duration);
           hostCommandVersion = version;
           lastHostSeek = command.seekId ? { id: command.seekId, playerId, previousVersion: command.version } : undefined;
         } else if (action === 'play') {
           if (!bothReady()) conflict = true;
-          else {
-            lastHostSeek = undefined;
-            if (!wantsPlay) {
-              wantsPlay = true;
-              if (position === duration) align(0, true);
-              else {
-                scheduleStart(now);
-                version++;
-              }
-              hostCommandVersion = version;
-            }
-          }
+          else play(now);
         }
       }
       const currentPlayer = players[role];
       if (!conflict && currentPlayer?.id === playerId) {
         currentPlayer.lastSeen = now;
-        if (action === 'observe' && startsAt !== null && command.epoch === epoch &&
-            command.version === version && Number.isFinite(command.position)) {
-          currentPlayer.progress = { version, position: command.position };
+        if (action === 'observe' && command.epoch === epoch && command.version === version) {
+          if (typeof command.ended === 'boolean') currentPlayer.nativeEnd = true;
+          if (startsAt !== null) observeProgress(currentPlayer, command, now);
+          if (firstStart === 'armed' && startsAt !== null && command.startAcknowledgment === startsAt &&
+              Math.abs(command.position - position) <= alignmentTolerance) {
+            currentPlayer.startAcknowledgment = startsAt;
+            if (startAcknowledged() && command.startConfirmation === startsAt) {
+              currentPlayer.startConfirmation = startsAt;
+            }
+          }
         }
       }
+      // A missing report is different from consecutive samples proving the media clock stopped.
+      const stopped = roles.filter(seat => {
+        const progress = planProgress(players[seat]);
+        return progress && progress.sampledAt - progress.stoppedSince >= progressLeaseMs;
+      });
+      const lease = firstStartPending() ? firstStartProgressLeaseMs : progressLeaseMs;
+      const nativeAdvancing = Object.fromEntries(roles.map(seat => {
+        const progress = planProgress(players[seat]);
+        return [seat, progress !== undefined &&
+          !stopped.includes(seat) && now - progress.advancedAt <= lease];
+      }));
+      const playbackGap = nativeAdvancing.host && nativeAdvancing.visitor
+        ? Math.abs((players.host.progress.position - players.host.progress.at / 1000) -
+          (players.visitor.progress.position - players.visitor.progress.at / 1000)) : null;
+      const aligned = playbackGap !== null && playbackGap < 0.5;
+      if (firstStart === 'starting' && aligned) firstStart = 'confirmed';
+      const shortFirstStart = firstStart === 'starting' && duration - position <= minimumPreviewDuration;
+      const atTail = startsAt !== null && currentPosition(now) >= duration;
+      // The projected position can reach the end before a player has shown its terminal frame.
+      if (atTail && (!firstStartPending() || shortFirstStart) && roles.every(seat => finishedPlan(players[seat]))) {
+        align(duration, false);
+        ended = true;
+        firstStart = null;
+      }
+      const tailStalled = atTail && !firstStartPending() ? stopped.filter(seat => planProgress(players[seat])?.hasAdvanced) : [];
+      if (tailStalled.length) {
+        align(tailResumePosition(now) ?? position, true);
+        for (const seat of tailStalled) players[seat].waiting = 'stalled';
+      }
+      // Use the silent preview as evidence that both players can advance, then start
+      // the real playback from the original target after both players align again.
+      const previewComplete = firstStart === 'preview' && aligned;
+      const previewStalled = firstStart === 'preview' && startsAt !== null &&
+        (stopped.length > 0 || currentPosition(now) >= duration);
+      const startStalled = firstStart === 'starting' && stopped.length > 0;
+      if (previewComplete || previewStalled || startStalled) {
+        const stalled = previewComplete ? [] : stopped.length ? stopped : roles.filter(seat => !nativeAdvancing[seat]);
+        if (previewComplete) firstStart = 'armed';
+        align(position, true);
+        for (const seat of roles) {
+          if (stalled.includes(seat)) players[seat].waiting = 'buffering';
+        }
+      }
+      const advancing = Object.fromEntries(roles.map(seat => {
+        const player = players[seat];
+        const progress = planProgress(player);
+        return [seat, startsAt !== null && (nativeAdvancing[seat] ||
+          (!player?.nativeEnd && progress?.legacySteps >= 2 && now - progress.at <= progressLeaseMs))];
+      }));
+      const preview = firstStart === 'preview';
       return {
         conflict,
         state: {
           epoch, version, position, startsAt, wantsPlay, ended, serverTime: now,
+          firstStartPending: firstStartPending(), preview, awaitingStart: firstStart === 'armed',
+          hostSupportsAutomaticStart: players.host?.lastSeen != null ? players.host.nativeEnd : undefined,
+          startAcknowledged: firstStart === 'armed' && startAcknowledged(),
+          startConfirmed: firstStart !== 'armed' || startConfirmed(), advancing,
+          synchronized: startsAt !== null && !firstStartPending() && aligned,
+          playbackGap: startsAt === null ? null : playbackGap,
           ready: Object.fromEntries(roles.map(seat => [seat, Boolean(players[seat]?.ready)])),
           waiting: Object.fromEntries(roles.map(seat => [seat, players[seat]?.waiting ?? null])),
           blocked: roles.filter(seat => players[seat]?.blocked),
