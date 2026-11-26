@@ -994,7 +994,7 @@ export function createPlayer({ apiOrigin, roomPath, role, cancelFirstStart }) {
   });
   play.addEventListener('click', () => {
     if (state?.firstStartPending && !state.ownsSeat && cancelFirstStart) cancelPendingStart();
-    else command(state?.wantsPlay ? 'pause' : 'play');
+    else command(state?.firstStartPending || state?.wantsPlay ? 'pause' : 'play');
   });
 
   async function cancelPendingStart() {

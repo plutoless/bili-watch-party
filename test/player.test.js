@@ -628,6 +628,51 @@ test('a suspended context cannot confirm a future first start', async () => {
   assert.equal(app.visitor.gain.value, 0);
 });
 
+test('the visible cancel button cancels first start after seeking to the exact end', async () => {
+  const app = roomFixture({ automatic: true });
+  app.approve();
+  for (let i = 0; i < 160 && !app.snapshot().awaitingStart; i++) await app.advance(50);
+  const armed = app.snapshot();
+  assert.equal(armed.awaitingStart, true);
+  await app.advance(250);
+  const { element, video } = app.host;
+  const seek = element('seek');
+  assert.equal(element('player').hidden, false);
+  assert.equal(element('seek-controls').hidden, false);
+  assert.equal(seek.disabled, false);
+  seek.value = video.duration;
+  seek.dispatchEvent(new Event('change'));
+  await app.advance(650);
+  const sought = app.snapshot();
+  assert.equal(sought.position, video.duration);
+  assert.equal(sought.startsAt, null);
+  assert.equal(sought.wantsPlay, false);
+  assert.equal(sought.ended, false);
+  const play = element('play');
+  assert.equal(play.textContent, '取消开播');
+  assert.equal(play.hidden, false);
+  assert.equal(play.disabled, false);
+  play.dispatchEvent(new Event('click'));
+  await app.advance(350);
+  const cancelled = app.snapshot();
+  assert.equal(cancelled.firstStartPending, false);
+  assert.equal(cancelled.position, video.duration);
+  assert.equal(cancelled.wantsPlay, false);
+  const playerId = app.savedHost().playerId;
+  const oldTarget = { epoch: armed.epoch, version: armed.version, position: 0, playerId };
+  assert.equal(app.send({ action: 'ready', ...oldTarget }).conflict, true);
+  app.send({ action: 'observe', ...oldTarget, startAcknowledgment: armed.startsAt, startConfirmation: armed.startsAt });
+  await app.advance(1200);
+  assert.equal(app.snapshot().startsAt, null);
+  assert.equal(app.snapshot().position, video.duration);
+  assert.equal(play.textContent, '播放');
+  assert.equal(play.disabled, false);
+  play.dispatchEvent(new Event('click'));
+  await app.advance(350);
+  assert.equal(app.snapshot().position, 0);
+  assert.equal(app.snapshot().wantsPlay, true);
+});
+
 test('pending scheduled play holds the room for a bounded local retry', async t => {
   for (const reject of [false, true]) await t.test(reject ? 'late rejection' : 'late success', async () => {
     const previous = Promise.withResolvers();
