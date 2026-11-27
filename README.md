@@ -95,4 +95,8 @@ HTTP 测试用合成样本覆盖导入和重试、邀请轮换和过期、并发
 
 在获准用于验收的共享部署上，默认使用为本轮保留的公开片源，按 [R2 验收的房间归属检查](docs/r2-media.md#验收) 手动操作。查看首次 `POST /api/rooms` 的响应，仅在收到 `201` 且确认返回的是本轮新房间后继续。收到 `200`（复用房间）或无法确认归属时立即停止该次验收并离开房间，避免任何后续写操作。
 
+To reuse an approved test address, first [verify the live web and API revisions](docs/production-release.md#隔离验收与首次生产记录) and confirm the expected media mode for that deployment. After the new room is confirmed, check the actual playback request. Protected media uses the backend's `/media/` route with a room session. Public media goes directly to the configured R2 media origin. If the revision, media mode, or room ownership cannot be confirmed, stop that acceptance run.
+
+Sign in to the app as host to create or manage the test room, using the existing browser session if it is still valid. Guests use the invite and host approval. The public web page, release marker, and public R2 reads can be checked without signing in. A provider dashboard sign-in is needed only for authorized dashboard work when an existing session or another authorized interface is unavailable. Importing a supported public Bilibili submission requires no Bilibili login.
+
 仅在能确保脚本固定片源创建新房间的环境中运行部署浏览器命令。把 `BROWSER_ORIGIN` 设为部署后的 HTTPS 源地址，并向测试进程提供该环境的 `HOST_PASSWORD`，运行 `npm run test:browser`。测试会提交真实导入并结束相应房间。拆分部署时设置 `BROWSER_API_ORIGIN` 指向后台。测试按房间返回的媒体来源断言访问方式。受保护模式验证已批准的会话从后台取得 `Range/206`，其他会话被拒绝。R2 模式可设置 `BROWSER_MEDIA_ORIGIN` 明确要求指定的 HTTPS 媒体域，验证播放器直接使用公开地址、匿名片段返回 `206`，房间与播放控制仍需后台授权。生产生命周期、受控删除和重导入另行验收。独立的 Compose 回环实例可设置 `WATCH_BIND_IP=127.0.0.1`、`WATCH_HTTPS_PORT=8443` 和 `PUBLIC_ORIGIN=https://localhost:8443`。如果该实例使用本地 CA，可为测试进程设 `BROWSER_LOCAL_TLS=1`，并用该 CA 单独校验 TLS。受保护模式可设置 `BROWSER_DATA_DIR` 指向部署的本地运行数据目录，供 FFprobe 和 FFmpeg 检查成品。请在仓库之外保存临时运行数据和任何测试日志。
