@@ -18,6 +18,11 @@ function stage(name) {
 const fail = () => process.exit(1);
 const home = process.env.FIXTURE_REMOTE_HOME;
 
+// R2 input is available to the release shell, then only to the authenticated SSH stream.
+const r2Keys = ['R2_ACCOUNT_ID', 'R2_BUCKET', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY'];
+assert.ok(r2Keys.every(key => process.env[key] === undefined), 'Unexpected R2 child environment');
+assert.ok(args.every(arg => !arg.includes('synthetic-r2-')), 'Unexpected R2 command argument');
+
 switch (command) {
   case 'ssh': {
     assert.ok(has('BatchMode=yes') && has('IdentitiesOnly=yes') && has('StrictHostKeyChecking=yes'));
@@ -36,9 +41,10 @@ switch (command) {
       }
       break;
     }
-    const result = spawnSync('bash', ['-c', args.at(-1)], {
-      env: { ...process.env, HOME: home }, stdio: 'inherit',
-    });
+    // OpenSSH does not forward the CI environment to the host.
+    const remote = { ...process.env, HOME: home };
+    delete remote.MEDIA_ORIGIN;
+    const result = spawnSync('bash', ['-c', args.at(-1)], { env: remote, stdio: 'inherit' });
     process.exit(result.status ?? 1);
   }
   case 'flock':
@@ -46,7 +52,14 @@ switch (command) {
     break;
   case 'docker': {
     assert.equal(value('--project-name'), 'existing-project');
-    assert.equal(value('--env-file'), join(home, '.config/bili-watch-party/compose.env'));
+    const envFiles = args.flatMap((arg, index) => arg === '--env-file' ? [args[index + 1]] : []);
+    assert.equal(envFiles[0], join(home, '.config/bili-watch-party/compose.env'));
+    assert.ok(envFiles.length <= 2);
+    if (envFiles[1]) {
+      assert.equal(process.env.MEDIA_ORIGIN, undefined);
+      const currentRelease = join(home, '.local/share/bili-watch-party-deploy/r2-config', basename(process.cwd()) + '.env');
+      assert.equal(envFiles[1], state.rollbackEnvFile ?? currentRelease);
+    }
     assert.ok(has('compose.yaml') && has('compose.release.yaml'));
     if (has('config')) {
       const environment = { PUBLIC_ORIGIN: process.env.API_ORIGIN, WEB_ORIGIN: process.env.WEB_ORIGIN };
@@ -58,6 +71,8 @@ switch (command) {
     } else {
       assert.ok(has('up') && has('--wait') && has('--no-build') && has('never'));
       state.backend = process.env.RELEASE_SHA;
+      state.backendDir = process.cwd();
+      state.r2EnvFile = envFiles[1] ?? null;
       if (stage('compose-up')) fail();
     }
     break;
@@ -75,6 +90,10 @@ switch (command) {
       if (result.status !== 0) fail();
       mkdirSync(output, { recursive: true });
       copyFileSync(join(cwd, 'dist/index.html'), join(output, 'index.html'));
+      if (state.failure === 'missing-media-csp') {
+        const file = join(output, 'index.html');
+        writeFileSync(file, readFileSync(file, 'utf8').replace(' ' + process.env.MEDIA_ORIGIN, ''));
+      }
       if (state.failure !== 'missing-player-build') copyFileSync(join(cwd, 'dist/xgplayer.js'), join(output, 'xgplayer.js'));
     } else if (has('deploy')) {
       assert.ok(has('--prod') && has('--prebuilt') && has('--skip-domain'));
@@ -147,6 +166,7 @@ switch (command) {
       }
     } else {
       assert.equal(url.origin, process.env.WEB_ORIGIN);
+      if (url.pathname === '/' && !url.search) stage('check-current-web');
       const isNew = state.liveId === 'dpl_' + process.env.RELEASE_SHA;
       if (!state.liveId || (isNew && state.failure === 'live-https')) status = 502;
       if (url.pathname === '/xgplayer.js') {

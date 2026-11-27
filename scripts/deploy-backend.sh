@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -euo pipefail
 umask 077
 
@@ -16,8 +17,20 @@ COMPOSE_PROJECT_NAME=$(<"$config/compose-project")
 [[ $COMPOSE_PROJECT_NAME =~ ^[a-z0-9][a-z0-9_-]*$ ]] || fail 'Compose 项目名无效。'
 export COMPOSE_PROJECT_NAME
 cd "$release"
-compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" --env-file "$config/compose.env"
-  -f compose.yaml -f compose.release.yaml)
+compose=(docker compose --project-name "$COMPOSE_PROJECT_NAME" --env-file "$config/compose.env")
+if [[ -e .ci-r2 || -n ${5:-} ]]; then
+  r2_file=${5:-}
+  r2_dir=${r2_file%/*}
+  private_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+  [[ $r2_file == /* && -f $r2_file && ! -L $r2_file && -O $r2_file &&
+     $(private_mode "$r2_file") == 600 && -d $r2_dir && ! -L $r2_dir &&
+     -O $r2_dir && $(private_mode "$r2_dir") == 700 ]] ||
+    fail '后台 CI R2 配置缺失、归属错误或权限不安全。'
+  # Compose prefers the process environment over either env file.
+  unset MEDIA_ORIGIN R2_ACCOUNT_ID R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
+  compose+=(--env-file "$r2_file")
+fi
+compose+=(-f compose.yaml -f compose.release.yaml)
 
 if ! "${compose[@]}" config --format json 2>/dev/null | jq -e \
   --arg api "$api_origin" --arg web "$web_origin" \

@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
+# R2 credentials arrive in the workflow environment. Keep them in this shell.
+set +x
 set -euo pipefail
+r2_values=("${R2_ACCOUNT_ID:-}" "${R2_BUCKET:-}" "${R2_ACCESS_KEY_ID:-}" "${R2_SECRET_ACCESS_KEY:-}")
+unset R2_ACCOUNT_ID R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
 umask 077
 export LC_ALL=C
 
@@ -30,16 +34,27 @@ port=${DEPLOY_SSH_PORT:-22}
 [[ $VERCEL_ORG_ID =~ ^[a-zA-Z0-9_]+$ && $VERCEL_PROJECT_ID =~ ^prj_[a-zA-Z0-9]+$ ]] ||
   fail 'Vercel 项目标识无效。'
 if ! node -e '
-  const [api, web] = process.argv.slice(1).map(value => {
+  const [api, web, media] = process.argv.slice(1).filter(Boolean).map(value => {
     const url = URL.parse(value);
     if (url?.protocol !== "https:" || url.origin !== value || !/^[a-z0-9.-]+$/.test(url.hostname)) {
       process.exit(1);
     }
     return url;
   });
-  if (api.origin === web.origin || web.port) process.exit(1);
-' "$API_ORIGIN" "$WEB_ORIGIN"; then
-  fail '两个 HTTPS Origin 必须不同，网页 Origin 使用标准 HTTPS 端口。'
+  if (api.origin === web.origin || web.port ||
+      (media && [api.origin, web.origin].includes(media.origin))) process.exit(1);
+' "$API_ORIGIN" "$WEB_ORIGIN" "${MEDIA_ORIGIN:-}"; then
+  fail 'HTTPS Origin 必须彼此不同，网页 Origin 使用标准 HTTPS 端口。'
+fi
+ci_r2=0
+if [[ -n ${r2_values[0]}${r2_values[1]}${r2_values[2]}${r2_values[3]} ]]; then
+  [[ -n ${MEDIA_ORIGIN:-} && -n ${r2_values[0]} && -n ${r2_values[1]} &&
+     -n ${r2_values[2]} && -n ${r2_values[3]} ]] || fail 'CI 的 R2 后台配置必须完整。'
+  [[ ${r2_values[0]} =~ ^[0-9a-f]{32}$ && ${r2_values[1]} =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ &&
+     ${r2_values[2]} =~ ^[A-Za-z0-9_+/=-]+$ &&
+     ${r2_values[3]} =~ ^[A-Za-z0-9_+/=-]+$ ]] &&
+    (( ${#r2_values[2]} <= 256 && ${#r2_values[3]} <= 256 )) || fail 'CI 的 R2 后台配置格式无效。'
+  ci_r2=1
 fi
 web_host=${WEB_ORIGIN#https://}
 work=$(mktemp -d)
@@ -86,6 +101,14 @@ grep -Fq "name=\"watch-release\" content=\"$RELEASE_SHA\"" "$index" 2>/dev/null 
   fail 'Vercel 产物缺少通过验证的提交标识。'
 [[ -s $player_asset ]] || fail 'Vercel 产物缺少播放器脚本。'
 
+media_origin_allowed() {
+  grep -F '<meta http-equiv="Content-Security-Policy" content="' "$1" |
+    grep -F "media-src $API_ORIGIN $MEDIA_ORIGIN\">" >/dev/null
+}
+if [[ -n ${MEDIA_ORIGIN:-} ]]; then
+  media_origin_allowed "$index" || fail 'Vercel 产物未允许配置的 R2 媒体源。'
+fi
+
 curl_request() {
   curl --disable --silent --show-error --connect-timeout 10 --max-time 20 "$@" 2>/dev/null
 }
@@ -128,6 +151,13 @@ printf '%s\n' 'Vercel 正式域名配置检查与候选网页部署'
   jq -e '.verified == true and .redirect == null and .gitBranch == null' \
     "$work/vercel-response" >/dev/null 2>&1 || fail 'Vercel 正式域名未验证或未绑定到项目的生产环境。'
 prior=$(active_web) || fail '无法读取上一个正式网页部署。'
+if [[ $ci_r2 == 1 ]]; then
+  # A failed promotion restores this page while the new backend remains active.
+  [[ -n $prior && $(curl_request -H 'Cache-Control: no-cache' -o "$work/prior-page" \
+    -w '%{http_code}' "$WEB_ORIGIN/") == 200 ]] &&
+    media_origin_allowed "$work/prior-page" ||
+    fail '正式网页尚未允许 R2 媒体源。请先只配置 MEDIA_ORIGIN 并发布网页。'
+fi
 staged=$("${vercel_cli[@]}" deploy --prebuilt --prod --skip-domain --yes --token "$VERCEL_TOKEN" 2>/dev/null) ||
   fail 'Vercel 候选网页部署失败，正式域名保持原版本。'
 [[ $staged =~ ^https://[a-zA-Z0-9-]+\.vercel\.app$ ]] || fail 'Vercel 候选网页地址无效。'
@@ -145,18 +175,63 @@ staged_id=$(jq -er --arg project "$VERCEL_PROJECT_ID" \
   fail '候选网页不属于配置的项目或未就绪。'
 
 current_main
-remote_command='set -eu
+if [[ $ci_r2 == 1 && $(active_web) != "$prior" ]]; then
+  fail '正式网页部署已变化，未启用 CI 的 R2 配置。'
+fi
+remote_command='set +x
+  set -eu
   umask 077
   root="$HOME/.local/share/bili-watch-party-deploy"
-  mkdir -p "$root/releases"
+  private_dir() {
+    [[ -d $1 && ! -L $1 && -O $1 &&
+       $(stat -c "%a" "$1" 2>/dev/null || stat -f "%Lp" "$1" 2>/dev/null) == 700 ]]
+  }
+  IFS= read -r ci_r2
+  case "$ci_r2" in
+    0) ;;
+    1)
+      unset r2_media_origin r2_account r2_bucket r2_access r2_secret
+      IFS= read -r r2_media_origin
+      IFS= read -r r2_account
+      IFS= read -r r2_bucket
+      IFS= read -r r2_access
+      IFS= read -r r2_secret
+      ;;
+    *) exit 1 ;;
+  esac
+  if [[ $ci_r2 == 1 ]]; then
+    mkdir -p "$root"
+    private_dir "$root" || { echo "后台发布根目录须由部署账号拥有且权限为 0700。"; exit 1; }
+    mkdir -p "$root/releases" "$root/r2-config"
+    private_dir "$root/releases" || { echo "后台源码目录须由部署账号拥有且权限为 0700。"; exit 1; }
+    private_dir "$root/r2-config" || { echo "后台 R2 配置目录须由部署账号拥有且权限为 0700。"; exit 1; }
+    [[ ! -L $root/deploy.lock && ( ! -e $root/deploy.lock || ( -f $root/deploy.lock && -O $root/deploy.lock ) ) ]] ||
+      { echo "后台发布锁文件无效。"; exit 1; }
+  else
+    mkdir -p "$root/releases"
+  fi
   exec 9>"$root/deploy.lock"
   flock -w 120 9 || { echo "后台发布锁超时。"; exit 1; }
   dir=$(mktemp -d "$root/releases/$1.XXXXXXXX")
   # Keep tracked source readable by the image user inside the private host directory.
   tar -xpf - -C "$dir"
-  bash "$dir/scripts/deploy-backend.sh" "$dir" "$@"'
-"${ssh_command[@]}" "bash -c '$remote_command' bash $RELEASE_SHA $API_ORIGIN $WEB_ORIGIN" \
-  <"$work/backend.tar" 2>"$work/ssh-error" || fail '后台部署失败，正式网页未切换。'
+  r2_file=
+  if [[ $ci_r2 == 1 ]]; then
+    r2_file="$root/r2-config/${dir##*/}.env"
+    (set -o noclobber; printf "%s\n" "MEDIA_ORIGIN=$r2_media_origin" "R2_ACCOUNT_ID=$r2_account" \
+      "R2_BUCKET=$r2_bucket" "R2_ACCESS_KEY_ID=$r2_access" "R2_SECRET_ACCESS_KEY=$r2_secret" >"$r2_file")
+    : >"$dir/.ci-r2"
+    unset r2_media_origin r2_account r2_bucket r2_access r2_secret
+  fi
+  bash "$dir/scripts/deploy-backend.sh" "$dir" "$@" "$r2_file"'
+{
+  printf '%s\n' "$ci_r2"
+  if [[ $ci_r2 == 1 ]]; then
+    printf '%s\n' "$MEDIA_ORIGIN" "${r2_values[@]}"
+  fi
+  cat "$work/backend.tar"
+} | "${ssh_command[@]}" "bash -c '$remote_command' bash $RELEASE_SHA $API_ORIGIN $WEB_ORIGIN" \
+  2>"$work/ssh-error" || fail '后台部署失败，正式网页未切换。'
 
 check_backend() {
   local status

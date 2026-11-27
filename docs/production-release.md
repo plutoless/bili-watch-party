@@ -25,7 +25,11 @@ PR 合入 `main` 后，Actions 测试并构建确切的合并 SHA。生产作业
 | Secret | `VERCEL_AUTOMATION_BYPASS_SECRET` | 可选，供 HTTPS 检查访问受保护的候选网页 |
 | Variable | `VERCEL_ORG_ID`、`VERCEL_PROJECT_ID` | Vercel 账号或团队 ID，以及网页项目 ID |
 | Variable | `API_ORIGIN`、`WEB_ORIGIN` | Vultr 的后台 HTTPS Origin、Vercel 的正式网页 HTTPS Origin |
-| Variable | `MEDIA_ORIGIN` | 可选。R2 公开媒体 HTTPS Origin，用于网页的媒体来源限制。桶级凭据只配置在 Vultr。参见 [R2 公开媒体](r2-media.md)。 |
+| Variable | `MEDIA_ORIGIN` | 可选。R2 公开媒体 HTTPS Origin，用于网页的媒体来源限制。启用 CI 的 R2 后台配置时必填。 |
+| Variable | `R2_ACCOUNT_ID`、`R2_BUCKET` | 可选。CI 要配置的 R2 账号 ID 和本应用的成品媒体专用桶。 |
+| Secret | `R2_ACCESS_KEY_ID`、`R2_SECRET_ACCESS_KEY` | 可选。仅限该桶的写入凭据，通过已校验主机身份的 SSH 传给 Vultr，仅 app 容器使用。 |
+
+CI 的 R2 后台配置由两项 R2 Variable 和两项 R2 Secret 组成。四项均留空时，后台沿用主机的 `compose.env`。填写任一项时，四项和 `MEDIA_ORIGIN` 都必填。先按 [R2 公开媒体](r2-media.md#应用配置) 发布支持媒体域的网页，再配置后台。
 
 ## 失败与恢复
 
@@ -33,18 +37,33 @@ PR 合入 `main` 后，Actions 测试并构建确切的合并 SHA。生产作业
 - **测试、候选网页或后台镜像构建失败。** 原容器和正式网页继续服务。修正问题后显式运行当前 `main`。Actions 只记录 SHA、阶段和结果。需要细节时在服务器或私有终端重现该阶段。
 - **Compose 或后台 HTTPS 失败。** 正式网页仍指向之前的部署。检查服务器上的 Compose 状态、Caddy 证书和本地日志，修正后重试。若需尽快恢复且卷格式兼容，在发布停止时进入上一次健康 SHA 对应的 `~/.local/share/bili-watch-party-deploy/releases/<SHA>.<后缀>/`，使用同一服务器配置和项目名重启保存的镜像。第一次接管旧实例而旧版本没有发布 SHA 时，回到原源码目录，用原项目名、配置和原 Compose 启动命令恢复。
 
+  在执行 Compose 前，确认旧镜像理解现有房间的媒体配置。若当前或失败的发布已启用 R2 并可能发布成品，必须保留可读取这些成品的媒体域、桶和有效凭据。首次启用后的回退可能需要使用新发布的私有配置文件，即使选中的旧版本此前没有该文件。仅在旧发布没有 `.ci-r2` 标记且已确认主机 `compose.env` 与相关房间兼容时，将 `R2_ROLLBACK_CONFIG` 设为 `host`。否则将其设为已核验的私有配置文件绝对路径，再运行下方命令。无法确认兼容性时暂停回退，先核查或恢复兼容配置。
+
   ```bash
   export COMPOSE_PROJECT_NAME=$(cat "$HOME/.config/bili-watch-party/compose-project")
   export RELEASE_SHA='<上一次健康后台的完整 SHA>'
-  docker compose --project-name "$COMPOSE_PROJECT_NAME" \
-    --env-file "$HOME/.config/bili-watch-party/compose.env" \
+  env_files=(--env-file "$HOME/.config/bili-watch-party/compose.env")
+  # R2_ROLLBACK_CONFIG 由操作者在运行前确认。值为 host 或已验证的私有配置文件绝对路径。
+  : "${R2_ROLLBACK_CONFIG:?请先确认兼容现有房间的后台配置}"
+  unset MEDIA_ORIGIN R2_ACCOUNT_ID R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
+  if [[ $R2_ROLLBACK_CONFIG == host ]]; then
+    [[ ! -e .ci-r2 ]] || exit 1
+  else
+    r2_dir=${R2_ROLLBACK_CONFIG%/*}
+    private_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+    [[ $R2_ROLLBACK_CONFIG == /* && -f $R2_ROLLBACK_CONFIG && ! -L $R2_ROLLBACK_CONFIG &&
+       -O $R2_ROLLBACK_CONFIG && $(private_mode "$R2_ROLLBACK_CONFIG") == 600 &&
+       -d $r2_dir && ! -L $r2_dir && -O $r2_dir && $(private_mode "$r2_dir") == 700 ]] || exit 1
+    env_files+=(--env-file "$R2_ROLLBACK_CONFIG")
+  fi
+  docker compose --project-name "$COMPOSE_PROJECT_NAME" "${env_files[@]}" \
     -f compose.yaml -f compose.release.yaml \
     up -d --no-build --pull never --force-recreate --wait
   ```
 
 - **Vercel 切换失败。** 流水线尝试将此前的网页部署重新设为生产，并核对正式域名。通过检查的新后台继续服务旧网页。若恢复未获确认，在 Vercel 查看生产域名的当前指向，将此前兼容的生产部署重新设为生产并验证 HTTPS。首次发布没有旧网页时，检查正式域名是否已切换，修复 DNS、证书或部署后重试。若人工恢复后台，确保它兼容当前正式网页。
 
-发布目录和镜像供故障恢复使用。清理前在服务器核对正在运行的 Compose 容器、Caddy 的挂载来源和上一个健康版本，保留对应目录及镜像。日常升级和恢复均保留持久卷。
+CI 的 R2 配置保存在 Vultr 的私有 `r2-config` 目录。发布根目录、`releases` 和 `r2-config` 均由部署账号所有且权限为 `0700`。文件与发布目录同名并加 `.env` 后缀，权限为 `0600`。使用过 CI R2 的发布目录保留 `.ci-r2` 标记。保留恢复所需文件，并确认选中的配置仍能访问现有房间使用的媒体域和桶。发布目录、对应的私有配置和镜像供故障恢复使用。清理前在服务器核对正在运行的 Compose 容器、Caddy 的挂载来源和上一个健康版本，保留对应目录、私有配置及镜像。日常升级和恢复均保留持久卷。
 
 ## 隔离验收与首次生产记录
 
