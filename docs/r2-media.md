@@ -37,19 +37,21 @@
 
 ## 应用配置
 
-先把 `MEDIA_ORIGIN=https://media-watch.example.org` 加入自动发布的 `production` 环境 **Variable**，或加入手动 Vercel 构建的 Production 环境变量。发布能加载该媒体域的网页后，再启用 Vultr 的 R2 导入。此顺序使后台先行升级期间，正在使用旧网页的人可以继续播放本地媒体。
+先在 [正常发布流程](production-release.md) 的 GitHub Actions `production` 环境 Variable 设置 `MEDIA_ORIGIN`。手动 Vercel 构建可使用其 Production 环境变量。确认已发布网页的 CSP 允许该媒体域，再启用 Vultr 的 R2 导入。
 
-在 Vultr 上已有的私有 `compose.env` 设置以下五项，并沿用现有的房间数据卷和 HTTPS Origin。服务器配置文件保持在仓库之外，权限为 `0600`。
+Vultr 的后台设置可使用已有私有 `compose.env`（`0600`），也可由 GitHub Actions 的 `production` 环境提供。通过 CI 启用时按下表配置。CI 将后台参数通过已校验主机身份的 SSH 送到 Vultr，以独立的私有配置补充 Compose，仅 app 容器获得这些值。原 `compose.env` 保持原样。
 
-| 配置 | 值 |
-| --- | --- |
-| `MEDIA_ORIGIN` | 正式媒体 HTTPS Origin，无结尾斜杠，与网页和后台 Origin 不同 |
-| `R2_ACCOUNT_ID` | 建桶账号 ID |
-| `R2_BUCKET` | 专用桶名称 |
-| `R2_ACCESS_KEY_ID` | 仅部署在 Vultr 的桶级 S3 Access Key ID |
-| `R2_SECRET_ACCESS_KEY` | 仅部署在 Vultr 的桶级 S3 Secret Access Key |
+| 配置 | CI 输入 | 值 |
+| --- | --- | --- |
+| `MEDIA_ORIGIN` | Variable | 与网页和后台 Origin 都不同的媒体 HTTPS Origin，无结尾斜杠 |
+| `R2_ACCOUNT_ID` | Variable | 建桶账号 ID |
+| `R2_BUCKET` | Variable | 专用桶名称 |
+| `R2_ACCESS_KEY_ID` | Secret | 桶级 S3 Access Key ID |
+| `R2_SECRET_ACCESS_KEY` | Secret | 桶级 S3 Secret Access Key |
 
-五项均留空时，新导入继续使用原来的受保护本地媒体。已有本地媒体仍从后台读取。启用 R2 后，保留同一个专用桶及其媒体域配置，直到相应房间结束。上传重试保留待发布 MP4，成功后清理本地成品。结束失败的房间后，待发布 MP4 随服务器现有的房间文件保留期清理。当前在线房间发现 R2 对象已删除后，房主可以在原房间选择「重新导入」。重新导入产生新地址，原地址继续失效。
+首次通过 CI 启用时，先只配置 `MEDIA_ORIGIN` 并发布，核对正式网页的 CSP。随后补齐四项 R2 后台输入，再运行当前 `main` 的 **Release production**。正式网页尚未允许同一媒体域时，发布脚本不会启用 CI 的 R2 后台配置。四项后台 CI 输入均留空时保留主机设置。移除已启用的 CI 配置前，先核对主机已接管同一媒体域和桶，或等待相关房间结束。
+
+后台五项 R2 设置均留空时，新导入继续使用原来的受保护本地媒体。已有本地媒体仍从后台读取。启用 R2 后，保留同一个专用桶及其媒体域配置，直到相应房间结束。上传重试保留待发布 MP4，成功后清理本地成品。结束失败的房间后，待发布 MP4 随服务器现有的房间文件保留期清理。当前在线房间发现 R2 对象已删除后，房主可以在原房间选择「重新导入」。重新导入产生新地址，原地址继续失效。
 
 ## 验收
 

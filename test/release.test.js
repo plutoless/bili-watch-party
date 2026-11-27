@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { chmodSync, copyFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -24,7 +24,9 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
     cpSync(file, join(repo, file), { recursive: true });
   }
   writeFileSync(join(conf, 'compose-project'), 'existing-project\n');
-  writeFileSync(join(conf, 'compose.env'), 'HOST_PASSWORD=synthetic-password\n');
+  const composeEnv = join(conf, 'compose.env');
+  const hostSettings = 'HOST_PASSWORD=synthetic-password\nENDED_ROOM_RETENTION_HOURS=48\n';
+  writeFileSync(composeEnv, hostSettings);
   const git = (...args) => execFileSync('git', args, { cwd: repo, encoding: 'utf8' }).trim();
   git('init', '-q', '-b', 'main');
   git('config', 'user.name', 'Fixture');
@@ -50,6 +52,7 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
     DEPLOY_SSH_HOST: sshHost, DEPLOY_SSH_USER: 'fixture', DEPLOY_SSH_KEY: 'synthetic-ssh-key',
     DEPLOY_SSH_KNOWN_HOSTS: sshHost + ' ' + hostKey, DEPLOY_SSH_PORT: '',
     API_ORIGIN: 'https://api.fixture.test', WEB_ORIGIN: 'https://web.fixture.test', MEDIA_ORIGIN: '',
+    R2_ACCOUNT_ID: '', R2_BUCKET: '', R2_ACCESS_KEY_ID: '', R2_SECRET_ACCESS_KEY: '',
     VERCEL_ORG_ID: 'team_fixture', VERCEL_PROJECT_ID: 'prj_fixture', VERCEL_TOKEN: 'synthetic-vercel-token',
     VERCEL_AUTOMATION_BYPASS_SECRET: '',
   };
@@ -57,16 +60,21 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   const readState = () => JSON.parse(readFileSync(stateFile, 'utf8'));
   function release(sha, failure, expected, variables = {}) {
     writeFileSync(stateFile, JSON.stringify({ ...readState(), stages: [], failure }));
-    const result = spawnSync('bash', ['scripts/release.sh'], {
+    const result = spawnSync('bash', ['-x', 'scripts/release.sh'], {
       cwd: repo, env: { ...env, RELEASE_SHA: sha, ...variables }, encoding: 'utf8',
     });
     const output = result.stdout + result.stderr;
+    assert.equal(/synthetic-ssh-key|synthetic-vercel-token|synthetic-password|synthetic-r2-/.test(output), false,
+      'Release output must exclude credential values');
     assert.equal(result.status, expected ? 1 : 0, output);
     if (expected) assert.match(output, expected);
-    assert.doesNotMatch(output, /synthetic-ssh-key|synthetic-vercel-token|synthetic-password/);
+    assert.equal(readFileSync(composeEnv, 'utf8'), hostSettings);
     return readState();
   }
   assert.deepEqual(release(first, '', /缺少生产发布配置 VERCEL_TOKEN/, { VERCEL_TOKEN: '' }).stages, []);
+  assert.deepEqual(release(first, '', /R2.*完整/, {
+    MEDIA_ORIGIN: 'https://media.fixture.test', R2_BUCKET: 'fixture-finished-media',
+  }).stages, []);
   assert.deepEqual(release(first, '', /主机密钥配置/, { DEPLOY_SSH_PORT: '2222' }).stages, []);
   assert.deepEqual(release(first, 'host-key', /主机密钥校验失败/).stages, ['ssh-offline']);
   assert.deepEqual(release(first, 'ssh-offline', /SSH 不可达/).stages, ['ssh-offline']);
@@ -81,6 +89,7 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   let state = release(first);
   assert.equal(state.liveId, 'dpl_' + first);
   assert.equal(state.backend, first);
+  assert.equal(state.r2EnvFile, null);
   assert.ok(state.stages.indexOf('backend-https') < state.stages.indexOf('promote'));
 
   const second = advance();
@@ -96,12 +105,96 @@ test('production release on isolated Git, SSH, Compose and Vercel command bounda
   assert.equal(release(second, '', undefined, custom).liveId, 'dpl_' + second);
 
   const third = advance();
-  state = release(third, '', undefined, { VERCEL_ORG_ID: "account_fixture", MEDIA_ORIGIN: 'https://media.fixture.test' });
+  const mediaOrigin = 'https://media.fixture.test';
+  const r2 = {
+    MEDIA_ORIGIN: mediaOrigin, R2_ACCOUNT_ID: '0123456789abcdef0123456789abcdef',
+    R2_BUCKET: 'fixture-finished-media', R2_ACCESS_KEY_ID: 'synthetic-r2-access+id',
+    R2_SECRET_ACCESS_KEY: 'synthetic-r2-secret/with=padding',
+  };
+  assert.deepEqual(release(third, '', /R2.*格式无效/, { ...r2,
+    R2_SECRET_ACCESS_KEY: 'synthetic-r2-invalid\nOVERRIDE=value',
+  }).stages, []);
+  state = release(third, '', /正式网页尚未允许 R2 媒体源/, r2);
+  assert.equal(state.backend, second);
+  assert.ok(!state.stages.includes('backend-build') && !state.stages.includes('stage-web'));
+
+  assert.equal(release(third, 'missing-media-csp', /Vercel 产物未允许/, { MEDIA_ORIGIN: mediaOrigin }).backend, second);
+  state = release(third, '', undefined, { VERCEL_ORG_ID: 'account_fixture', MEDIA_ORIGIN: mediaOrigin });
   assert.equal(state.liveId, 'dpl_' + third);
+  assert.equal(state.r2EnvFile, null);
   assert.match(state.pages[state.liveId], /media-src https:\/\/api\.fixture\.test https:\/\/media\.fixture\.test/);
+
+  const beforeActivation = state;
+  const fourth = advance();
+  // The backend may have published with its new configuration before HTTPS failed.
+  state = release(fourth, 'backend-https', /后台 HTTPS.*未切换/, r2);
+  assert.equal(state.backend, fourth);
+  assert.equal(state.liveId, 'dpl_' + third);
+  const { r2EnvFile: activationEnv, backendDir: activationDir } = state;
+  assert.ok(existsSync(join(activationDir, '.ci-r2')));
+  assert.ok(!existsSync(join(beforeActivation.backendDir, '.ci-r2')));
+  const releases = dirname(activationDir);
+  const releaseRoot = dirname(releases);
+  const lock = join(releaseRoot, 'deploy.lock');
+  writeFileSync(lock, 'existing fixture lock');
+  chmodSync(releaseRoot, 0o755);
+  state = release(fourth, '', /发布根目录.*0700/, r2);
+  assert.ok(!state.stages.includes('backend-build'));
+  assert.equal(readFileSync(lock, 'utf8'), 'existing fixture lock');
+  chmodSync(releaseRoot, 0o700);
+  chmodSync(releases, 0o755);
+  state = release(fourth, '', /后台源码目录.*0700/, r2);
+  assert.ok(!state.stages.includes('backend-build'));
+  chmodSync(releases, 0o700);
+  chmodSync(dirname(activationEnv), 0o755);
+  state = release(fourth, '', /R2 配置目录.*0700/, r2);
+  assert.ok(!state.stages.includes('backend-build'));
+  chmodSync(dirname(activationEnv), 0o700);
+  const recoveryBlock = readFileSync('docs/production-release.md', 'utf8').match(/  ```bash\n([\s\S]+?)  ```/)[1];
+  const recover = (config, directory = beforeActivation.backendDir, sha = third) => {
+    const recovery = recoveryBlock.replace('<上一次健康后台的完整 SHA>', sha);
+    return spawnSync('bash', ['-c', 'set -eo pipefail\n' + recovery], {
+      cwd: directory, encoding: 'utf8', env: {
+        ...env, ...r2, HOME: home, R2_ROLLBACK_CONFIG: config,
+      },
+    });
+  };
+  assert.equal(recover('').status, 1);
+  assert.equal(recover('host', activationDir, fourth).status, 1);
+  assert.equal(recover(activationEnv + '.missing', activationDir, fourth).status, 1);
+  assert.equal(readState().backend, fourth);
+  writeFileSync(stateFile, JSON.stringify({ ...readState(), failure: '', rollbackEnvFile: activationEnv }));
+  const restored = recover(activationEnv);
+  assert.equal(restored.status, 0, restored.stdout + restored.stderr);
+  assert.equal(readState().backend, third);
+  assert.equal(readState().r2EnvFile, activationEnv);
+  const restoredHost = recover('host');
+  assert.equal(restoredHost.status, 0, restoredHost.stdout + restoredHost.stderr);
+  assert.equal(readState().r2EnvFile, null);
+  writeFileSync(stateFile, JSON.stringify({ ...readState(), rollbackEnvFile: null }));
+
+  state = release(fourth, 'live-https', /上一个正式网页部署已恢复/, r2);
+  assert.equal(state.backend, fourth);
+  assert.equal(state.liveId, 'dpl_' + third);
+  assert.ok(state.stages.indexOf('check-current-web') < state.stages.indexOf('backend-build'));
+  const overlayContents = Object.entries(r2).map(([key, value]) => key + '=' + value + '\n').join('');
+  const rollbackFile = state.r2EnvFile;
+  assert.equal(statSync(rollbackFile).mode & 0o777, 0o600);
+  assert.equal(readFileSync(rollbackFile, 'utf8') === overlayContents, true, 'App overlay must match the input');
+  assert.ok(!state.pages[state.liveId].includes('synthetic-r2-'));
+
+  state = release(fourth, '', undefined, r2);
+  assert.equal(state.liveId, 'dpl_' + fourth);
+  assert.notEqual(state.r2EnvFile, rollbackFile);
+  assert.equal(readFileSync(state.r2EnvFile, 'utf8') === overlayContents, true);
+  assert.equal(readFileSync(rollbackFile, 'utf8') === overlayContents, true);
+  assert.ok(!state.pages[state.liveId].includes('synthetic-r2-'));
+
+  state = release(fourth, '', undefined, { MEDIA_ORIGIN: mediaOrigin });
+  assert.equal(state.r2EnvFile, null);
   git('checkout', '-q', '--detach', second);
   state = release(second);
-  assert.equal(state.liveId, 'dpl_' + third);
-  assert.equal(state.backend, third);
+  assert.equal(state.liveId, 'dpl_' + fourth);
+  assert.equal(state.backend, fourth);
   assert.deepEqual(state.stages, []);
 });

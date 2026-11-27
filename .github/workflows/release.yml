@@ -69,6 +69,10 @@ jobs:
           DEPLOY_SSH_PORT: ${{ vars.DEPLOY_SSH_PORT }}
           API_ORIGIN: ${{ vars.API_ORIGIN }}
           MEDIA_ORIGIN: ${{ vars.MEDIA_ORIGIN }}
+          R2_ACCOUNT_ID: ${{ vars.R2_ACCOUNT_ID }}
+          R2_BUCKET: ${{ vars.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           WEB_ORIGIN: ${{ vars.WEB_ORIGIN }}
           VERCEL_ORG_ID: ${{ vars.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ vars.VERCEL_PROJECT_ID }}
