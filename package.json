@@ -2,13 +2,13 @@
   "name": "bili-watch-party",
   "version": "1.0.0",
   "scripts": {
-    "test": "node --test test/host.test.js test/player.test.js",
+    "test": "node --test test/host.test.js test/player.test.js test/browser-failure.test.js test/native-range-observer.test.js test/playback-stability.test.js test/paused-status-browser.test.js",
     "start": "node src/server.js",
     "build:web": "node scripts/build-web.js",
     "test:browser": "node test/live-browser.js",
     "test:release": "node --test test/release.test.js",
     "test:release:compose": "bash test/compose-release.sh",
-    "check": "node --check src/server.js && node --check src/importer.js && node --check src/rooms.js && node --check src/admission.js && node --check src/playback.js && node --check public/app.js && node --check public/player.js && node --check scripts/build-web.js && bash -n scripts/release.sh && bash -n scripts/deploy-backend.sh && bash -n test/compose-release.sh"
+    "check": "node --check src/server.js && node --check src/importer.js && node --check src/rooms.js && node --check src/admission.js && node --check src/playback.js && node --check src/r2-media.js && node --check public/app.js && node --check public/player.js && node --check scripts/build-web.js && bash -n scripts/release.sh && bash -n scripts/deploy-backend.sh && bash -n test/compose-release.sh"
   },
   "type": "module",
   "engines": {
@@ -19,6 +19,7 @@
   },
   "private": true,
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1175.0",
     "xgplayer": "3.0.27"
   }
 }

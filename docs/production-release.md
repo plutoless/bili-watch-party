@@ -25,6 +25,7 @@ PR 合入 `main` 后，Actions 测试并构建确切的合并 SHA。生产作业
 | Secret | `VERCEL_AUTOMATION_BYPASS_SECRET` | 可选，供 HTTPS 检查访问受保护的候选网页 |
 | Variable | `VERCEL_ORG_ID`、`VERCEL_PROJECT_ID` | Vercel 账号或团队 ID，以及网页项目 ID |
 | Variable | `API_ORIGIN`、`WEB_ORIGIN` | Vultr 的后台 HTTPS Origin、Vercel 的正式网页 HTTPS Origin |
+| Variable | `MEDIA_ORIGIN` | 可选。R2 公开媒体 HTTPS Origin，用于网页的媒体来源限制。桶级凭据只配置在 Vultr。参见 [R2 公开媒体](r2-media.md)。 |
 
 ## 失败与恢复
 

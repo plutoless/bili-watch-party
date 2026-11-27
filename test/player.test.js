@@ -8,10 +8,10 @@ import { createPlayback } from '../src/playback.js';
 
 const playerSource = readFileSync(new URL('../public/player.js', import.meta.url), 'utf8')
   .replaceAll('export function ', 'function ')
-  .replace('    load(url) {', '    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(url) {');
+  .replace('  return {\n    load(', '  return {\n    measure() { return { offset, target: positionAt(performance.now() + offset) }; },\n    load(');
 
-function roomFixture() {
-  const room = createPlayback(120);
+function roomFixture({ publicMedia = false, duration = 120 } = {}) {
+  const room = createPlayback(duration);
   const timers = new Set();
   const saved = { host: new Map(), visitor: new Map() };
   let now = 1000;
@@ -68,8 +68,9 @@ function roomFixture() {
     let position = 0;
     let updatedAt = now;
     let rate = 1;
+    const seeks = [];
     Object.assign(video, {
-      duration: 120, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
+      duration, HAVE_METADATA: 1, HAVE_CURRENT_DATA: 2, HAVE_FUTURE_DATA: 3,
       readyState: 4, seeking: false, paused: true, src: '',
       hasAttribute() { return Boolean(this.src); },
       getAttribute() { return this.src; },
@@ -81,7 +82,7 @@ function roomFixture() {
     Object.defineProperties(video, {
       currentTime: {
         get: () => position + (video.paused ? 0 : (now - updatedAt) * rate / 1000),
-        set: seconds => { position = seconds; updatedAt = now; },
+        set: seconds => { seeks.push(seconds); position = seconds; updatedAt = now; },
       },
       playbackRate: {
         get: () => rate,
@@ -176,8 +177,8 @@ function roomFixture() {
     const player = runInNewContext(playerSource + '\ncreatePlayer', context)({
       apiOrigin: '', roomPath: '/rooms/synthetic', role,
     });
-    player.load('/media/synthetic.mp4');
-    return { player, video, element };
+    player.load(publicMedia ? 'https://media.fixture.test/synthetic.mp4' : '/media/synthetic.mp4', publicMedia);
+    return { player, video, element, seeks };
   }
 
   let host = open('host');
@@ -219,6 +220,48 @@ function roomFixture() {
     snapshot() { return room.update({ role: 'host', action: 'observe', playerId: randomUUID() }, now).state; },
   };
 }
+
+test('the host can still end the room when a naturally ended public video expires', async () => {
+  const app = roomFixture({ publicMedia: true, duration: 6 });
+  const { player, element, video } = app.host;
+  await app.start();
+  await app.advance(6500);
+  assert.equal(app.snapshot().ended, true);
+  assert.equal(element('end-room').hidden, true);
+  assert.equal(element('player').hidden, false);
+  assert.equal(element('end-after-playback').hidden, false);
+
+  // The room view stops the player when the expired room has no media URL.
+  player.stop();
+  assert.equal(video.src, '');
+  assert.equal(element('player').hidden, true);
+  assert.equal(element('end-room').hidden, false, 'the host can still end the expired room from management');
+
+  player.load('https://media.fixture.test/reimported.mp4', true);
+  assert.equal(element('player').hidden, false);
+  assert.equal(video.crossOrigin, 'anonymous');
+  assert.equal(element('end-after-playback').hidden, true, 'reimport must not reveal the previous playback end control');
+  assert.equal(element('end-room').hidden, false);
+});
+
+test('a naturally ended public video can still replay from zero', async () => {
+  const app = roomFixture({ publicMedia: true, duration: 6 });
+  await app.start();
+  await app.advance(6500);
+  assert.equal(app.snapshot().ended, true);
+  const play = app.host.element('play');
+  assert.equal(play.textContent, '重播');
+  play.dispatchEvent(new Event('click'));
+  await app.advance(2000);
+  assert.equal(app.snapshot().ended, false);
+  assert.equal(app.snapshot().position, 0);
+  for (const { video } of [app.host, app.visitor]) {
+    assert.equal(video.paused, false);
+    assert.ok(video.currentTime > 0.25 && video.currentTime < 2);
+  }
+  assert.equal(app.host.element('end-room').hidden, false);
+  assert.equal(app.host.element('end-after-playback').hidden, true);
+});
 
 for (const direction of [-1, 1]) {
   test('opposing 0.31 second errors converge when the host is ' + (direction > 0 ? 'ahead' : 'behind'), async t => {
@@ -1017,4 +1060,71 @@ test('v3 buffering recovery waits for an in-flight Ready acknowledgment', async 
   await app.advance(150);
   assert.equal(reloads, 0);
   assert.equal(app.snapshot().ready.host, true);
+});
+
+for (const direction of [-1, 1]) {
+  test('public media corrects opposing 0.31 second errors at 1x with the host ' +
+      (direction > 0 ? 'ahead' : 'behind'), async t => {
+    const app = roomFixture({ publicMedia: true });
+    await app.start();
+    const { host, visitor } = app;
+    const gap = () => Math.abs(host.video.currentTime - visitor.video.currentTime);
+    host.video.currentTime += direction * 0.31;
+    visitor.video.currentTime -= direction * 0.31;
+    assert.ok(Math.abs(gap() - 0.62) < 0.001);
+    const initialSeeks = [host.seeks.length, visitor.seeks.length];
+
+    await app.advance(1500);
+    const samples = [];
+    for (let i = 0; i < 100; i++) {
+      samples.push(gap());
+      for (const player of [host, visitor]) {
+        assert.equal(player.video.playbackRate, 1);
+        assert.equal(player.video.paused, false);
+      }
+      await app.advance(100);
+    }
+    const clear = samples.filter(value => value < 0.5).length;
+    const result = clear + '/100 below 0.5 s, max ' + Math.max(...samples).toFixed(3) + ' s';
+    t.diagnostic(result);
+    assert.ok(clear >= 95, result);
+    assert.deepEqual([host.seeks.length, visitor.seeks.length],
+      initialSeeks.map(seeks => seeks + 1), 'Neither player repeats a settled correction');
+  });
+}
+
+test('public media corrects sustained moderate drift in either direction at 1x', async () => {
+  const app = roomFixture({ publicMedia: true });
+  await app.start();
+  const { video, seeks } = app.visitor;
+  for (const offset of [0.70, -0.70]) {
+    video.currentTime = app.host.video.currentTime + offset;
+    const initialSeeks = seeks.length;
+    await app.advance(1000);
+    const difference = Math.abs(app.host.video.currentTime - video.currentTime);
+    assert.ok(difference < 0.5, 'Sustained public drift must converge below 0.5 s, observed ' + difference);
+    assert.equal(video.playbackRate, 1);
+    assert.equal(seeks.length, initialSeeks + 1, 'Each sustained displacement needs one corrective seek');
+
+    await app.advance(2300);
+    assert.equal(seeks.length, initialSeeks + 1, 'A settled displacement must not cause repeat seeks');
+    assert.equal(video.playbackRate, 1);
+  }
+});
+
+test('public media leaves brief or reversing moderate drift at 1x without seeking', async () => {
+  const app = roomFixture({ publicMedia: true });
+  await app.start();
+  const { video, seeks } = app.visitor;
+  for (const offset of [0.70, -0.70, 0.70, -0.70]) {
+    video.currentTime = app.host.video.currentTime + offset;
+    const initialSeeks = seeks.length;
+    await app.advance(200);
+    assert.equal(seeks.length, initialSeeks, 'A short deviation should not trigger a correction');
+    assert.equal(video.playbackRate, 1);
+  }
+  video.currentTime = app.host.video.currentTime;
+  const finalSeeks = seeks.length;
+  await app.advance(2000);
+  assert.equal(seeks.length, finalSeeks);
 });

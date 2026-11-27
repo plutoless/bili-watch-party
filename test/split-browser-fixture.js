@@ -5,18 +5,29 @@ import { createServer } from 'node:https';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-export async function startSplitFixture(directory) {
+export async function createLoopbackTls(directory) {
+  const key = join(directory, 'key.pem');
+  const cert = join(directory, 'cert.pem');
+  execFileSync('openssl', ['req', '-x509', '-nodes', '-days', '1', '-newkey', 'rsa:2048',
+    '-subj', '/CN=localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
+  return readLoopbackTls(directory);
+}
+
+export async function readLoopbackTls(directory) {
+  return {
+    key: await readFile(join(directory, 'key.pem')),
+    cert: await readFile(join(directory, 'cert.pem')),
+  };
+}
+
+export async function startSplitFixture(directory, { mediaOrigin = '', tls } = {}) {
   const webOutput = join(directory, 'web');
   await mkdir(webOutput);
   const webSource = process.env.BROWSER_WEB_SOURCE ?? fileURLToPath(new URL('../', import.meta.url));
   await cp(join(webSource, 'public'), join(webOutput, 'public'), { recursive: true });
   await cp(join(webSource, 'scripts/build-web.js'), join(webOutput, 'scripts/build-web.js'), { recursive: true });
   await symlink(join(webSource, 'node_modules'), join(webOutput, 'node_modules'));
-  const key = join(directory, 'key.pem');
-  const cert = join(directory, 'cert.pem');
-  execFileSync('openssl', ['req', '-x509', '-nodes', '-days', '1', '-newkey', 'rsa:2048',
-    '-subj', '/CN=localhost', '-keyout', key, '-out', cert], { stdio: 'ignore' });
-  const tls = { key: await readFile(key), cert: await readFile(cert) };
+  tls ??= await createLoopbackTls(directory);
   const assets = {
     '/index.html': 'text/html; charset=utf-8',
     '/app.js': 'text/javascript',
@@ -57,7 +68,7 @@ export async function startSplitFixture(directory) {
   try {
     const [webOrigin, apiOrigin] = await Promise.all([listen(web), listen(api)]);
     execFileSync(process.execPath, ['scripts/build-web.js'], {
-      cwd: webOutput, env: { ...process.env, API_ORIGIN: apiOrigin }, stdio: 'ignore',
+      cwd: webOutput, env: { ...process.env, API_ORIGIN: apiOrigin, MEDIA_ORIGIN: mediaOrigin }, stdio: 'ignore',
     });
     return { webOrigin, apiOrigin, bind(app) { backend = app.localOrigin; }, close };
   } catch (error) {

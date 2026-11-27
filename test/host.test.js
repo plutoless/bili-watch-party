@@ -6,10 +6,97 @@ import { join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 import test from 'node:test';
 import { createImporter } from '../src/importer.js';
+import { createR2Media } from '../src/r2-media.js';
 import { startServer } from '../src/server.js';
+import { startR2Fixture } from './r2-fixture.js';
 
 const source = 'https://www.bilibili.com/video/BV1TDyazeEuY';
 const fixturePassword = 'synthetic-test-password';
+
+test('R2 retries preserve one publication across an ambiguous write and restart', async t => {
+  const storage = await startR2Fixture();
+  t.after(storage.close);
+  let imports = 0;
+  let time = Date.now();
+  const app = await setup(t, async ({ output }) => {
+    imports++;
+    await writeFile(output, 'synthetic object');
+    return 15;
+  }, { r2Media: createR2Media(storage.options), now: () => time });
+  let cookie = await app.login();
+  storage.nextUpload = 'hold';
+  const [code, { id }] = await app.submit(cookie);
+  assert.equal(code, 201);
+  const roomPath = '/api/rooms/' + id;
+  const retry = attempt => app.request(roomPath + '/retry', {
+    cookie, method: 'POST', body: { attempt },
+  });
+  await storage.uploadHeld;
+  const uploading = await app.status(cookie, id, 'publishing');
+  assert.equal(uploading.mediaUrl, null);
+  assert.equal((await app.request('/media/' + id + '.mp4', { cookie })).status, 404);
+  storage.releaseUpload();
+  assert.equal((await app.status(cookie, id, 'failed')).error.code, 'publication');
+  assert.equal(storage.objects.size, 0);
+
+  storage.publicReadable = false;
+  storage.nextUpload = 'dropResponse';
+  await Promise.all([retry(1), retry(1)]);
+  assert.equal((await app.status(cookie, id, 'failed')).attempt, 2);
+  assert.equal(storage.objects.size, 1);
+  await app.restart();
+  cookie = await app.login();
+  // A previous PUT can commit just after the retry observes an absent object.
+  storage.nextHeadMissing = true;
+  await retry(2);
+  const unreadable = await app.status(cookie, id, 'failed');
+  assert.equal(unreadable.attempt, 3);
+  assert.equal(unreadable.mediaUrl, null);
+  assert.equal(storage.writes, 1);
+  assert.equal(storage.conflicts, 1);
+
+  storage.publicReadable = true;
+  await retry(3);
+  const ready = await app.status(cookie, id, 'ready');
+  assert.equal(await (await fetch(ready.mediaUrl)).text(), 'synthetic object');
+  assert.equal(storage.writes, 1);
+  assert.equal(imports, 1);
+  assert.equal((await app.request('/media/' + id + '.mp4', { cookie })).status, 404);
+  assert.equal((await app.request(roomPath)).status, 401);
+
+  storage.headUnavailable = true;
+  time += 60_000;
+  assert.equal((await app.request(roomPath, { cookie }).then(r => r.json())).status, 'ready');
+  storage.headUnavailable = false;
+  storage.remove(ready.mediaUrl);
+  time += 60_000;
+  const expired = await app.status(cookie, id, 'media-expired');
+  assert.equal(expired.mediaUrl, null);
+  assert.equal((await fetch(ready.mediaUrl)).status, 404);
+  await Promise.all([retry(expired.attempt), retry(expired.attempt)]);
+  const reimported = await app.status(cookie, id, 'ready');
+  assert.notEqual(reimported.mediaUrl, ready.mediaUrl);
+  assert.equal((await fetch(ready.mediaUrl)).status, 404);
+  assert.equal(storage.objects.size, 1);
+  assert.equal(storage.writes, 2);
+  assert.equal(imports, 2);
+
+  const application = await app.request(roomPath + '/join', {
+    method: 'POST', body: { token: reimported.invitation.token },
+  });
+  const { requestId } = await application.json();
+  const visitor = application.headers.get('set-cookie').split(';')[0];
+  assert.equal((await app.request(roomPath + '/approve', { cookie, method: 'POST', body: { requestId } })).status, 200);
+  storage.remove(reimported.mediaUrl);
+  time += 60_000;
+  await app.status(cookie, id, 'media-expired');
+  const end = cookie => app.request(roomPath + '/end', { cookie, method: 'POST', body: {} });
+  assert.equal((await end()).status, 401);
+  assert.equal((await end(visitor)).status, 401);
+  const ended = await end(cookie);
+  assert.equal(ended.status, 200);
+  assert.equal((await ended.json()).status, 'ended');
+});
 
 async function setup(t, importVideo, options = {}) {
   const dataDir = await mkdtemp(join(tmpdir(), 'watch-party-test-'));

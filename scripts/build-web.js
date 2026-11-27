@@ -7,12 +7,20 @@ if (origin?.protocol !== 'https:' || origin.origin !== process.env.API_ORIGIN ||
 }
 const releaseSha = process.env.RELEASE_SHA;
 if (releaseSha && !/^[0-9a-f]{40}$/.test(releaseSha)) throw new Error('RELEASE_SHA 无效。');
+const mediaOrigin = process.env.MEDIA_ORIGIN;
+if (mediaOrigin) {
+  const media = URL.parse(mediaOrigin);
+  if (media?.protocol !== 'https:' || media.origin !== mediaOrigin ||
+      !/^[a-z0-9.-]+$/.test(media.hostname) || mediaOrigin === origin.origin) {
+    throw new Error('MEDIA_ORIGIN 必须是独立的 HTTPS 源地址，且无结尾斜杠。');
+  }
+}
 
 const output = new URL('../dist/', import.meta.url);
 const source = new URL('../public/', import.meta.url);
 const html = await readFile(new URL('index.html', source), 'utf8');
 const policy = "default-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; " +
-  'connect-src ' + origin.origin + '; media-src ' + origin.origin;
+  'connect-src ' + origin.origin + '; media-src ' + origin.origin + (mediaOrigin ? ' ' + mediaOrigin : '');
 const page = html.replace('<meta charset="utf-8">', `<meta charset="utf-8">
   <meta http-equiv="Content-Security-Policy" content="${policy}">
   <meta name="watch-api-origin" content="${origin.origin}">` +

@@ -85,7 +85,6 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   // Leave room for both peers' media error and uncertainty within the 0.5 s budget.
   const driftBudgetSeconds = host ? 0.10 : 0.385;
   const endpoint = apiOrigin + roomPath + '/playback';
-  if (apiOrigin) video.crossOrigin = 'use-credentials';
   const playerId = crypto.randomUUID();
   const storageKey = 'watch-party-player:' + endpoint + ':' + role;
   let recoveryId = playerId;
@@ -136,7 +135,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let offset = 0;
   let clockRtt = 0;
   let hardDriftSamples = 0;
-  let rateDriftSamples = 0;
+  let sustainedDriftSamples = 0;
   let nextHardSeek = 0;
   let driftSeekStarted;
   let driftSeekLeadMs = initialDriftSeekLeadMs;
@@ -145,6 +144,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   let initialReloadClosed = false;
   let prepareIntent = 0;
   let seekPreview = false;
+  let useRateCorrection = true;
 
   function setText(id, message) {
     const element = byId(id);
@@ -381,7 +381,10 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   function correctDrift() {
     if (state?.startsAt == null || !state.ownsSeat || !primed || priming ||
         networkError || outage || reportBlocked || reportBuffering || document.hidden ||
-        video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) return;
+        video.paused || video.seeking || video.readyState < video.HAVE_FUTURE_DATA) {
+      if (!useRateCorrection) sustainedDriftSamples = 0;
+      return;
+    }
     const now = performance.now() + offset;
     const target = positionAt(now);
     if (now < state.startsAt || !Number.isFinite(target) || target >= video.duration) return;
@@ -395,20 +398,23 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
     const correctionStart = Math.max(0.04, Math.min(rateDriftLimit, driftBudgetSeconds - clockRtt / 2000));
     const correctionStop = Math.min(rateDriftSettled, correctionStart * 0.6);
     const direction = Math.sign(drift);
-    rateDriftSamples = distance <= correctionStart ? 0
-      : (Math.sign(rateDriftSamples) === direction ? rateDriftSamples : 0) + direction;
-    if ((distance > 1.25 || hardDriftSamples >= 2) && now >= nextHardSeek) {
+    // Two public players each need room within the shared 0.5 s alignment budget.
+    const threshold = useRateCorrection ? correctionStart : 0.24;
+    sustainedDriftSamples = distance <= threshold ? 0
+      : (Math.sign(sustainedDriftSamples) === direction ? sustainedDriftSamples : 0) + direction;
+    const sustainedPublicDrift = !useRateCorrection && Math.abs(sustainedDriftSamples) >= 4;
+    if ((distance > 1.25 || hardDriftSamples >= 2 || sustainedPublicDrift) && now >= nextHardSeek) {
       // Allow for the time spent decoding the destination while the room keeps playing.
       driftSeekStarted = performance.now();
       video.currentTime = positionAt(now + driftSeekLeadMs);
       setRate(1);
       nextHardSeek = now + 1500;
       hardDriftSamples = 0;
-      rateDriftSamples = 0;
-    } else if (video.playbackRate === 1 && Math.abs(rateDriftSamples) >= 4) {
+      sustainedDriftSamples = 0;
+    } else if (useRateCorrection && video.playbackRate === 1 && Math.abs(sustainedDriftSamples) >= 4) {
       setRate(1 + direction * 0.10);
     } else if (video.playbackRate !== 1 && (distance <= correctionStop || drift * (video.playbackRate - 1) < 0)) {
-      rateDriftSamples = 0;
+      sustainedDriftSamples = 0;
       setRate(1);
     }
   }
@@ -615,7 +621,7 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
           ? timeline : undefined;
         pendingStart = undefined;
         hardDriftSamples = 0;
-        rateDriftSamples = 0;
+        sustainedDriftSamples = 0;
         nextHardSeek = 0;
         driftSeekStarted = undefined;
       }
@@ -745,10 +751,43 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
   video.addEventListener('playing', render);
   for (const event of ['progress', 'durationchange', 'emptied']) video.addEventListener(event, renderBuffer);
 
+  function stop() {
+    if (!video.hasAttribute('src')) return;
+    loadGeneration++;
+    mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = undefined;
+    hasStartedScheduledPlayback = initialReloadClosed = false;
+    clearTimeout(poll);
+    clearTimeout(startTimer);
+    clearInterval(driftTimer);
+    clearTimeout(stallTimer);
+    state = undefined;
+    queuedCommand = unacknowledgedSeekId = undefined;
+    reportBlocked = reportBuffering = outage = pendingStart = undefined;
+    reloadAfterReconnect = false;
+    mediaReloaded = false;
+    inFlight = pendingClaimId = undefined;
+    priming = primed = claim = gestureFailed = networkError = false;
+    seekPreview = false;
+    commandMessage = '';
+    driftSeekStarted = undefined;
+    driftSeekLeadMs = initialDriftSeekLeadMs;
+    clockSamples = [];
+    video.removeAttribute('src');
+    video.load();
+    byId('player').hidden = true;
+    if (host) byId('end-room').hidden = false;
+  }
+
   return {
-    load(url) {
-      url = apiOrigin + url;
+    load(url, publicMedia = false) {
+      if (!publicMedia) url = apiOrigin + url;
       if (video.getAttribute('src') === url) return;
+      if (publicMedia || !useRateCorrection) stop();
+      if (publicMedia) video.crossOrigin = 'anonymous';
+      else if (apiOrigin) video.crossOrigin = 'use-credentials';
+      else video.removeAttribute('crossorigin');
+      // Direct public streams stay at normal speed and retain hard-seek correction.
+      useRateCorrection = !publicMedia;
       mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = pendingStart = undefined;
       hasStartedScheduledPlayback = initialReloadClosed = false;
       video.src = url;
@@ -757,30 +796,6 @@ export function createPlayer({ apiOrigin, roomPath, role }) {
       byId('player').hidden = false;
       wake();
     },
-    stop() {
-      if (!video.hasAttribute('src')) return;
-      loadGeneration++;
-      mediaRecoveryRetry = visitorBufferingTimeline = initialRewindRetry = undefined;
-      hasStartedScheduledPlayback = initialReloadClosed = false;
-      clearTimeout(poll);
-      clearTimeout(startTimer);
-      clearInterval(driftTimer);
-      clearTimeout(stallTimer);
-      state = undefined;
-      queuedCommand = unacknowledgedSeekId = undefined;
-      reportBlocked = reportBuffering = outage = pendingStart = undefined;
-      reloadAfterReconnect = false;
-      mediaReloaded = false;
-      inFlight = pendingClaimId = undefined;
-      priming = primed = claim = gestureFailed = networkError = false;
-      seekPreview = false;
-      commandMessage = '';
-      driftSeekStarted = undefined;
-      driftSeekLeadMs = initialDriftSeekLeadMs;
-      clockSamples = [];
-      video.removeAttribute('src');
-      video.load();
-      byId('player').hidden = true;
-    },
+    stop,
   };
 }

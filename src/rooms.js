@@ -6,7 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { openAdmission } from './admission.js';
 import { ImportError } from './importer.js';
 
-export function openRooms(dataDir, importVideo, { now, retentionMs }) {
+export function openRooms(dataDir, importVideo, { now, retentionMs, r2Media }) {
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const lock = new DatabaseSync(join(dataDir, 'worker.sqlite'));
   let db;
@@ -37,13 +37,22 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
         UNIQUE (bvid, part)
       );
       CREATE TABLE IF NOT EXISTS ended_rooms (id TEXT PRIMARY KEY, endedAt INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS room_publications (
+        roomId TEXT PRIMARY KEY REFERENCES rooms(id) ON DELETE CASCADE,
+        objectKey TEXT NOT NULL UNIQUE,
+        duration REAL NOT NULL
+      );
     `);
     admission = openAdmission(db, now);
-    const interrupted = db.prepare(`
+    db.prepare(`
       UPDATE rooms SET status = 'failed', error = 'interrupted'
-      WHERE status IN ('downloading', 'preparing') RETURNING id
-    `).all();
-    for (const { id } of interrupted) rmSync(mediaPath(id), { force: true });
+      WHERE status IN ('downloading', 'preparing', 'publishing')
+    `).run();
+    for (const { id } of db.prepare(`
+      SELECT id FROM rooms
+      WHERE (status IN ('ready', 'media-expired') AND id IN (SELECT roomId FROM room_publications))
+         OR (error = 'interrupted' AND id NOT IN (SELECT roomId FROM room_publications))
+    `).all()) rmSync(mediaPath(id), { force: true });
   } catch (error) {
     db?.close();
     lock.close();
@@ -54,9 +63,17 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
   const findSource = db.prepare('SELECT * FROM rooms WHERE bvid = ? AND part = ?');
   const insert = db.prepare('INSERT INTO rooms (id, bvid, part) VALUES (?, ?, ?)');
   const next = db.prepare("SELECT * FROM rooms WHERE status = 'queued' ORDER BY rowid LIMIT 1");
+  const publication = db.prepare('SELECT objectKey, duration FROM room_publications WHERE roomId = ?');
+  const stage = db.prepare('INSERT INTO room_publications VALUES (?, ?, ?)');
+  const expire = db.prepare(`
+    UPDATE rooms SET status = 'media-expired', error = 'media-expired', duration = NULL
+    WHERE id = ? AND status = 'ready'
+      AND id IN (SELECT roomId FROM room_publications WHERE objectKey = ?)
+  `);
+  const discardPublication = db.prepare('DELETE FROM room_publications WHERE roomId = ?');
   const requeue = db.prepare(`
     UPDATE rooms SET status = 'queued', error = NULL, duration = NULL, attempt = attempt + 1
-    WHERE id = ? AND status = 'failed' AND attempt = ?
+    WHERE id = ? AND status IN ('failed', 'media-expired') AND attempt = ?
   `);
   const setStatus = db.prepare('UPDATE rooms SET status = ?, error = ?, duration = ? WHERE id = ?');
   const setMetadata = db.prepare('UPDATE rooms SET title = ?, partTitle = ? WHERE id = ?');
@@ -69,40 +86,88 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
   let active;
   let scheduled;
   let closing = false;
+  const mediaChecks = new Map();
 
   function get(id) {
     const room = find.get(id);
     if (!room) return null;
+    const published = publication.get(id);
+    let mediaUrl = null;
+    if (room.status === 'ready') {
+      mediaUrl = published ? r2Media?.url(published.objectKey) ?? null : '/media/' + id + '.mp4';
+    }
     return {
       ...room,
       error: room.error ? new ImportError(room.error).toJSON() : null,
-      mediaUrl: room.status === 'ready' ? '/media/' + id + '.mp4' : null,
+      mediaUrl,
+      ...(mediaUrl && published && { mediaPublic: true }),
     };
+  }
+
+  async function refreshMedia(id) {
+    const published = r2Media && publication.get(id);
+    if (!published || find.get(id)?.status !== 'ready') return;
+    const { objectKey } = published;
+    let check = mediaChecks.get(id);
+    if (check?.objectKey !== objectKey || (check.nextAt !== undefined && check.nextAt <= now())) {
+      check = { objectKey };
+      mediaChecks.set(id, check);
+      // A transport or permission failure does not establish deletion.
+      check.pending = r2Media.exists(objectKey).catch(() => undefined).then(exists => {
+        if (exists === false && !closing) expire.run(id, objectKey);
+      }).finally(() => {
+        check.nextAt = now() + 5000;
+        check.pending = undefined;
+      });
+    }
+    await check.pending;
   }
 
   async function process(room, signal) {
     let workDir;
-    setStatus.run('downloading', null, null, room.id);
+    const { id } = room;
+    let staged = publication.get(id);
+    let publishing = Boolean(staged);
     try {
-      workDir = await mkdtemp(join(workRoot, 'import-'));
-      const output = join(workDir, 'ready.mp4');
-      const duration = await importVideo({
-        source: { bvid: room.bvid, part: room.part },
-        workDir,
-        output,
-        update(metadata) {
-          if (metadata.status === 'preparing') setStatus.run('preparing', null, null, room.id);
-          else setMetadata.run(metadata.title ?? null, metadata.partTitle ?? null, room.id);
-        },
-        signal,
-      });
-      signal.throwIfAborted();
-      await rename(output, mediaPath(room.id));
-      setStatus.run('ready', null, duration, room.id);
+      let duration = staged?.duration;
+      if (!staged) {
+        setStatus.run('downloading', null, null, id);
+        workDir = await mkdtemp(join(workRoot, 'import-'));
+        const output = join(workDir, 'ready.mp4');
+        duration = await importVideo({
+          source: { bvid: room.bvid, part: room.part },
+          workDir,
+          output,
+          update(metadata) {
+            if (metadata.status === 'preparing') setStatus.run('preparing', null, null, id);
+            else setMetadata.run(metadata.title ?? null, metadata.partTitle ?? null, id);
+          },
+          signal,
+        });
+        signal.throwIfAborted();
+        await rename(output, mediaPath(id));
+        // Room end or shutdown can race the asynchronous rename.
+        signal.throwIfAborted();
+        if (r2Media) {
+          const objectKey = randomUUID();
+          stage.run(id, objectKey, duration);
+          staged = { objectKey, duration };
+        }
+      }
+      if (staged) {
+        publishing = true;
+        setStatus.run('publishing', null, null, id);
+        if (!r2Media) throw new Error('R2 配置不可用。');
+        await r2Media.publish(staged.objectKey, mediaPath(id), signal);
+        signal.throwIfAborted();
+      }
+      setStatus.run('ready', null, duration, id);
+      if (staged) await rm(mediaPath(id), { force: true }).catch(() =>
+        console.error('无法清理已发布视频的临时文件。请检查数据目录。'));
     } catch (error) {
       const failure = signal.aborted ? 'interrupted'
-        : error instanceof ImportError ? error.code : 'processing';
-      setStatus.run('failed', failure, null, room.id);
+        : publishing ? 'publication' : error instanceof ImportError ? error.code : 'processing';
+      setStatus.run('failed', failure, null, id);
     } finally {
       if (workDir) await rm(workDir, { force: true, recursive: true });
     }
@@ -157,9 +222,11 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
         throw error;
       }
       if (job?.id === id) job.controller.abort();
+      mediaChecks.delete(id);
       return true;
     },
     get,
+    refreshMedia,
     mediaPath,
     submit({ bvid, part }) {
       const existing = findSource.get(bvid, part);
@@ -180,8 +247,22 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
     retry(id, attempt) {
       const room = get(id);
       if (!room) return null;
-      if (room.status === 'failed' && room.error.retryable) {
-        requeue.run(id, attempt);
+      if (room.error?.retryable && attempt === room.attempt) {
+        if (room.status === 'media-expired') {
+          // Allocate a fresh public key on reimport; the expired URL stays dead.
+          db.exec('BEGIN');
+          try {
+            discardPublication.run(id);
+            requeue.run(id, attempt);
+            db.exec('COMMIT');
+          } catch (error) {
+            db.exec('ROLLBACK');
+            throw error;
+          }
+          mediaChecks.delete(id);
+        } else {
+          requeue.run(id, attempt);
+        }
         schedule();
       }
       return get(id);
@@ -192,6 +273,7 @@ export function openRooms(dataDir, importVideo, { now, retentionMs }) {
       clearInterval(cleanup);
       clearImmediate(scheduled);
       await active;
+      await Promise.allSettled([...mediaChecks.values()].map(check => check.pending));
       db.close();
       lock.close();
     },

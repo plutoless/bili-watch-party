@@ -21,13 +21,16 @@ let actionPending = false;
 let displayedRequests = '';
 let pollTimer;
 let failedAttempt;
+let publicMedia;
 let rememberRoom = true;
 
 const statusLabels = {
   queued: '等待导入',
   downloading: '正在下载',
   preparing: '正在准备视频',
+  publishing: '正在发布视频',
   ready: '视频已就绪',
+  'media-expired': '公开视频已过期',
   failed: '导入失败',
   pending: '等待房主批准',
   waiting: '已获批准，等待视频导入完成。',
@@ -136,7 +139,7 @@ function showTerminal(state) {
 
 function render(room) {
   if (room.status === 'ended') return showTerminal('ended');
-  const waiting = visitor && ['queued', 'downloading', 'preparing'].includes(room.status);
+  const waiting = visitor && ['queued', 'downloading', 'preparing', 'publishing'].includes(room.status);
   setStatus(waiting ? 'waiting' : room.status);
   byId('title').textContent = room.title || '观影房间';
   const detail = byId('source-detail');
@@ -145,10 +148,12 @@ function render(room) {
   setText(roomError, room.error?.message ?? '');
   failedAttempt = room.error?.retryable ? room.attempt : undefined;
   retry.hidden = visitor || !room.error?.retryable;
+  setText(retry, room.status === 'media-expired' ? '重新导入' : '重试导入');
+  publicMedia = room.mediaPublic;
   if (room.mediaUrl) {
     fullscreen ??= createPageFullscreen();
-    player.load(room.mediaUrl);
-  }
+    player.load(room.mediaUrl, publicMedia);
+  } else stopPlayer();
   if (!visitor) {
     if (rememberRoom) {
       writeRecentRoom(path);
@@ -346,7 +351,10 @@ byId('share-invite').addEventListener('click', async () => {
 });
 for (const id of ['end-room', 'end-after-playback']) {
   byId(id).addEventListener('click', event => {
-    if (confirm('结束房间后，邀请和视频访问将立即失效。确定结束？')) {
+    const message = publicMedia
+      ? '结束后邀请和房间内的播放会停止。公开视频链接在对象删除前仍可访问。确定结束？'
+      : '结束房间后，邀请和视频访问将立即失效。确定结束？';
+    if (confirm(message)) {
       hostAction('end', {}, event.currentTarget, id === 'end-after-playback' ? byId('end-room-message') : actionMessage);
     }
   });

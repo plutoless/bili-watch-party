@@ -1,14 +1,19 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { execFile, spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { chromium, devices, webkit } from 'playwright';
 import { createImporter, ImportError } from '../src/importer.js';
+import { createR2Media } from '../src/r2-media.js';
 import { startServer } from '../src/server.js';
-import { checkSharedPlayback } from './playback-browser.js';
-import { startSplitFixture } from './split-browser-fixture.js';
+import { formatBrowserFailure } from './browser-failure.js';
+import { observeNativeRanges } from './native-range-observer.js';
+import { checkPlaybackReconnect, checkSharedPlayback } from './playback-browser.js';
+import { startR2Fixture } from './r2-fixture.js';
+import { createLoopbackTls, readLoopbackTls, startSplitFixture } from './split-browser-fixture.js';
 
 const run = promisify(execFile);
 const ffmpeg = process.env.FFMPEG_PATH ?? 'ffmpeg';
@@ -16,22 +21,52 @@ const ffprobe = process.env.FFPROBE_PATH ?? 'ffprobe';
 const source = 'https://www.bilibili.com/video/BV1TDyazeEuY';
 const deployedOrigin = process.env.BROWSER_ORIGIN;
 const deployedApiOrigin = process.env.BROWSER_API_ORIGIN;
+const deployedMediaOrigin = process.env.BROWSER_MEDIA_ORIGIN;
+const r2Fixture = process.env.BROWSER_R2_FIXTURE === '1';
+const fixtureTlsDir = process.env.BROWSER_R2_TLS_DIR;
+
+// Node reads extra roots at startup. Trust only the generated loopback fixture in this run.
+if (r2Fixture && !deployedOrigin && !fixtureTlsDir) {
+  const directory = await mkdtemp(join(tmpdir(), 'watch-party-r2-tls-'));
+  let exitCode;
+  try {
+    const { cert } = await createLoopbackTls(directory);
+    const extra = process.env.NODE_EXTRA_CA_CERTS;
+    const trust = join(directory, 'ca.pem');
+    await writeFile(trust, extra ? Buffer.concat([await readFile(extra), Buffer.from('\n'), cert]) : cert);
+    const result = spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+      env: { ...process.env, NODE_EXTRA_CA_CERTS: trust, BROWSER_R2_TLS_DIR: directory },
+      stdio: 'inherit',
+    });
+    if (result.error) throw result.error;
+    exitCode = result.status ?? 1;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+  process.exit(exitCode);
+}
 const password = deployedOrigin ? process.env.HOST_PASSWORD : 'synthetic-browser-test-password';
 const dataDir = deployedOrigin ? null : await mkdtemp(join(tmpdir(), 'watch-party-live-'));
 const mediaDir = dataDir ?? process.env.BROWSER_DATA_DIR;
 const simulateFirstFailure = process.env.SIMULATE_FIRST_FAILURE === '1';
 const synthetic = process.env.SYNTHETIC_VIDEO === '1';
-const splitFixture = process.env.BROWSER_SYNTHETIC_SPLIT === '1';
+const splitFixture = r2Fixture || process.env.BROWSER_SYNTHETIC_SPLIT === '1';
 const ignoreHTTPSErrors = splitFixture || process.env.BROWSER_LOCAL_TLS === '1';
 let app;
 let fixture;
+let storage;
 const browsers = [];
 let failNextRequest = simulateFirstFailure;
 let importGate;
 let clockOffset = 0;
+let failurePhase = 'configuration';
 
-async function checkMediaFile(media) {
-  const output = join(mediaDir, 'media', media.split('/').at(-1));
+function reportFailure(error, phase = failurePhase) {
+  console.error('Live check failed:', formatBrowserFailure(error, phase));
+  process.exitCode = 1;
+}
+
+async function checkMediaFile(output) {
   const { stdout } = await run(ffprobe, [
     '-v', 'error', '-show_entries', 'stream=codec_name,codec_type,height:format=duration',
     '-of', 'json', output,
@@ -47,7 +82,40 @@ async function checkMediaFile(media) {
     ' s, complete audio/video decode passed.');
 }
 
+async function syntheticTracks(directory) {
+  const video = join(directory, 'source-video.mp4');
+  const audio = join(directory, 'source-audio.mp4');
+  await run(ffmpeg, [
+    '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24',
+    '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+    '-map', '0:v:0', '-t', '60', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video,
+    '-map', '1:a:0', '-t', '60', '-c:a', 'aac', audio,
+  ]);
+  const cdn = 'https://synthetic.bilivideo.com/';
+  return async input => {
+    const url = new URL(input);
+    switch (url.pathname) {
+      case '/x/web-interface/view':
+        return Response.json({ code: 0, data: {
+          title: '合成验收视频', pages: [{ page: 1, cid: 42, duration: 60 }],
+        } });
+      case '/x/player/playurl':
+        return Response.json({ code: 0, data: { dash: { duration: 60,
+          video: [{ codecs: 'avc1.64001E', id: 32, baseUrl: cdn + 'video' }],
+          audio: [{ codecs: 'mp4a.40.2', bandwidth: 32000, baseUrl: cdn + 'audio' }],
+        } } });
+      case '/video':
+        return new Response(await readFile(video));
+      case '/audio':
+        return new Response(await readFile(audio));
+      default:
+        return new Response(null, { status: 404 });
+    }
+  };
+}
+
 async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorProfile, origin, apiOrigin, checkFile) {
+  failurePhase = 'room admission';
   const hostOptions = { ...devices[hostProfile], ignoreHTTPSErrors };
   const visitorOptions = { ...devices[visitorProfile], ignoreHTTPSErrors };
   const host = await hostBrowser.newContext(hostOptions);
@@ -69,15 +137,7 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const hostPage = await host.newPage();
   const visitorPage = await visitor.newPage();
   const strangerPage = await stranger.newPage();
-  const mediaRanges = new Map([hostPage, visitorPage].map(page => [page, new Set()]));
-  for (const [page, requested] of mediaRanges) {
-    page.on('response', async response => {
-      if (response.status() === 206 && response.request().resourceType() === 'media' &&
-          new URL(response.url()).origin === apiOrigin) {
-        requested.add(await response.headerValue('content-range'));
-      }
-    });
-  }
+  const mediaRanges = [hostPage, visitorPage].map(page => observeNativeRanges(page, apiOrigin));
   const inviteLink = hostPage.getByLabel('邀请链接');
   const generate = hostPage.getByRole('button', { name: '生成邀请', exact: true });
   const manage = hostPage.getByText('管理房间', { exact: true });
@@ -88,6 +148,8 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   const copy = hostPage.getByRole('button', { name: '复制邀请' });
   const watchStatus = (page, state) => page.locator('#status[data-status="' + state + '"]');
   const range = { Range: 'bytes=0-1023' };
+  const writesBefore = storage?.writes;
+  if (storage) storage.nextUpload = 'dropResponse';
 
   const home = await hostPage.goto(origin);
   const legacyWeb = await hostPage.locator('#recent-room').count() === 0;
@@ -139,7 +201,6 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     await singleApproval.waitFor();
     console.log('Injected connection reset: actionable error and same-room retry with pending application passed.');
   }
-
   if (!legacyWeb) {
     await back.tap();
     await resume.tap();
@@ -212,6 +273,13 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     assert.ok(waitedForVideo, 'Approval during import must show waiting for import');
     importGate.resolve();
   }
+  if (storage) {
+    await watchStatus(hostPage, 'failed').waitFor({ timeout: 360_000 });
+    assert.match(await hostPage.locator('#room-error').textContent(), /无法发布视频/);
+    assert.equal(await hostPage.locator('video').getAttribute('src'), null);
+    assert.equal(storage.writes, writesBefore + 1);
+    await hostPage.getByRole('button', { name: '重试导入' }).tap();
+  }
   await visitorPage.reload({ waitUntil: 'domcontentloaded' });
   await hostPage.reload({ waitUntil: 'domcontentloaded' });
   for (const page of [hostPage, visitorPage]) {
@@ -231,12 +299,39 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
       assert.equal(cookie.domain, new URL(apiOrigin).hostname);
     }
   }
+  failurePhase = 'media access';
+  const roomResponse = await host.request.get(apiOrigin + '/api' + hostPath);
+  assert.equal(roomResponse.status(), 200);
+  const room = await roomResponse.json();
+  const publicMedia = room.mediaPublic === true;
+  const expectedMediaOrigin = storage?.options.publicOrigin ?? deployedMediaOrigin;
+  assert.ok(!expectedMediaOrigin || publicMedia, 'The room must publish to the expected media origin');
+  const mediaUrl = new URL(room.mediaUrl, apiOrigin).href;
+  if (publicMedia) {
+    const address = new URL(mediaUrl);
+    assert.equal(address.protocol, 'https:');
+    assert.ok(address.origin !== origin && address.origin !== apiOrigin, 'Public media must use a separate HTTPS origin');
+    if (expectedMediaOrigin) assert.equal(address.origin, expectedMediaOrigin);
+    if (ignoreHTTPSErrors) assert.ok(['localhost', '127.0.0.1'].includes(address.hostname),
+      'Test trust bypass is for isolated loopback HTTPS only');
+    assert.equal((await host.request.get(apiOrigin + media, { headers: range })).status(), 404);
+  } else {
+    assert.equal(mediaUrl, apiOrigin + media, 'Protected media must be served by the room API origin');
+  }
+  for (const page of [hostPage, visitorPage]) {
+    assert.ok(await page.locator('video').evaluate((video, url) => video.src === url, mediaUrl));
+    if (publicMedia) assert.equal(await page.locator('video').getAttribute('crossorigin'), 'anonymous');
+  }
+  const publicContext = publicMedia && await hostBrowser.newContext(hostOptions);
+  const publicReader = publicContext?.request;
   if (apiOrigin !== origin) {
     const denied = await host.request.get(apiOrigin + '/api/session', {
       headers: { Origin: 'https://other.example.org' },
     });
     assert.equal(denied.status(), 403);
     assert.equal(denied.headers()['access-control-allow-origin'], undefined);
+  }
+  if (apiOrigin !== origin && !publicMedia) {
     for (const page of [hostPage, visitorPage]) {
       const { status, contentRange, cacheControl, size } = await page.evaluate(async url => {
         const response = await fetch(url, { credentials: 'include', headers: { Range: 'bytes=1024-2047' } });
@@ -254,17 +349,20 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
     }
     console.log('Split HTTPS: allowlisted browser sessions received private 206 media; foreign Origin denied.');
   }
-  for (const context of [host, visitor]) {
-    const head = await context.request.head(apiOrigin + media);
+  const mediaHeaders = publicMedia ? { Origin: origin } : {};
+  for (const reader of publicMedia ? [publicReader] : [host.request, visitor.request]) {
+    const head = await reader.head(mediaUrl, { headers: mediaHeaders, maxRedirects: 0 });
     assert.equal(head.status(), 200);
     assert.equal(head.headers()['accept-ranges'], 'bytes');
-    const first = await context.request.get(apiOrigin + media, { headers: range });
+    const first = await reader.get(mediaUrl, { headers: { ...mediaHeaders, ...range }, maxRedirects: 0 });
     assert.equal(first.status(), 206);
+    if (publicMedia) assert.ok([origin, '*'].includes(first.headers()['access-control-allow-origin']),
+      'Anonymous Range must allow the web origin');
     assert.equal(first.headers()['content-type'], 'video/mp4');
     assert.equal(first.headers()['accept-ranges'], 'bytes');
     assert.match(first.headers()['content-range'], /^bytes 0-1023\/\d+$/);
     assert.equal((await first.body()).length, 1024);
-    const last = await context.request.get(apiOrigin + media, { headers: { Range: 'bytes=-128' } });
+    const last = await reader.get(mediaUrl, { headers: { ...mediaHeaders, Range: 'bytes=-128' }, maxRedirects: 0 });
     assert.equal(last.status(), 206);
     assert.equal((await last.body()).length, 128);
   }
@@ -276,19 +374,73 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   await strangerPage.getByRole('heading', { name: '房主登录' }).waitFor();
   assert.equal(await strangerPage.locator('video').getAttribute('src'), null);
 
-  await checkSharedPlayback({ hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath });
-  if (synthetic) {
-    for (const ranges of mediaRanges.values()) {
-      assert.ok([...ranges].some(range => /^bytes \d+-\d+\/\d+$/.test(range)),
+  failurePhase = 'shared playback';
+  await checkSharedPlayback({
+    hostPage, visitorPage, host, visitor, stranger, origin, apiOrigin, hostPath, publicMedia,
+  });
+  if (synthetic && !publicMedia) {
+    for (const hasNativeRange of mediaRanges) {
+      assert.ok(await hasNativeRange(mediaUrl),
         'Each native video must receive an authorized byte-range response');
     }
     console.log('Both native media elements received authorized 206 responses.');
   }
-  if (checkFile && mediaDir) await checkMediaFile(media);
+  if (checkFile && mediaDir && (!publicMedia || storage)) {
+    const path = storage ? join(mediaDir, 'public-object.mp4') : join(mediaDir, 'media', media.split('/').at(-1));
+    if (storage) await writeFile(path, storage.objects.get(new URL(mediaUrl).pathname).body);
+    await checkMediaFile(path);
+  }
+
+  failurePhase = 'public lifecycle';
+  let finalMedia = mediaUrl;
+  if (publicMedia) {
+    for (const page of [hostPage, visitorPage]) {
+      assert.ok(await page.locator('video').evaluate((video, url) => video.currentSrc === url, mediaUrl));
+    }
+    await checkPlaybackReconnect(hostPage, visitorPage);
+    console.log('Direct public media: both players loaded the media origin, anonymous Range returned 206, and room controls remained protected.');
+  }
+  if (storage) {
+    assert.ok(storage.ranges.some(read => read.path === new URL(mediaUrl).pathname &&
+      read.origin === origin && /Mozilla/.test(read.userAgent) && read.end > read.start),
+    'The mobile video element must receive a 206 from the public media origin');
+    assert.equal(storage.writes, writesBefore + 1);
+    storage.remove(mediaUrl);
+    assert.equal((await publicReader.get(mediaUrl, { headers: range })).status(), 404);
+    for (const page of [hostPage, visitorPage]) {
+      await watchStatus(page, 'media-expired').waitFor();
+      assert.equal(await page.locator('video').getAttribute('src'), null);
+    }
+    if (!legacyWeb) {
+      await back.tap();
+      await resume.tap();
+      await watchStatus(hostPage, 'media-expired').waitFor();
+      assert.ok(new URL(hostPage.url()).pathname === hostPath, 'Home must resume the room after media expiry');
+    }
+    await hostPage.getByRole('button', { name: '重新导入' }).tap();
+    for (const page of [hostPage, visitorPage]) {
+      await page.locator('#status[data-status="ready"], #status[data-status="failed"]').waitFor({ timeout: 360_000 });
+      assert.equal(await page.locator('#status').getAttribute('data-status'), 'ready',
+        await page.locator('#room-error').textContent());
+    }
+    finalMedia = await hostPage.locator('video').evaluate(video => video.src);
+    assert.notEqual(finalMedia, mediaUrl);
+    assert.equal((await publicReader.get(mediaUrl, { headers: range })).status(), 404);
+    assert.equal(storage.writes, writesBefore + 2);
+    for (const page of [hostPage, visitorPage]) await page.getByRole('button', { name: '准备好了', exact: true }).tap();
+    await hostPage.getByText('访客 · 已就绪').waitFor();
+    await hostPage.locator('#play').tap();
+    await Promise.all([hostPage, visitorPage].map(page => page.waitForFunction(() => {
+      const video = document.querySelector('video');
+      return !video.paused && video.videoWidth > 0 && video.currentTime > 0.25 && video.currentTime < 5;
+    })));
+    console.log('Direct public 206, ambiguous-upload retry, expired-link rejection and reimport passed.');
+  }
 
   const endAfterPlayback = hostPage.locator('#end-after-playback');
   const endedInPlayer = await endAfterPlayback.isVisible();
   if (!endedInPlayer) await openManagement();
+  failurePhase = 'room revocation';
   hostPage.once('dialog', dialog => dialog.accept());
   await (endedInPlayer ? endAfterPlayback : hostPage.locator('#end-room')).tap();
   await watchStatus(hostPage, 'ended').waitFor();
@@ -300,6 +452,10 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   assert.equal(await visitorPage.locator('video').getAttribute('src'), null);
   assert.equal((await host.request.get(apiOrigin + media, { headers: range })).status(), 410);
   assert.equal((await visitor.request.get(apiOrigin + media, { headers: range })).status(), 401);
+  if (publicMedia) {
+    assert.equal((await publicReader.get(finalMedia, { headers: range })).status(), 206);
+    storage?.remove(finalMedia);
+  }
   await strangerPage.goto(invitation);
   await watchStatus(strangerPage, 'ended').waitFor();
   if (!legacyWeb) {
@@ -318,15 +474,20 @@ async function checkSessions(hostBrowser, hostProfile, visitorBrowser, visitorPr
   console.log(hostProfile + ' / ' + visitorProfile + ': initial invitation, ' + resumeSummary +
     'deduplication, approval, shared playback and seek, denied third session, and invalidation passed. ' +
     'Observed approved visitor waiting for import: ' + waitedForVideo + '.');
-  await Promise.all([host, visitor, stranger].map(context => context.close()));
+  await Promise.all([host, visitor, stranger, ...(publicContext ? [publicContext] : [])]
+    .map(context => context.close()));
 }
 
 try {
   assert.ok(!synthetic || !deployedOrigin, 'Synthetic video requires the standalone test server');
-  assert.ok(!splitFixture || synthetic, 'The isolated split fixture requires SYNTHETIC_VIDEO=1');
-  assert.ok(!deployedApiOrigin || deployedOrigin, 'BROWSER_API_ORIGIN requires BROWSER_ORIGIN');
+  assert.ok(!splitFixture || (!deployedOrigin && (synthetic || r2Fixture)),
+    'The isolated split fixture requires a local app and SYNTHETIC_VIDEO=1 or BROWSER_R2_FIXTURE=1');
+  assert.ok(!(deployedApiOrigin || deployedMediaOrigin) || deployedOrigin,
+    'BROWSER_API_ORIGIN and BROWSER_MEDIA_ORIGIN require BROWSER_ORIGIN');
   if (deployedOrigin) {
-    for (const origin of [deployedOrigin, deployedApiOrigin ?? deployedOrigin]) {
+    const origins = [deployedOrigin, deployedApiOrigin ?? deployedOrigin];
+    if (deployedMediaOrigin) origins.push(deployedMediaOrigin);
+    for (const origin of origins) {
       assert.equal(new URL(origin).protocol, 'https:', 'Deployed browser run requires HTTPS');
       assert.equal(new URL(origin).origin, origin, 'Use an origin without a trailing slash');
       if (ignoreHTTPSErrors) {
@@ -337,16 +498,14 @@ try {
     assert.ok(password, 'Set HOST_PASSWORD for the deployed browser run');
     assert.ok(!simulateFirstFailure, 'Failure injection requires the test-managed app server');
   } else {
-    if (splitFixture) fixture = await startSplitFixture(dataDir);
-    const importVideo = synthetic
-      ? async ({ output, update, signal }) => {
-          if (failNextRequest) {
-            failNextRequest = false;
-            throw new ImportError('network');
-          }
-          update({ title: '合成验收视频' });
-          update({ status: 'preparing' });
-          await importGate.promise;
+    failurePhase = 'fixture setup';
+    if (r2Fixture) {
+      const tls = await readLoopbackTls(fixtureTlsDir);
+      storage = await startR2Fixture({ tls });
+      fixture = await startSplitFixture(dataDir, { tls, mediaOrigin: storage.options.publicOrigin });
+    } else if (splitFixture) fixture = await startSplitFixture(dataDir);
+    const prepareVideo = synthetic && !storage
+      ? async ({ output, signal }) => {
           await run(ffmpeg, [
             '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24',
             '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo', '-t', '60',
@@ -356,7 +515,7 @@ try {
         }
       : createImporter({
         ffmpeg, ffprobe,
-        async fetch(...args) {
+        fetch: synthetic ? await syntheticTracks(dataDir) : async (...args) => {
           if (failNextRequest) {
             failNextRequest = false;
             throw new TypeError('Synthetic connection reset during first import');
@@ -364,14 +523,27 @@ try {
           return fetch(...args);
         },
       });
+    const importVideo = synthetic ? async job => {
+      if (failNextRequest) {
+        failNextRequest = false;
+        throw new ImportError('network');
+      }
+      job.update({ title: '合成验收视频' });
+      job.update({ status: 'preparing' });
+      await importGate.promise;
+      job.signal.throwIfAborted();
+      return prepareVideo(job);
+    } : prepareVideo;
     app = await startServer({
       dataDir, password, port: 0, importVideo, now: () => Date.now() + clockOffset,
       webOrigin: fixture?.webOrigin, publicOrigin: fixture?.apiOrigin,
+      r2Media: storage && createR2Media({ ...storage.options, webOrigin: fixture.webOrigin }),
     });
     fixture?.bind(app);
   }
   const origin = deployedOrigin ?? fixture?.webOrigin ?? app.origin;
   const apiOrigin = deployedApiOrigin ?? fixture?.apiOrigin ?? origin;
+  failurePhase = 'browser launch';
   browsers.push(await chromium.launch());
   browsers.push(await webkit.launch());
   const [android, iphone] = browsers;
@@ -386,14 +558,20 @@ try {
     await checkSessions(host, hostProfile, visitor, visitorProfile, origin, apiOrigin, checkFile);
   }
 } catch (error) {
-  console.error('Live check failed:', error.message
-    .replace(/\/(rooms|media|invite)\/[a-f0-9-]+(?:\.mp4|#[a-f0-9]+)?/g, '/$1/[redacted]')
-    .replaceAll(mediaDir ?? '\0', '[temporary data]'));
-  process.exitCode = 1;
+  reportFailure(error);
 } finally {
+  async function attemptCleanup(action) {
+    try {
+      await action();
+    } catch (error) {
+      reportFailure(error, 'cleanup');
+    }
+  }
+
   importGate?.resolve();
-  await Promise.all(browsers.map(browser => browser.close()));
-  await fixture?.close();
-  await app?.close();
-  if (dataDir) await rm(dataDir, { recursive: true, force: true });
+  await Promise.all(browsers.map(browser => attemptCleanup(() => browser.close())));
+  await attemptCleanup(() => fixture?.close());
+  await attemptCleanup(() => app?.close());
+  await attemptCleanup(() => storage?.close());
+  if (dataDir) await attemptCleanup(() => rm(dataDir, { recursive: true, force: true }));
 }
