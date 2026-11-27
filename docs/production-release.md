@@ -6,6 +6,8 @@ PR 合入 `main` 后，Actions 测试并构建确切的合并 SHA。生产作业
 
 **合并即发布。后台重启会中断正在播放的同步，清空内存中的共享播放状态，房主需要重新登录。** 原有房间、影片和 Caddy 证书沿用服务器卷。
 
+The current workflow triggers a production release on any PR merge into `main`, including docs-only merges. A successful CI release covers the build, deployment, and live HTTP checks. Record a successful HTTPS `GET /api/release` with `200` and the expected SHA as backend health. Record the first real R2 upload and public `Range` read separately, using the [R2 acceptance steps](r2-media.md#验收).
+
 ## 首次设置
 
 1. 在同一可注册域名下准备两个 HTTPS 子域，例如 `watch.example.org` 和 `api-watch.example.org`。网页域按 Vercel 项目要求配置 DNS，并绑定为项目的生产域名。后台域解析到 Vultr，放行 HTTP 80 和 HTTPS 443，供 Caddy 获取证书和向浏览器提供服务。SSH 地址可以与 HTTPS 地址不同。
@@ -72,3 +74,5 @@ CI 的 R2 配置保存在 Vultr 的私有 `r2-config` 目录。发布根目录�
 - 安装 Chromium、WebKit、FFmpeg 和 FFprobe 后，用 `BROWSER_SYNTHETIC_SPLIT=1 SYNTHETIC_VIDEO=1 npm run test:browser` 在回环 HTTPS 上验收旧网页对新后台的兼容性。用 `BROWSER_WEB_SOURCE` 指向上一份网页源码的私有检出，省略时使用当前网页源码。夹具生成并清理合成视频，检查移动浏览器会话、房间与邀请深链接、访客审批、授权 `206`、陌生 Origin 拒绝、播放和跳转。
 
 实际生产首发由维护者另行启用。核对域名、凭据和既有卷后，运行当前 `main` 的 **Release production**。通过两个正式 HTTPS 域检查网页和后台的 SHA，再用公开片源在独立验收房间测试登录、审批、播放和跳转。记录 Actions 运行链接、日期、两端 SHA、HTTPS 和浏览器验收结果及是否复用原卷。配置、Cookie、邀请、媒体地址、影片及原始日志留在私有位置。
+
+For CI-built releases, compare the live web page's `watch-release` meta value and the live API's `/api/release` JSON `sha` to the expected release commit. Both should match it. If R2 is enabled, check the live page's CSP `media-src` for the configured media origin. These revision markers are release-build specific. For an older or manually built entry without them, confirm its revision from deployment records before reusing it.

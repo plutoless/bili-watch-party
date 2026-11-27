@@ -2,9 +2,14 @@
 
 开启后，后台继续用 FFmpeg 复制 B 站的 H.264 画轨和 AAC 音轨，将成品封装成快速起播的 MP4。浏览器从媒体域直接请求视频片段，房间、邀请审批和同步控制仍经后台校验会话。持有公开媒体地址的人可以在对象删除前播放，即使房间已结束。房间记录、凭据、源轨道和临时文件留在后台。
 
+Protected local media requires a valid host or approved guest session in an open room. Anyone holding an R2 media URL can play, download, or share that MP4 without a room session until R2 deletes the object. The URL grants read access to that object only. CORS controls cross-origin browser access, while direct reads of the URL remain public. [Cloudflare public buckets](https://developers.cloudflare.com/r2/buckets/public-buckets/), [R2 CORS](https://developers.cloudflare.com/r2/buckets/cors/)
+
 ## Cloudflare 配置
 
-1. 首次配置时创建默认管辖区的应用专用桶，仅用于成品 MP4。已有符合此用途的桶可继续使用。为 Vultr 创建范围仅限该桶的 **Object Read & Write** S3 凭据。将它保存到服务器私有配置文件。网页构建、Vercel 和 GitHub Actions 只接收公开的媒体 Origin。 [R2 凭据](https://developers.cloudflare.com/r2/api/tokens/)
+1. 首次配置时创建默认管辖区的应用专用桶，仅用于成品 MP4。已有符合此用途的桶可继续使用。
+
+   In the Cloudflare dashboard, go to **R2 Object Storage → Account Details → API Tokens → Manage**. Choose **Create Account API token**, select **Object Read & Write**, and under **Apply to specific buckets only**, select just the app's finished-media bucket. Copy the S3 **Access Key ID** and **Secret Access Key** when shown. Cloudflare displays the secret key only at creation. Store the two keys using the [application configuration below](#应用配置). [Cloudflare R2 credentials](https://developers.cloudflare.com/r2/api/tokens/)
+
 2. 在该桶的 **Settings → Custom Domains** 连接正式媒体域，例如 `media-watch.example.org`。等待域名和 TLS 生效。正式环境关闭 `r2.dev` 开发入口。 [R2 公开桶](https://developers.cloudflare.com/r2/buckets/public-buckets/)
 3. 在 Cloudflare **Cache Rules** 中为表达式 `(http.host eq "media-watch.example.org")` 设置 **Bypass cache**。检查同域的其他规则不会重新启用缓存。成品同时携带 `Cache-Control: public, no-store`。如曾启用共享缓存，清理旧条目。 [Cloudflare 缓存规则](https://developers.cloudflare.com/cache/how-to/cache-rules/create-dashboard/)
 4. 设置如下的桶 CORS 策略，将示例 Origin 换成正式网页地址。若由后台提供单机网页，则填 `PUBLIC_ORIGIN`。播放器跨源匿名请求媒体。 [R2 CORS](https://developers.cloudflare.com/r2/buckets/cors/)
@@ -49,7 +54,11 @@ Vultr 的后台设置可使用已有私有 `compose.env`（`0600`），也可由
 | `R2_ACCESS_KEY_ID` | Secret | 桶级 S3 Access Key ID |
 | `R2_SECRET_ACCESS_KEY` | Secret | 桶级 S3 Secret Access Key |
 
+For CI, enter the two keys only as GitHub Actions `production` Environment secrets. Use Environment variables for the three non-secret values `MEDIA_ORIGIN`, `R2_ACCOUNT_ID`, and `R2_BUCKET`. The release sends the keys to the Vultr app over SSH. Vercel and the web build only need the public `MEDIA_ORIGIN` for media configuration.
+
 首次通过 CI 启用时，先只配置 `MEDIA_ORIGIN` 并发布，核对正式网页的 CSP。随后补齐四项 R2 后台输入，再运行当前 `main` 的 **Release production**。正式网页尚未允许同一媒体域时，发布脚本不会启用 CI 的 R2 后台配置。四项后台 CI 输入均留空时保留主机设置。移除已启用的 CI 配置前，先核对主机已接管同一媒体域和桶，或等待相关房间结束。
+
+During the web-first release, check that the live page's `Content-Security-Policy` meta tag lists the exact `MEDIA_ORIGIN` in `media-src` before enabling backend uploads. Verify the live web and API revisions using the [release runbook](production-release.md#隔离验收与首次生产记录).
 
 后台五项 R2 设置均留空时，新导入继续使用原来的受保护本地媒体。已有本地媒体仍从后台读取。启用 R2 后，保留同一个专用桶及其媒体域配置，直到相应房间结束。上传重试保留待发布 MP4，成功后清理本地成品。结束失败的房间后，待发布 MP4 随服务器现有的房间文件保留期清理。当前在线房间发现 R2 对象已删除后，房主可以在原房间选择「重新导入」。重新导入产生新地址，原地址继续失效。
 
@@ -69,6 +78,8 @@ SYNTHETIC_VIDEO=1 BROWSER_SYNTHETIC_SPLIT=1 npm run test:browser
 ```
 
 第二个浏览器命令使用公开 B 站样本，需要本机能够访问 B 站 API 及媒体 CDN。浏览器测试会在用户界面提交链接、验证直接播放的 `Range` 和 `206`，并用夹具删除对象验证重导入。数据与媒体生成在私有临时目录，退出时清理。
+
+The split HTTPS and R2 fixtures cover session-protected local media, anonymous direct range playback, and reimport after deletion. The HTTP fixture also covers retry after an ambiguous write. One scoped real R2 import verifies the deployed revision can upload a fresh MP4 with its bucket credentials and serve it from the public HTTPS media domain. Record the upload and anonymous `Range` response separately, including `206`, `Content-Range`, and CORS for the web origin. Mark real lifecycle execution, controlled deletion, and fault injection as untested unless exercised separately.
 
 实际环境验收可复用获准的现有 Vercel 项目、Vultr 主机和本应用专用的成品媒体桶。通过正常发布流程确认网页和后台对应获准验收的版本。将验收操作和临时产物限定在本轮新建的验收房间及其导入对象，故障注入使用隔离夹具或仅影响本轮上传的作用域。
 
